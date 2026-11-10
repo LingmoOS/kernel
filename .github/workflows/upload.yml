@@ -1,0 +1,78 @@
+name: Upload kernel source to OBS
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v*.*.*'
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: kernel-source-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  debian:
+    name: Build Debian source package
+    runs-on: ubuntu-latest
+    container: docker.io/library/debian:testing
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      KDEB_SOURCENAME: linux
+      KDEB_CHANGELOG_DIST: lithium
+      KDEB_MAINTAINER: Lingmo OS Team <team@lingmo.org>
+      DEBFULLNAME: Lingmo OS Team
+      DEBEMAIL: team@lingmo.org
+    steps:
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates git curl build-essential bc bison flex \
+            libssl-dev libelf-dev libncurses-dev kmod cpio rsync \
+            python3 devscripts dpkg-dev debhelper xz-utils
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Configure kernel
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          cp CONFIGS/x86_64/config .config
+          make ARCH=x86 olddefconfig
+
+      - name: Build source package
+        run: make ARCH=x86 -j"$(nproc)" KDEB_SOURCE_COMPRESS=xz srcdeb-pkg
+
+      - name: Collect source package
+        run: |
+          set -eu
+          mkdir -p src-tar-output
+          cp ../linux_*.dsc ../linux_*.tar.* src-tar-output/
+          test "$(find src-tar-output -maxdepth 1 -name '*.dsc' | wc -l)" -eq 1
+
+      - name: Save source package
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-source-${{ github.run_id }}-${{ github.run_attempt }}
+          path: src-tar-output/
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload to OBS
+        if: github.event_name == 'push'
+        uses: LingmoOS/action-upload-to-obs@0.0.4
+        with:
+          remove-old-sources: true
+          obs-package-name: linux
+          obs-project-name: home:LingmoOS
+          obs-user-name: ${{ secrets.OBS_USERNAME }}
+          obs-password: ${{ secrets.OBS_TOKEN }}
+          obs-instance-url: https://api.opensuse.org
+          local-package-dir: ./src-tar-output
