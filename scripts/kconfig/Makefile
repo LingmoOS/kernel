@@ -170,6 +170,14 @@ $(obj)/lexer.lex.o: $(obj)/parser.tab.h
 HOSTCFLAGS_lexer.lex.o	:= -I $(src)
 HOSTCFLAGS_parser.tab.o	:= -I $(src)
 
+# Fall back to the kernel UAPI headers when building host tools on minimal
+# build environments without linux-libc-dev.
+kconfig-uapi-flags := -idirafter $(srctree)/include/uapi \
+		      -idirafter $(srctree)/arch/$(SRCARCH)/include/uapi
+HOSTCFLAGS_conf.o += $(kconfig-uapi-flags)
+HOSTCFLAGS_confdata.o += $(kconfig-uapi-flags)
+HOSTCFLAGS_expr.o += $(kconfig-uapi-flags)
+
 # conf: Used for defconfig, oldconfig and related targets
 hostprogs	+= conf
 conf-objs	:= conf.o $(common-objs)

@@ -32,7 +32,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            ca-certificates git curl build-essential bc bison flex linux-libc-dev \
+            ca-certificates git curl build-essential bc bison flex \
             libssl-dev libelf-dev libncurses-dev kmod cpio rsync \
             python3 devscripts dpkg-dev debhelper xz-utils
 
