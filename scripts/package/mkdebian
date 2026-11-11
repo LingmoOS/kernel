@@ -200,7 +200,7 @@ Section: kernel
 Priority: optional
 Maintainer: $maintainer
 Rules-Requires-Root: no
-Build-Depends: debhelper-compat (= 12), openssl
+Build-Depends: debhelper-compat (= 12), openssl, zstd
 Build-Depends-Arch: bc, bison, flex,
  gcc-${host_gnu} <!pkg.${sourcename}.nokernelheaders>,
  kmod, libdw-dev:native, libelf-dev:native,
