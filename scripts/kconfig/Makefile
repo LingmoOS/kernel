@@ -172,10 +172,7 @@ HOSTCFLAGS_parser.tab.o	:= -I $(src)
 
 # Fall back to the kernel UAPI headers when building host tools on minimal
 # build environments without linux-libc-dev.
-kconfig-uapi-flags := -idirafter $(srctree)/include/uapi
-HOSTCFLAGS_conf.o += $(kconfig-uapi-flags)
-HOSTCFLAGS_confdata.o += $(kconfig-uapi-flags)
-HOSTCFLAGS_expr.o += $(kconfig-uapi-flags)
+HOST_EXTRACFLAGS += -idirafter $(srctree)/include/uapi
 
 # conf: Used for defconfig, oldconfig and related targets
 hostprogs	+= conf
