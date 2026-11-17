@@ -5,11 +5,11 @@ permissions:
 
 on:
   push:
-    branches: [main]
+    branches: [7.3.4]
     tags:
       - 'v*.*.*'
   pull_request:
-    branches: [main]
+    branches: [7.3.4]
 
 concurrency:
   group: linux-7.3.4-source-${{ github.ref }}
