@@ -40,7 +40,6 @@ debian/fs-enable-link-security-restrictions-by-default.patch
 
 # Set various features runtime-disabled by default
 debian/yama-disable-by-default.patch
-debian/add-sysctl-to-disallow-unprivileged-CLONE_NEWUSER-by-default.patch
 features/all/security-perf-allow-further-restriction-of-perf_event_open.patch
 features/x86/intel-iommu-add-option-to-exclude-integrated-gpu-only.patch
 features/x86/intel-iommu-add-kconfig-option-to-exclude-igpu-by-default.patch
