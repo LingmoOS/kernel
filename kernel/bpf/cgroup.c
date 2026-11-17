@@ -870,7 +870,7 @@ static int __cgroup_bpf_attach(struct cgroup *cgrp,
 		old_pl_flags = pl->flags;
 		bpf_cgroup_storages_assign(old_storage, pl->storage);
 	} else {
-		pl = kmalloc(sizeof(*pl), GFP_KERNEL);
+		pl = kmalloc_obj(*pl);
 		if (!pl) {
 			bpf_cgroup_storages_free(new_storage);
 			return -ENOMEM;
@@ -1551,7 +1551,7 @@ int cgroup_bpf_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)
 	if (IS_ERR(cgrp))
 		return PTR_ERR(cgrp);
 
-	link = kzalloc(sizeof(*link), GFP_USER);
+	link = kzalloc_obj(*link, GFP_USER);
 	if (!link) {
 		err = -ENOMEM;
 		goto out_put_cgroup;
@@ -1728,7 +1728,7 @@ EXPORT_SYMBOL(__cgroup_bpf_run_filter_sk);
  * returned value != 1 during execution. In all other cases, 0 is returned.
  */
 int __cgroup_bpf_run_filter_sock_addr(struct sock *sk,
-				      struct sockaddr *uaddr,
+				      struct sockaddr_unsized *uaddr,
 				      int *uaddrlen,
 				      enum cgroup_bpf_attach_type atype,
 				      void *t_ctx,
@@ -1739,20 +1739,16 @@ int __cgroup_bpf_run_filter_sock_addr(struct sock *sk,
 		.uaddr = uaddr,
 		.t_ctx = t_ctx,
 	};
-	struct sockaddr_storage unspec;
+	struct sockaddr_storage storage;
 	struct cgroup *cgrp;
 	int ret;
 
-	/* Check socket family since not all sockets represent network
-	 * endpoint (e.g. AF_UNIX).
-	 */
-	if (sk->sk_family != AF_INET && sk->sk_family != AF_INET6 &&
-	    sk->sk_family != AF_UNIX)
+	if (!sk_is_inet(sk) && !sk_is_unix(sk))
 		return 0;
 
 	if (!ctx.uaddr) {
-		memset(&unspec, 0, sizeof(unspec));
-		ctx.uaddr = (struct sockaddr *)&unspec;
+		memset(&storage, 0, sizeof(storage));
+		ctx.uaddr = (struct sockaddr_unsized *)&storage;
 		ctx.uaddrlen = 0;
 	} else {
 		ctx.uaddrlen = *uaddrlen;
@@ -2334,7 +2330,7 @@ static const struct bpf_func_proto bpf_sysctl_get_name_proto = {
 	.ret_type	= RET_INTEGER,
 	.arg1_type	= ARG_PTR_TO_CTX,
 	.arg2_type	= ARG_PTR_TO_MEM | MEM_WRITE,
-	.arg3_type	= ARG_CONST_SIZE,
+	.arg3_type	= ARG_MEM_SIZE,
 	.arg4_type	= ARG_ANYTHING,
 };
 
@@ -2376,7 +2372,7 @@ static const struct bpf_func_proto bpf_sysctl_get_current_value_proto = {
 	.ret_type	= RET_INTEGER,
 	.arg1_type	= ARG_PTR_TO_CTX,
 	.arg2_type	= ARG_PTR_TO_UNINIT_MEM,
-	.arg3_type	= ARG_CONST_SIZE,
+	.arg3_type	= ARG_MEM_SIZE,
 };
 
 BPF_CALL_3(bpf_sysctl_get_new_value, struct bpf_sysctl_kern *, ctx, char *, buf,
@@ -2396,7 +2392,7 @@ static const struct bpf_func_proto bpf_sysctl_get_new_value_proto = {
 	.ret_type	= RET_INTEGER,
 	.arg1_type	= ARG_PTR_TO_CTX,
 	.arg2_type	= ARG_PTR_TO_UNINIT_MEM,
-	.arg3_type	= ARG_CONST_SIZE,
+	.arg3_type	= ARG_MEM_SIZE,
 };
 
 BPF_CALL_3(bpf_sysctl_set_new_value, struct bpf_sysctl_kern *, ctx,
@@ -2422,7 +2418,7 @@ static const struct bpf_func_proto bpf_sysctl_set_new_value_proto = {
 	.ret_type	= RET_INTEGER,
 	.arg1_type	= ARG_PTR_TO_CTX,
 	.arg2_type	= ARG_PTR_TO_MEM | MEM_RDONLY,
-	.arg3_type	= ARG_CONST_SIZE,
+	.arg3_type	= ARG_MEM_SIZE,
 };
 
 static const struct bpf_func_proto *

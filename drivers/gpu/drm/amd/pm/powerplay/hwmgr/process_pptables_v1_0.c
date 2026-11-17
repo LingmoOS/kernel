@@ -520,6 +520,7 @@ static int get_vddc_lookup_table(
 		)
 {
 	uint32_t i;
+	uint32_t num_entries;
 	phm_ppt_v1_voltage_lookup_table *table;
 	phm_ppt_v1_voltage_lookup_record *record;
 	ATOM_Tonga_Voltage_Lookup_Record *atom_record;
@@ -527,13 +528,22 @@ static int get_vddc_lookup_table(
 	PP_ASSERT_WITH_CODE((0 != vddc_lookup_pp_tables->ucNumEntries),
 		"Invalid CAC Leakage PowerPlay Table!", return 1);
 
-	table = kzalloc(struct_size(table, entries, max_levels), GFP_KERNEL);
+	num_entries = min_t(uint32_t, vddc_lookup_pp_tables->ucNumEntries,
+			    min_t(uint32_t, max_levels,
+				  pp_entries_max(hwmgr, vddc_lookup_pp_tables,
+						 sizeof(*vddc_lookup_pp_tables),
+						 sizeof(ATOM_Tonga_Voltage_Lookup_Record))));
+	if (num_entries < vddc_lookup_pp_tables->ucNumEntries)
+		pr_warn("amdgpu: VddcLookup table: clamping ucNumEntries %u -> %u\n",
+			vddc_lookup_pp_tables->ucNumEntries, num_entries);
+
+	table = kzalloc_flex(*table, entries, num_entries);
 	if (!table)
 		return -ENOMEM;
 
-	table->count = vddc_lookup_pp_tables->ucNumEntries;
+	table->count = num_entries;
 
-	for (i = 0; i < vddc_lookup_pp_tables->ucNumEntries; i++) {
+	for (i = 0; i < num_entries; i++) {
 		record = GET_FLEXIBLE_ARRAY_MEMBER_ADDR(
 					phm_ppt_v1_voltage_lookup_record,
 					entries, table, i);
@@ -562,7 +572,7 @@ static int get_platform_power_management_table(
 		struct pp_hwmgr *hwmgr,
 		const ATOM_Tonga_PPM_Table *atom_ppm_table)
 {
-	struct phm_ppm_table *ptr = kzalloc(sizeof(*ptr), GFP_KERNEL);
+	struct phm_ppm_table *ptr = kzalloc_obj(*ptr);
 	struct phm_ppt_v1_information *pp_table_information =
 		(struct phm_ppt_v1_information *)(hwmgr->pptable);
 
@@ -692,8 +702,7 @@ static int get_valid_clk(
 	PP_ASSERT_WITH_CODE((0 != clk_volt_pp_table->count),
 		"Invalid PowerPlay Table!", return -1);
 
-	table = kzalloc(struct_size(table, values, clk_volt_pp_table->count),
-			GFP_KERNEL);
+	table = kzalloc_flex(*table, values, clk_volt_pp_table->count);
 	if (!table)
 		return -ENOMEM;
 
@@ -735,6 +744,7 @@ static int get_mclk_voltage_dependency_table(
 		)
 {
 	uint32_t i;
+	uint32_t num_entries;
 	phm_ppt_v1_clock_voltage_dependency_table *mclk_table;
 	phm_ppt_v1_clock_voltage_dependency_record *mclk_table_record;
 	ATOM_Tonga_MCLK_Dependency_Record *mclk_dep_record;
@@ -742,14 +752,21 @@ static int get_mclk_voltage_dependency_table(
 	PP_ASSERT_WITH_CODE((0 != mclk_dep_table->ucNumEntries),
 		"Invalid PowerPlay Table!", return -1);
 
-	mclk_table = kzalloc(struct_size(mclk_table, entries, mclk_dep_table->ucNumEntries),
-			     GFP_KERNEL);
+	num_entries = min_t(uint32_t, mclk_dep_table->ucNumEntries,
+			    pp_entries_max(hwmgr, mclk_dep_table,
+					   sizeof(*mclk_dep_table),
+					   sizeof(ATOM_Tonga_MCLK_Dependency_Record)));
+	if (num_entries < mclk_dep_table->ucNumEntries)
+		pr_warn("amdgpu: MCLK dependency table: clamping ucNumEntries %u -> %u\n",
+			mclk_dep_table->ucNumEntries, num_entries);
+
+	mclk_table = kzalloc_flex(*mclk_table, entries, num_entries);
 	if (!mclk_table)
 		return -ENOMEM;
 
-	mclk_table->count = (uint32_t)mclk_dep_table->ucNumEntries;
+	mclk_table->count = num_entries;
 
-	for (i = 0; i < mclk_dep_table->ucNumEntries; i++) {
+	for (i = 0; i < num_entries; i++) {
 		mclk_table_record = GET_FLEXIBLE_ARRAY_MEMBER_ADDR(
 					phm_ppt_v1_clock_voltage_dependency_record,
 						entries, mclk_table, i);
@@ -775,6 +792,7 @@ static int get_sclk_voltage_dependency_table(
 		)
 {
 	uint32_t i;
+	uint32_t num_entries;
 	phm_ppt_v1_clock_voltage_dependency_table *sclk_table;
 	phm_ppt_v1_clock_voltage_dependency_record *sclk_table_record;
 
@@ -786,14 +804,21 @@ static int get_sclk_voltage_dependency_table(
 		PP_ASSERT_WITH_CODE((0 != tonga_table->ucNumEntries),
 			"Invalid PowerPlay Table!", return -1);
 
-		sclk_table = kzalloc(struct_size(sclk_table, entries, tonga_table->ucNumEntries),
-				     GFP_KERNEL);
+		num_entries = min_t(uint32_t, tonga_table->ucNumEntries,
+				    pp_entries_max(hwmgr, tonga_table,
+						   sizeof(*tonga_table),
+						   sizeof(ATOM_Tonga_SCLK_Dependency_Record)));
+		if (num_entries < tonga_table->ucNumEntries)
+			pr_warn("amdgpu: Tonga SCLK dependency table: clamping ucNumEntries %u -> %u\n",
+				tonga_table->ucNumEntries, num_entries);
+
+		sclk_table = kzalloc_flex(*sclk_table, entries, num_entries);
 		if (!sclk_table)
 			return -ENOMEM;
 
-		sclk_table->count = (uint32_t)tonga_table->ucNumEntries;
+		sclk_table->count = num_entries;
 
-		for (i = 0; i < tonga_table->ucNumEntries; i++) {
+		for (i = 0; i < num_entries; i++) {
 			sclk_dep_record = GET_FLEXIBLE_ARRAY_MEMBER_ADDR(
 						ATOM_Tonga_SCLK_Dependency_Record,
 						entries, tonga_table, i);
@@ -815,14 +840,21 @@ static int get_sclk_voltage_dependency_table(
 		PP_ASSERT_WITH_CODE((0 != polaris_table->ucNumEntries),
 			"Invalid PowerPlay Table!", return -1);
 
-		sclk_table = kzalloc(struct_size(sclk_table, entries, polaris_table->ucNumEntries),
-				     GFP_KERNEL);
+		num_entries = min_t(uint32_t, polaris_table->ucNumEntries,
+				    pp_entries_max(hwmgr, polaris_table,
+						   sizeof(*polaris_table),
+						   sizeof(ATOM_Polaris_SCLK_Dependency_Record)));
+		if (num_entries < polaris_table->ucNumEntries)
+			pr_warn("amdgpu: Polaris SCLK dependency table: clamping ucNumEntries %u -> %u\n",
+				polaris_table->ucNumEntries, num_entries);
+
+		sclk_table = kzalloc_flex(*sclk_table, entries, num_entries);
 		if (!sclk_table)
 			return -ENOMEM;
 
-		sclk_table->count = (uint32_t)polaris_table->ucNumEntries;
+		sclk_table->count = num_entries;
 
-		for (i = 0; i < polaris_table->ucNumEntries; i++) {
+		for (i = 0; i < num_entries; i++) {
 			sclk_dep_record = GET_FLEXIBLE_ARRAY_MEMBER_ADDR(
 						ATOM_Polaris_SCLK_Dependency_Record,
 						entries, polaris_table, i);
@@ -862,9 +894,8 @@ static int get_pcie_table(
 		PP_ASSERT_WITH_CODE((atom_pcie_table->ucNumEntries != 0),
 			"Invalid PowerPlay Table!", return -1);
 
-		pcie_table = kzalloc(struct_size(pcie_table, entries,
-						 atom_pcie_table->ucNumEntries),
-				     GFP_KERNEL);
+		pcie_table = kzalloc_flex(*pcie_table, entries,
+					  atom_pcie_table->ucNumEntries);
 		if (!pcie_table)
 			return -ENOMEM;
 
@@ -899,9 +930,8 @@ static int get_pcie_table(
 		PP_ASSERT_WITH_CODE((atom_pcie_table->ucNumEntries != 0),
 			"Invalid PowerPlay Table!", return -1);
 
-		pcie_table = kzalloc(struct_size(pcie_table, entries,
-						 atom_pcie_table->ucNumEntries),
-				     GFP_KERNEL);
+		pcie_table = kzalloc_flex(*pcie_table, entries,
+					  atom_pcie_table->ucNumEntries);
 		if (!pcie_table)
 			return -ENOMEM;
 
@@ -1089,20 +1119,29 @@ static int get_mm_clock_voltage_table(
 		)
 {
 	uint32_t i;
+	uint32_t num_entries;
 	const ATOM_Tonga_MM_Dependency_Record *mm_dependency_record;
 	phm_ppt_v1_mm_clock_voltage_dependency_table *mm_table;
 	phm_ppt_v1_mm_clock_voltage_dependency_record *mm_table_record;
 
 	PP_ASSERT_WITH_CODE((0 != mm_dependency_table->ucNumEntries),
 		"Invalid PowerPlay Table!", return -1);
-	mm_table = kzalloc(struct_size(mm_table, entries, mm_dependency_table->ucNumEntries),
-			   GFP_KERNEL);
+
+	num_entries = min_t(uint32_t, mm_dependency_table->ucNumEntries,
+			    pp_entries_max(hwmgr, mm_dependency_table,
+					   sizeof(*mm_dependency_table),
+					   sizeof(ATOM_Tonga_MM_Dependency_Record)));
+	if (num_entries < mm_dependency_table->ucNumEntries)
+		pr_warn("amdgpu: MM dependency table: clamping ucNumEntries %u -> %u\n",
+			mm_dependency_table->ucNumEntries, num_entries);
+
+	mm_table = kzalloc_flex(*mm_table, entries, num_entries);
 	if (!mm_table)
 		return -ENOMEM;
 
-	mm_table->count = mm_dependency_table->ucNumEntries;
+	mm_table->count = num_entries;
 
-	for (i = 0; i < mm_dependency_table->ucNumEntries; i++) {
+	for (i = 0; i < num_entries; i++) {
 		mm_dependency_record = GET_FLEXIBLE_ARRAY_MEMBER_ADDR(
 						ATOM_Tonga_MM_Dependency_Record,
 						entries, mm_dependency_table, i);
@@ -1559,7 +1598,7 @@ static int pp_tables_v1_0_initialize(struct pp_hwmgr *hwmgr)
 	int result = 0;
 	const ATOM_Tonga_POWERPLAYTABLE *powerplay_table;
 
-	hwmgr->pptable = kzalloc(sizeof(struct phm_ppt_v1_information), GFP_KERNEL);
+	hwmgr->pptable = kzalloc_obj(struct phm_ppt_v1_information);
 
 	PP_ASSERT_WITH_CODE((NULL != hwmgr->pptable),
 			    "Failed to allocate hwmgr->pptable!", return -ENOMEM);

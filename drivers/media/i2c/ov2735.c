@@ -993,7 +993,7 @@ static int ov2735_probe(struct i2c_client *client)
 				     "failed to parse endpoint configuration\n");
 
 	ov2735->reset_gpio = devm_gpiod_get_optional(ov2735->dev,
-						     "reset", GPIOD_OUT_LOW);
+						     "reset", GPIOD_OUT_HIGH);
 	if (IS_ERR(ov2735->reset_gpio))
 		return dev_err_probe(ov2735->dev, PTR_ERR(ov2735->reset_gpio),
 				     "failed to get reset GPIO\n");
@@ -1081,6 +1081,7 @@ static void ov2735_remove(struct i2c_client *client)
 	v4l2_subdev_cleanup(&ov2735->sd);
 	media_entity_cleanup(&sd->entity);
 	v4l2_ctrl_handler_free(ov2735->sd.ctrl_handler);
+	ov2735_power_off(ov2735->dev);
 }
 
 static DEFINE_RUNTIME_DEV_PM_OPS(ov2735_pm_ops,

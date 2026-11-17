@@ -139,7 +139,7 @@ static struct audit_parent *audit_init_parent(const struct path *path)
 	struct audit_parent *parent;
 	int ret;
 
-	parent = kzalloc(sizeof(*parent), GFP_KERNEL);
+	parent = kzalloc_obj(*parent);
 	if (unlikely(!parent))
 		return ERR_PTR(-ENOMEM);
 
@@ -161,7 +161,7 @@ static struct audit_watch *audit_init_watch(char *path)
 {
 	struct audit_watch *watch;
 
-	watch = kzalloc(sizeof(*watch), GFP_KERNEL);
+	watch = kzalloc_obj(*watch);
 	if (unlikely(!watch))
 		return ERR_PTR(-ENOMEM);
 
@@ -372,7 +372,7 @@ static void audit_add_to_parent(struct audit_krule *krule,
 	struct audit_watch *w, *watch = krule->watch;
 	int watch_found = 0;
 
-	BUG_ON(!mutex_is_locked(&audit_filter_mutex));
+	lockdep_assert_held(&audit_filter_mutex);
 
 	list_for_each_entry(w, &parent->watches, wlist) {
 		if (strcmp(watch->path, w->path))

@@ -9,7 +9,6 @@
 #include <linux/kobject.h>
 #include <linux/init.h>
 #include <linux/io.h>
-#include <linux/mod_devicetable.h>
 #include <linux/nvmem-consumer.h>
 #include <linux/nvmem-provider.h>
 #include <linux/of.h>
@@ -259,6 +258,7 @@ static int tegra_fuse_probe(struct platform_device *pdev)
 
 static int __maybe_unused tegra_fuse_runtime_resume(struct device *dev)
 {
+	struct tegra_fuse *fuse = dev_get_drvdata(dev);
 	int err;
 
 	err = clk_prepare_enable(fuse->clk);
@@ -272,6 +272,8 @@ static int __maybe_unused tegra_fuse_runtime_resume(struct device *dev)
 
 static int __maybe_unused tegra_fuse_runtime_suspend(struct device *dev)
 {
+	struct tegra_fuse *fuse = dev_get_drvdata(dev);
+
 	clk_disable_unprepare(fuse->clk);
 
 	return 0;
@@ -279,6 +281,7 @@ static int __maybe_unused tegra_fuse_runtime_suspend(struct device *dev)
 
 static int __maybe_unused tegra_fuse_suspend(struct device *dev)
 {
+	struct tegra_fuse *fuse = dev_get_drvdata(dev);
 	int ret;
 
 	/*
@@ -295,6 +298,7 @@ static int __maybe_unused tegra_fuse_suspend(struct device *dev)
 
 static int __maybe_unused tegra_fuse_resume(struct device *dev)
 {
+	struct tegra_fuse *fuse = dev_get_drvdata(dev);
 	int ret = 0;
 
 	if (fuse->soc->clk_suspend_on)
@@ -441,7 +445,7 @@ struct device *tegra_soc_device_register(void)
 	struct soc_device_attribute *attr;
 	struct soc_device *dev;
 
-	attr = kzalloc(sizeof(*attr), GFP_KERNEL);
+	attr = kzalloc_obj(*attr);
 	if (!attr)
 		return NULL;
 

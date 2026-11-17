@@ -16,6 +16,7 @@
 #include <linux/dm-kcopyd.h>
 #include <linux/jiffies.h>
 #include <linux/init.h>
+#include <linux/kstrtox.h>
 #include <linux/mempool.h>
 #include <linux/module.h>
 #include <linux/rwsem.h>
@@ -2136,7 +2137,6 @@ static int parse_cache_dev(struct cache_args *ca, struct dm_arg_set *as,
 static int parse_origin_dev(struct cache_args *ca, struct dm_arg_set *as,
 			    char **error)
 {
-	sector_t origin_sectors;
 	int r;
 
 	if (!at_least_one_arg(as, error))
@@ -2147,12 +2147,6 @@ static int parse_origin_dev(struct cache_args *ca, struct dm_arg_set *as,
 	if (r) {
 		*error = "Error opening origin device";
 		return r;
-	}
-
-	origin_sectors = get_dev_size(ca->origin_dev);
-	if (ca->ti->len > origin_sectors) {
-		*error = "Device size larger than cached device";
-		return -EINVAL;
 	}
 
 	return 0;
@@ -2431,7 +2425,7 @@ static int cache_create(struct cache_args *ca, struct cache **result)
 	struct dm_cache_metadata *cmd;
 	bool may_format = ca->features.mode == CM_WRITE;
 
-	cache = kzalloc(sizeof(*cache), GFP_KERNEL);
+	cache = kzalloc_obj(*cache);
 	if (!cache)
 		return -ENOMEM;
 
@@ -2641,7 +2635,7 @@ static int cache_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	struct cache_args *ca;
 	struct cache *cache = NULL;
 
-	ca = kzalloc(sizeof(*ca), GFP_KERNEL);
+	ca = kzalloc_obj(*ca);
 	if (!ca) {
 		ti->error = "Error allocating memory for cache";
 		return -ENOMEM;
@@ -2964,6 +2958,9 @@ static dm_cblock_t get_cache_dev_size(struct cache *cache)
 
 static bool can_resume(struct cache *cache)
 {
+	bool clean_when_opened;
+	int r;
+
 	/*
 	 * Disallow retrying the resume operation for devices that failed the
 	 * first resume attempt, as the failure leaves the policy object partially
@@ -2978,6 +2975,20 @@ static bool can_resume(struct cache *cache)
 			DMERR("%s: unable to resume cache due to missing proper cache table reload",
 			      cache_device_name(cache));
 		return false;
+	}
+
+	if (passthrough_mode(cache)) {
+		r = dm_cache_metadata_clean_when_opened(cache->cmd, &clean_when_opened);
+		if (r) {
+			DMERR("%s: failed to query metadata flags", cache_device_name(cache));
+			return false;
+		}
+
+		if (!clean_when_opened) {
+			DMERR("%s: unable to resume into passthrough mode after unclean shutdown",
+			      cache_device_name(cache));
+			return false;
+		}
 	}
 
 	return true;
@@ -3304,42 +3315,46 @@ struct cblock_range {
 	dm_cblock_t end;
 };
 
+static inline dm_cblock_t cblock_succ(dm_cblock_t b)
+{
+	return to_cblock(from_cblock(b) + 1);
+}
+
 /*
  * A cache block range can take two forms:
  *
  * i) A single cblock, eg. '3456'
  * ii) A begin and end cblock with a dash between, eg. 123-234
  */
-static int parse_cblock_range(struct cache *cache, const char *str,
+static int parse_cblock_range(struct cache *cache, char *str,
 			      struct cblock_range *result)
 {
-	char dummy;
-	uint64_t b, e;
+	char *blocknr = strsep(&str, "-");
+	unsigned int b, e;
 	int r;
 
-	/*
-	 * Try and parse form (ii) first.
-	 */
-	r = sscanf(str, "%llu-%llu%c", &b, &e, &dummy);
+	r = kstrtouint(blocknr, 10, &b);
+	if (r)
+		goto bad;
 
-	if (r == 2) {
-		result->begin = to_cblock(b);
+	result->begin = to_cblock(b);
+
+	if (str) {
+		blocknr = str;
+
+		r = kstrtouint(blocknr, 10, &e);
+		if (r)
+			goto bad;
+
 		result->end = to_cblock(e);
-		return 0;
+	} else {
+		result->end = cblock_succ(result->begin);
 	}
 
-	/*
-	 * That didn't work, try form (i).
-	 */
-	r = sscanf(str, "%llu%c", &b, &dummy);
+	return 0;
 
-	if (r == 1) {
-		result->begin = to_cblock(b);
-		result->end = to_cblock(from_cblock(result->begin) + 1u);
-		return 0;
-	}
-
-	DMERR("%s: invalid cblock range '%s'", cache_device_name(cache), str);
+bad:
+	DMERR("%s: invalid cblock range '%s'", cache_device_name(cache), blocknr);
 	return -EINVAL;
 }
 
@@ -3370,11 +3385,6 @@ static int validate_cblock_range(struct cache *cache, struct cblock_range *range
 	return 0;
 }
 
-static inline dm_cblock_t cblock_succ(dm_cblock_t b)
-{
-	return to_cblock(from_cblock(b) + 1);
-}
-
 static int request_invalidation(struct cache *cache, struct cblock_range *range)
 {
 	int r = 0;
@@ -3398,7 +3408,7 @@ static int request_invalidation(struct cache *cache, struct cblock_range *range)
 }
 
 static int process_invalidate_cblocks_message(struct cache *cache, unsigned int count,
-					      const char **cblock_ranges)
+					      char **cblock_ranges)
 {
 	int r = 0;
 	unsigned int i;
@@ -3453,7 +3463,7 @@ static int cache_message(struct dm_target *ti, unsigned int argc, char **argv,
 	}
 
 	if (!strcasecmp(argv[0], "invalidate_cblocks"))
-		return process_invalidate_cblocks_message(cache, argc - 1, (const char **) argv + 1);
+		return process_invalidate_cblocks_message(cache, argc - 1, argv + 1);
 
 	if (argc != 2)
 		return -EINVAL;
@@ -3545,7 +3555,7 @@ static void cache_io_hints(struct dm_target *ti, struct queue_limits *limits)
 
 static struct target_type cache_target = {
 	.name = "cache",
-	.version = {2, 3, 0},
+	.version = {2, 4, 0},
 	.module = THIS_MODULE,
 	.ctr = cache_ctr,
 	.dtr = cache_dtr,

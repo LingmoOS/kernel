@@ -29,6 +29,16 @@ struct drm_client_funcs {
 	struct module *owner;
 
 	/**
+	 * @free:
+	 *
+	 * Called when the client gets unregistered. Implementations should
+	 * release all client-specific data and free the memory.
+	 *
+	 * This callback is optional.
+	 */
+	void (*free)(struct drm_client_dev *client);
+
+	/**
 	 * @unregister:
 	 *
 	 * Called when &drm_device is unregistered. The client should respond by
@@ -186,9 +196,12 @@ struct drm_client_buffer {
 };
 
 struct drm_client_buffer *
-drm_client_framebuffer_create(struct drm_client_dev *client, u32 width, u32 height, u32 format);
+drm_client_buffer_create(struct drm_client_dev *client, u32 width, u32 height,
+			 u32 format, u32 handle, u32 pitch);
+struct drm_client_buffer *
+drm_client_buffer_create_dumb(struct drm_client_dev *client, u32 width, u32 height, u32 format);
 void drm_client_buffer_delete(struct drm_client_buffer *buffer);
-int drm_client_framebuffer_flush(struct drm_client_buffer *buffer, struct drm_rect *rect);
+int drm_client_buffer_flush(struct drm_client_buffer *buffer, struct drm_rect *rect);
 int drm_client_buffer_vmap_local(struct drm_client_buffer *buffer,
 				 struct iosys_map *map_copy);
 void drm_client_buffer_vunmap_local(struct drm_client_buffer *buffer);
@@ -204,6 +217,7 @@ int drm_client_modeset_check(struct drm_client_dev *client);
 int drm_client_modeset_commit_locked(struct drm_client_dev *client);
 int drm_client_modeset_commit(struct drm_client_dev *client);
 int drm_client_modeset_dpms(struct drm_client_dev *client, int mode);
+int drm_client_modeset_wait_for_vblank(struct drm_client_dev *client, unsigned int crtc_index);
 
 /**
  * drm_client_for_each_modeset() - Iterate over client modesets

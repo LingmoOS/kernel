@@ -6,7 +6,7 @@
 #include <linux/arm-smccc.h>
 #include <linux/cc_platform.h>
 #include <linux/kernel.h>
-#include <linux/mod_devicetable.h>
+#include <linux/device-id/platform.h>
 #include <linux/module.h>
 #include <linux/smp.h>
 #include <linux/tsm.h>
@@ -198,7 +198,7 @@ module_exit(arm_cca_guest_exit);
 
 /* modalias, so userspace can autoload this module when RSI is available */
 static const struct platform_device_id arm_cca_match[] __maybe_unused = {
-	{ RSI_PDEV_NAME, 0},
+	{ .name = RSI_PDEV_NAME },
 	{ }
 };
 

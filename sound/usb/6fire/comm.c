@@ -156,8 +156,7 @@ static void usb6fire_comm_free(struct comm_runtime *rt)
 
 int usb6fire_comm_init(struct sfire_chip *chip)
 {
-	struct comm_runtime *rt = kzalloc(sizeof(struct comm_runtime),
-			GFP_KERNEL);
+	struct comm_runtime *rt = kzalloc_obj(struct comm_runtime);
 	struct urb *urb;
 	int ret;
 

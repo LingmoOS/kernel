@@ -104,7 +104,7 @@ static int drr_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
 		return 0;
 	}
 
-	cl = kzalloc(sizeof(struct drr_class), GFP_KERNEL);
+	cl = kzalloc_obj(struct drr_class);
 	if (cl == NULL)
 		return -ENOBUFS;
 
@@ -364,8 +364,8 @@ static int drr_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 		WRITE_ONCE(cl->deficit, READ_ONCE(cl->quantum));
 	}
 
-	sch->qstats.backlog += len;
-	sch->q.qlen++;
+	qstats_backlog_add(sch, len);
+	qdisc_qlen_inc(sch);
 	return err;
 }
 
@@ -398,7 +398,7 @@ static struct sk_buff *drr_dequeue(struct Qdisc *sch)
 			bstats_update(&cl->bstats, skb);
 			qdisc_bstats_update(sch, skb);
 			qdisc_qstats_backlog_dec(sch, skb);
-			sch->q.qlen--;
+			qdisc_qlen_dec(sch);
 			return skb;
 		}
 

@@ -173,11 +173,11 @@ static void rds_ib_cm_fill_conn_param(struct rds_connection *conn,
 
 	memset(conn_param, 0, sizeof(struct rdma_conn_param));
 
-	conn_param->responder_resources =
-		min_t(u32, rds_ibdev->max_responder_resources, max_responder_resources);
-	conn_param->initiator_depth =
-		min_t(u32, rds_ibdev->max_initiator_depth, max_initiator_depth);
-	conn_param->retry_count = min_t(unsigned int, rds_ib_retry_count, 7);
+	conn_param->responder_resources = min3(rds_ibdev->max_responder_resources,
+					       max_responder_resources, U8_MAX);
+	conn_param->initiator_depth = min3(rds_ibdev->max_initiator_depth,
+					   max_initiator_depth, U8_MAX);
+	conn_param->retry_count = min(rds_ib_retry_count, 7U);
 	conn_param->rnr_retry_count = 7;
 
 	if (dp) {
@@ -1223,7 +1223,7 @@ int rds_ib_conn_alloc(struct rds_connection *conn, gfp_t gfp)
 	int ret;
 
 	/* XXX too lazy? */
-	ic = kzalloc(sizeof(struct rds_ib_connection), gfp);
+	ic = kzalloc_obj(struct rds_ib_connection, gfp);
 	if (!ic)
 		return -ENOMEM;
 
@@ -1271,6 +1271,7 @@ void rds_ib_conn_free(void *arg)
 {
 	struct rds_ib_connection *ic = arg;
 	spinlock_t	*lock_ptr;
+	unsigned long flags;
 
 	rdsdebug("ic %p\n", ic);
 
@@ -1281,9 +1282,10 @@ void rds_ib_conn_free(void *arg)
 	 */
 	lock_ptr = ic->rds_ibdev ? &ic->rds_ibdev->spinlock : &ib_nodev_conns_lock;
 
-	spin_lock_irq(lock_ptr);
+	/* May be called with IRQs already disabled (see __rds_conn_create()) */
+	spin_lock_irqsave(lock_ptr, flags);
 	list_del(&ic->ib_node);
-	spin_unlock_irq(lock_ptr);
+	spin_unlock_irqrestore(lock_ptr, flags);
 
 	rds_ib_recv_free_caches(ic);
 

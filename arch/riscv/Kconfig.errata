@@ -46,7 +46,7 @@ config ERRATA_MIPS_P8700_PAUSE_OPCODE
 
 config ERRATA_SIFIVE
 	bool "SiFive errata"
-	depends on RISCV_ALTERNATIVE
+	depends on RISCV_ALTERNATIVE && 64BIT
 	help
 	  All SiFive errata Kconfig depend on this Kconfig. Disabling
 	  this Kconfig will disable all SiFive errata. Please say "Y"
@@ -84,6 +84,7 @@ config ERRATA_STARFIVE_JH7100
 	select DMA_GLOBAL_POOL
 	select RISCV_DMA_NONCOHERENT
 	select RISCV_NONSTANDARD_CACHE_OPS
+	select CACHEMAINT_FOR_DMA
 	select SIFIVE_CCACHE
 	default n
 	help

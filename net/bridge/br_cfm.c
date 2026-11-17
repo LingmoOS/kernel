@@ -542,7 +542,7 @@ int br_cfm_mep_create(struct net_bridge *br,
 		}
 	}
 
-	mep = kzalloc(sizeof(*mep), GFP_KERNEL);
+	mep = kzalloc_obj(*mep);
 	if (!mep)
 		return -ENOMEM;
 
@@ -688,7 +688,7 @@ int br_cfm_cc_peer_mep_add(struct net_bridge *br, const u32 instance,
 		return -EEXIST;
 	}
 
-	peer_mep = kzalloc(sizeof(*peer_mep), GFP_KERNEL);
+	peer_mep = kzalloc_obj(*peer_mep);
 	if (!peer_mep)
 		return -ENOMEM;
 

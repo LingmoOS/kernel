@@ -49,18 +49,34 @@
 
 #include "idle.c"
 
-#include "rt.c"
-#include "cpudeadline.c"
+#ifndef CONFIG_SCHED_ALT
+# include "rt.c"
+# include "cpudeadline.c"
+#endif
 
 #include "pelt.c"
 
 #include "cputime.c"
+#ifndef CONFIG_SCHED_ALT
 #include "deadline.c"
+#endif
 
 #ifdef CONFIG_SCHED_CLASS_EXT
-# include "ext_internal.h"
-# include "ext.c"
-# include "ext_idle.c"
+# include <linux/btf_ids.h>
+# include <linux/find.h>
+# include <linux/genalloc.h>
+# include "ext/types.h"
+# include "ext/internal.h"
+# include "ext/cid.h"
+# include "ext/arena.h"
+# include "ext/idle.h"
+# include "ext/sub.h"
+# include "ext/inlines.h"
+# include "ext/ext.c"
+# include "ext/cid.c"
+# include "ext/arena.c"
+# include "ext/idle.c"
+# include "ext/sub.c"
 #endif
 
 #include "syscalls.c"

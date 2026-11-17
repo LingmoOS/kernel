@@ -118,7 +118,7 @@ static struct ceph_snap_realm *ceph_create_snap_realm(
 
 	lockdep_assert_held_write(&mdsc->snap_rwsem);
 
-	realm = kzalloc(sizeof(*realm), GFP_NOFS);
+	realm = kzalloc_obj(*realm, GFP_NOFS);
 	if (!realm)
 		return ERR_PTR(-ENOMEM);
 
@@ -374,7 +374,7 @@ static int build_snap_context(struct ceph_mds_client *mdsc,
 
 	/* alloc new snap context */
 	err = -ENOMEM;
-	if (num > (SIZE_MAX - sizeof(*snapc)) / sizeof(u64))
+	if ((size_t)num > (SIZE_MAX - sizeof(*snapc)) / sizeof(u64))
 		goto fail;
 	snapc = ceph_create_snap_context(num, GFP_NOFS);
 	if (!snapc)
@@ -700,7 +700,7 @@ int __ceph_finish_cap_snap(struct ceph_inode_info *ci,
 		return 0;
 	}
 
-	ci->i_ceph_flags |= CEPH_I_FLUSH_SNAPS;
+	set_bit(CEPH_I_FLUSH_SNAPS_BIT, &ci->i_ceph_flags);
 	doutc(cl, "%p %llx.%llx cap_snap %p snapc %p %llu %s s=%llu\n",
 	      inode, ceph_vinop(inode), capsnap, capsnap->context,
 	      capsnap->context->seq, ceph_cap_string(capsnap->dirty),
@@ -788,6 +788,7 @@ int ceph_update_snap_trace(struct ceph_mds_client *mdsc,
 	struct ceph_snap_realm *first_realm = NULL;
 	struct ceph_snap_realm *realm_to_rebuild = NULL;
 	struct ceph_client *client = mdsc->fsc->client;
+	size_t snaps_len;
 	int rebuild_snapcs;
 	int err = -ENOMEM;
 	int ret;
@@ -802,8 +803,10 @@ more:
 	ceph_decode_need(&p, e, sizeof(*ri), bad);
 	ri = p;
 	p += sizeof(*ri);
-	ceph_decode_need(&p, e, sizeof(u64)*(le32_to_cpu(ri->num_snaps) +
-			    le32_to_cpu(ri->num_prior_parent_snaps)), bad);
+	snaps_len = size_mul(size_add(le32_to_cpu(ri->num_snaps),
+				      le32_to_cpu(ri->num_prior_parent_snaps)),
+			     sizeof(u64));
+	ceph_decode_need(&p, e, snaps_len, bad);
 	snaps = p;
 	p += sizeof(u64) * le32_to_cpu(ri->num_snaps);
 	prior_parent_snaps = p;
@@ -1216,7 +1219,7 @@ struct ceph_snapid_map* ceph_get_snapid_map(struct ceph_mds_client *mdsc,
 		return exist;
 	}
 
-	sm = kmalloc(sizeof(*sm), GFP_NOFS);
+	sm = kmalloc_obj(*sm, GFP_NOFS);
 	if (!sm)
 		return NULL;
 

@@ -1,12 +1,9 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
    BlueZ - Bluetooth protocol stack for Linux
 
    Copyright (C) 2010  Nokia Corporation
    Copyright (C) 2011-2012 Intel Corporation
-
-   This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License version 2 as
-   published by the Free Software Foundation;
 
    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
    OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
@@ -556,7 +553,7 @@ static int read_ext_index_list(struct sock *sk, struct hci_dev *hdev,
 	list_for_each_entry(d, &hci_dev_list, list)
 		count++;
 
-	rp = kmalloc(struct_size(rp, entry, count), GFP_ATOMIC);
+	rp = kmalloc_flex(*rp, entry, count, GFP_ATOMIC);
 	if (!rp) {
 		read_unlock(&hci_dev_list_lock);
 		return -ENOMEM;
@@ -860,6 +857,9 @@ static u32 get_supported_settings(struct hci_dev *hdev)
 	if (past_receiver_capable(hdev))
 		settings |= MGMT_SETTING_PAST_RECEIVER;
 
+	if (le_sci_capable(hdev))
+		settings |= MGMT_SETTING_SCI;
+
 	settings |= MGMT_SETTING_PHY_CONFIGURATION;
 
 	return settings;
@@ -950,6 +950,9 @@ static u32 get_current_settings(struct hci_dev *hdev)
 
 	if (past_receiver_enabled(hdev))
 		settings |= MGMT_SETTING_PAST_RECEIVER;
+
+	if (le_sci_enabled(hdev))
+		settings |= MGMT_SETTING_SCI;
 
 	return settings;
 }
@@ -2805,7 +2808,7 @@ static int add_uuid(struct sock *sk, struct hci_dev *hdev, void *data, u16 len)
 		goto failed;
 	}
 
-	uuid = kmalloc(sizeof(*uuid), GFP_KERNEL);
+	uuid = kmalloc_obj(*uuid);
 	if (!uuid) {
 		err = -ENOMEM;
 		goto failed;
@@ -3414,7 +3417,7 @@ static int get_connections(struct sock *sk, struct hci_dev *hdev, void *data,
 			i++;
 	}
 
-	rp = kmalloc(struct_size(rp, addr, i), GFP_KERNEL);
+	rp = kmalloc_flex(*rp, addr, i);
 	if (!rp) {
 		err = -ENOMEM;
 		goto unlock;
@@ -3896,6 +3899,8 @@ static int user_pairing_resp(struct sock *sk, struct hci_dev *hdev,
 	}
 
 	if (addr->type == BDADDR_LE_PUBLIC || addr->type == BDADDR_LE_RANDOM) {
+		lockdep_assert_held(&conn->hdev->lock);
+
 		err = smp_user_confirm_reply(conn, mgmt_op, passkey);
 		if (!err)
 			err = mgmt_cmd_complete(sk, hdev->id, mgmt_op,
@@ -4465,7 +4470,7 @@ static int set_blocked_keys(struct sock *sk, struct hci_dev *hdev, void *data,
 	hci_blocked_keys_clear(hdev);
 
 	for (i = 0; i < key_count; ++i) {
-		struct blocked_key *b = kzalloc(sizeof(*b), GFP_KERNEL);
+		struct blocked_key *b = kzalloc_obj(*b);
 
 		if (!b) {
 			err = MGMT_STATUS_NO_RESOURCES;
@@ -5218,6 +5223,69 @@ static void device_flags_changed(struct sock *sk, struct hci_dev *hdev,
 	mgmt_event(MGMT_EV_DEVICE_FLAGS_CHANGED, hdev, &ev, sizeof(ev), sk);
 }
 
+static bool is_connected(struct hci_dev *hdev, bdaddr_t *addr, u8 type)
+{
+	struct hci_conn *conn;
+
+	conn = hci_conn_hash_lookup_ba(hdev, LE_LINK, addr);
+	if (!conn)
+		return false;
+
+	if (conn->dst_type != type)
+		return false;
+
+	if (conn->state != BT_CONNECTED)
+		return false;
+
+	return true;
+}
+
+/* This function requires the caller holds hdev->lock */
+static struct hci_conn_params *hci_conn_params_set(struct hci_dev *hdev,
+						   bdaddr_t *addr, u8 addr_type,
+						   u8 auto_connect)
+{
+	struct hci_conn_params *params;
+
+	params = hci_conn_params_add(hdev, addr, addr_type);
+	if (!params)
+		return NULL;
+
+	if (params->auto_connect == auto_connect)
+		return params;
+
+	hci_pend_le_list_del_init(params);
+
+	switch (auto_connect) {
+	case HCI_AUTO_CONN_DISABLED:
+	case HCI_AUTO_CONN_LINK_LOSS:
+		/* If auto connect is being disabled when we're trying to
+		 * connect to device, keep connecting.
+		 */
+		if (params->explicit_connect)
+			hci_pend_le_list_add(params, &hdev->pend_le_conns);
+		break;
+	case HCI_AUTO_CONN_REPORT:
+		if (params->explicit_connect)
+			hci_pend_le_list_add(params, &hdev->pend_le_conns);
+		else
+			hci_pend_le_list_add(params, &hdev->pend_le_reports);
+		break;
+	case HCI_AUTO_CONN_DIRECT:
+	case HCI_AUTO_CONN_ALWAYS:
+		if (!is_connected(hdev, addr, addr_type))
+			hci_pend_le_list_add(params, &hdev->pend_le_conns);
+		break;
+	}
+
+	params->auto_connect = auto_connect;
+
+	bt_dev_dbg(hdev, "addr %pMR (type %u) auto_connect %u",
+		   addr, addr_type, auto_connect);
+
+	return params;
+}
+
 static int set_device_flags(struct sock *sk, struct hci_dev *hdev, void *data,
 			    u16 len)
 {
@@ -5261,9 +5329,16 @@ static int set_device_flags(struct sock *sk, struct hci_dev *hdev, void *data,
 	params = hci_conn_params_lookup(hdev, &cp->addr.bdaddr,
 					le_addr_type(cp->addr.type));
 	if (!params) {
-		bt_dev_warn(hdev, "No such LE device %pMR (0x%x)",
-			    &cp->addr.bdaddr, le_addr_type(cp->addr.type));
-		goto unlock;
+		/* Create a new hci_conn_params if it doesn't exist */
+		params = hci_conn_params_set(hdev, &cp->addr.bdaddr,
+					     le_addr_type(cp->addr.type),
+					     HCI_AUTO_CONN_DISABLED);
+		if (!params) {
+			bt_dev_warn(hdev, "No such LE device %pMR (0x%x)",
+				    &cp->addr.bdaddr,
+				    le_addr_type(cp->addr.type));
+			goto unlock;
+		}
 	}
 
 	supported_flags = hdev->conn_flags;
@@ -5510,7 +5585,7 @@ static u8 parse_adv_monitor_pattern(struct adv_monitor *m, u8 pattern_count,
 		    (offset + length) > HCI_MAX_AD_LENGTH)
 			return MGMT_STATUS_INVALID_PARAMS;
 
-		p = kmalloc(sizeof(*p), GFP_KERNEL);
+		p = kmalloc_obj(*p);
 		if (!p)
 			return MGMT_STATUS_NO_RESOURCES;
 
@@ -5547,7 +5622,7 @@ static int add_adv_patterns_monitor(struct sock *sk, struct hci_dev *hdev,
 		goto done;
 	}
 
-	m = kzalloc(sizeof(*m), GFP_KERNEL);
+	m = kzalloc_obj(*m);
 	if (!m) {
 		status = MGMT_STATUS_NO_RESOURCES;
 		goto done;
@@ -5584,7 +5659,7 @@ static int add_adv_patterns_monitor_rssi(struct sock *sk, struct hci_dev *hdev,
 		goto done;
 	}
 
-	m = kzalloc(sizeof(*m), GFP_KERNEL);
+	m = kzalloc_obj(*m);
 	if (!m) {
 		status = MGMT_STATUS_NO_RESOURCES;
 		goto done;
@@ -7678,68 +7753,6 @@ unlock:
 	return err;
 }
 
-static bool is_connected(struct hci_dev *hdev, bdaddr_t *addr, u8 type)
-{
-	struct hci_conn *conn;
-
-	conn = hci_conn_hash_lookup_ba(hdev, LE_LINK, addr);
-	if (!conn)
-		return false;
-
-	if (conn->dst_type != type)
-		return false;
-
-	if (conn->state != BT_CONNECTED)
-		return false;
-
-	return true;
-}
-
-/* This function requires the caller holds hdev->lock */
-static int hci_conn_params_set(struct hci_dev *hdev, bdaddr_t *addr,
-			       u8 addr_type, u8 auto_connect)
-{
-	struct hci_conn_params *params;
-
-	params = hci_conn_params_add(hdev, addr, addr_type);
-	if (!params)
-		return -EIO;
-
-	if (params->auto_connect == auto_connect)
-		return 0;
-
-	hci_pend_le_list_del_init(params);
-
-	switch (auto_connect) {
-	case HCI_AUTO_CONN_DISABLED:
-	case HCI_AUTO_CONN_LINK_LOSS:
-		/* If auto connect is being disabled when we're trying to
-		 * connect to device, keep connecting.
-		 */
-		if (params->explicit_connect)
-			hci_pend_le_list_add(params, &hdev->pend_le_conns);
-		break;
-	case HCI_AUTO_CONN_REPORT:
-		if (params->explicit_connect)
-			hci_pend_le_list_add(params, &hdev->pend_le_conns);
-		else
-			hci_pend_le_list_add(params, &hdev->pend_le_reports);
-		break;
-	case HCI_AUTO_CONN_DIRECT:
-	case HCI_AUTO_CONN_ALWAYS:
-		if (!is_connected(hdev, addr, addr_type))
-			hci_pend_le_list_add(params, &hdev->pend_le_conns);
-		break;
-	}
-
-	params->auto_connect = auto_connect;
-
-	bt_dev_dbg(hdev, "addr %pMR (type %u) auto_connect %u",
-		   addr, addr_type, auto_connect);
-
-	return 0;
-}
-
 static void device_added(struct sock *sk, struct hci_dev *hdev,
 			 bdaddr_t *bdaddr, u8 type, u8 action)
 {
@@ -7854,17 +7867,13 @@ static int add_device(struct sock *sk, struct hci_dev *hdev,
 	/* If the connection parameters don't exist for this device,
 	 * they will be created and configured with defaults.
 	 */
-	if (hci_conn_params_set(hdev, &cp->addr.bdaddr, addr_type,
-				auto_conn) < 0) {
+	params = hci_conn_params_set(hdev, &cp->addr.bdaddr, addr_type,
+				     auto_conn);
+	if (!params) {
 		err = mgmt_cmd_complete(sk, hdev->id, MGMT_OP_ADD_DEVICE,
 					MGMT_STATUS_FAILED, &cp->addr,
 					sizeof(cp->addr));
 		goto unlock;
-	} else {
-		params = hci_conn_params_lookup(hdev, &cp->addr.bdaddr,
-						addr_type);
-		if (params)
-			current_flags = params->flags;
 	}
 
 	cmd = mgmt_pending_new(sk, MGMT_OP_ADD_DEVICE, hdev, data, len);
@@ -8193,6 +8202,118 @@ static int load_conn_param(struct sock *sk, struct hci_dev *hdev, void *data,
 	hci_dev_unlock(hdev);
 
 	return mgmt_cmd_complete(sk, hdev->id, MGMT_OP_LOAD_CONN_PARAM, 0,
+				 NULL, 0);
+}
+
+static int load_conn_subrate(struct sock *sk, struct hci_dev *hdev, void *data,
+			     u16 len)
+{
+	struct mgmt_cp_load_conn_subrate *cp = data;
+	const u16 max_param_count = ((U16_MAX - sizeof(*cp)) /
+				     sizeof(struct mgmt_conn_subrate));
+	u16 param_count, expected_len;
+	int i;
+
+	if (!lmp_le_capable(hdev) || !le_sci_capable(hdev))
+		return mgmt_cmd_status(sk, hdev->id, MGMT_OP_LOAD_CONN_SUBRATE,
+				       MGMT_STATUS_NOT_SUPPORTED);
+
+	param_count = __le16_to_cpu(cp->param_count);
+	if (param_count > max_param_count) {
+		bt_dev_err(hdev, "too big param_count value %u", param_count);
+		return mgmt_cmd_status(sk, hdev->id, MGMT_OP_LOAD_CONN_SUBRATE,
+				       MGMT_STATUS_INVALID_PARAMS);
+	}
+
+	expected_len = struct_size(cp, params, param_count);
+	if (expected_len != len) {
+		bt_dev_err(hdev, "expected %u bytes, got %u bytes",
+			   expected_len, len);
+		return mgmt_cmd_status(sk, hdev->id, MGMT_OP_LOAD_CONN_SUBRATE,
+				       MGMT_STATUS_INVALID_PARAMS);
+	}
+
+	bt_dev_dbg(hdev, "param_count %u", param_count);
+
+	hci_dev_lock(hdev);
+
+	for (i = 0; i < param_count; i++) {
+		struct mgmt_conn_subrate *param = &cp->params[i];
+		struct hci_conn_params *hci_param;
+		u16 min, max, subrate_min, subrate_max;
+		u16 max_latency, cont_num, supv_timeout;
+		u8 addr_type;
+
+		bt_dev_dbg(hdev, "Adding subrate %pMR (type %u)",
+			   &param->addr.bdaddr, param->addr.type);
+
+		if (param->addr.type == BDADDR_LE_PUBLIC) {
+			addr_type = ADDR_LE_DEV_PUBLIC;
+		} else if (param->addr.type == BDADDR_LE_RANDOM) {
+			addr_type = ADDR_LE_DEV_RANDOM;
+		} else {
+			bt_dev_err(hdev, "ignoring invalid connection subrate parameters");
+			continue;
+		}
+
+		min = le16_to_cpu(param->min_interval);
+		max = le16_to_cpu(param->max_interval);
+		subrate_min = le16_to_cpu(param->subrate_min);
+		subrate_max = le16_to_cpu(param->subrate_max);
+		max_latency = le16_to_cpu(param->max_latency);
+		cont_num = le16_to_cpu(param->cont_num);
+		supv_timeout = le16_to_cpu(param->supv_timeout);
+
+		/* Validate the parameters before storing them. Reject
+		 * logically inconsistent values instead of forwarding them to
+		 * the controller.
+		 */
+		if (min > max || subrate_min > subrate_max ||
+		    subrate_min < 1 || supv_timeout < 1) {
+			bt_dev_err(hdev, "ignoring invalid connection subrate parameters");
+			continue;
+		}
+
+		hci_param = hci_conn_params_add(hdev, &param->addr.bdaddr,
+						addr_type);
+		if (!hci_param) {
+			bt_dev_err(hdev, "failed to add connection parameters");
+			continue;
+		}
+
+		hci_param->rate_min_interval = min;
+		hci_param->rate_max_interval = max;
+		hci_param->subrate_min = subrate_min;
+		hci_param->subrate_max = subrate_max;
+		hci_param->max_latency = max_latency;
+		hci_param->cont_num = cont_num;
+		hci_param->rate_supv_timeout = supv_timeout;
+
+		/* If the device is connected as central check if the
+		 * connection rate parameters need to be updated.
+		 */
+		if (!i && param_count == 1) {
+			struct hci_conn *conn;
+
+			conn = hci_conn_hash_lookup_le(hdev,
+						       &hci_param->addr,
+						       addr_type);
+			if (conn && conn->state == BT_CONNECTED &&
+			    conn->role == HCI_ROLE_MASTER &&
+			    (conn->le_rate_interval < min ||
+			     conn->le_rate_interval > max ||
+			     conn->le_subrate < subrate_min ||
+			     conn->le_subrate > subrate_max ||
+			     conn->le_rate_latency != max_latency ||
+			     conn->le_cont_num != cont_num ||
+			     conn->le_rate_supv_timeout != supv_timeout))
+				hci_le_conn_rate_request(hdev, conn);
+		}
+	}
+
+	hci_dev_unlock(hdev);
+
+	return mgmt_cmd_complete(sk, hdev->id, MGMT_OP_LOAD_CONN_SUBRATE, 0,
 				 NULL, 0);
 }
 
@@ -9613,6 +9734,8 @@ static const struct hci_mgmt_handler mgmt_handlers[] = {
 						HCI_MGMT_VAR_LEN },
 	{ mesh_send_cancel,        MGMT_MESH_SEND_CANCEL_SIZE },
 	{ mgmt_hci_cmd_sync,       MGMT_HCI_CMD_SYNC_SIZE, HCI_MGMT_VAR_LEN },
+	{ load_conn_subrate,       MGMT_LOAD_CONN_SUBRATE_SIZE,
+						HCI_MGMT_VAR_LEN },
 };
 
 void mgmt_index_added(struct hci_dev *hdev)
@@ -9978,6 +10101,22 @@ bool mgmt_powering_down(struct hci_dev *hdev)
 	return false;
 }
 
+u8 hci_to_mgmt_reason(u8 err)
+{
+	switch (err) {
+	case HCI_ERROR_CONNECTION_TIMEOUT:
+		return MGMT_DEV_DISCONN_TIMEOUT;
+	case HCI_ERROR_REMOTE_USER_TERM:
+	case HCI_ERROR_REMOTE_LOW_RESOURCES:
+	case HCI_ERROR_REMOTE_POWER_OFF:
+		return MGMT_DEV_DISCONN_REMOTE;
+	case HCI_ERROR_LOCAL_HOST_TERM:
+		return MGMT_DEV_DISCONN_LOCAL_HOST;
+	default:
+		return MGMT_DEV_DISCONN_UNKNOWN;
+	}
+}
+
 void mgmt_device_disconnected(struct hci_dev *hdev, bdaddr_t *bdaddr,
 			      u8 link_type, u8 addr_type, u8 reason,
 			      bool mgmt_connected)
@@ -10039,7 +10178,8 @@ void mgmt_connect_failed(struct hci_dev *hdev, struct hci_conn *conn, u8 status)
 
 	if (test_and_clear_bit(HCI_CONN_MGMT_CONNECTED, &conn->flags)) {
 		mgmt_device_disconnected(hdev, &conn->dst, conn->type,
-					 conn->dst_type, status, true);
+					 conn->dst_type,
+					 hci_to_mgmt_reason(status), true);
 		return;
 	}
 
@@ -10746,6 +10886,23 @@ static struct hci_mgmt_chan chan = {
 int mgmt_init(void)
 {
 	return hci_mgmt_chan_register(&chan);
+}
+
+void mgmt_conn_subrate_notify(struct hci_dev *hdev, struct hci_conn *conn,
+			      u8 status)
+{
+	struct mgmt_ev_conn_subrate ev;
+
+	bacpy(&ev.addr.bdaddr, &conn->dst);
+	ev.addr.type = link_to_bdaddr(conn->type, conn->dst_type);
+	ev.status = mgmt_status(status);
+	ev.interval = cpu_to_le16(conn->le_rate_interval);
+	ev.subrate = cpu_to_le16(conn->le_subrate);
+	ev.latency = cpu_to_le16(conn->le_rate_latency);
+	ev.cont_num = cpu_to_le16(conn->le_cont_num);
+	ev.supv_timeout = cpu_to_le16(conn->le_rate_supv_timeout);
+
+	mgmt_event(MGMT_EV_CONN_SUBRATE, hdev, &ev, sizeof(ev), NULL);
 }
 
 void mgmt_exit(void)

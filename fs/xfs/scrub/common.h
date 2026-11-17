@@ -25,13 +25,15 @@ bool xchk_fblock_xref_process_error(struct xfs_scrub *sc,
 void xchk_block_set_preen(struct xfs_scrub *sc,
 		struct xfs_buf *bp);
 void xchk_ino_set_preen(struct xfs_scrub *sc, xfs_ino_t ino);
+void xchk_fblock_set_preen(struct xfs_scrub *sc,
+		int whichfork, xfs_fileoff_t offset);
 
 void xchk_set_corrupt(struct xfs_scrub *sc);
 void xchk_block_set_corrupt(struct xfs_scrub *sc,
 		struct xfs_buf *bp);
 void xchk_ino_set_corrupt(struct xfs_scrub *sc, xfs_ino_t ino);
 #define xchk_ip_set_corrupt(_sc, _ip) \
-	xchk_ino_set_corrupt((_sc), (_ip)->i_ino)
+	xchk_ino_set_corrupt((_sc), I_INO(_ip))
 void xchk_fblock_set_corrupt(struct xfs_scrub *sc, int whichfork,
 		xfs_fileoff_t offset);
 #ifdef CONFIG_XFS_QUOTA
@@ -72,7 +74,6 @@ int xchk_setup_ag_rmapbt(struct xfs_scrub *sc);
 int xchk_setup_ag_refcountbt(struct xfs_scrub *sc);
 int xchk_setup_inode(struct xfs_scrub *sc);
 int xchk_setup_inode_bmap(struct xfs_scrub *sc);
-int xchk_setup_inode_bmap_data(struct xfs_scrub *sc);
 int xchk_setup_directory(struct xfs_scrub *sc);
 int xchk_setup_xattr(struct xfs_scrub *sc);
 int xchk_setup_symlink(struct xfs_scrub *sc);

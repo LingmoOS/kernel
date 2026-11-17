@@ -18,13 +18,6 @@ struct btrfs_inode;
 
 #define BTRFS_BIO_INLINE_CSUM_SIZE	64
 
-/*
- * Maximum number of sectors for a single bio to limit the size of the
- * checksum array.  This matches the number of bio_vecs per bio and thus the
- * I/O size for buffered I/O.
- */
-#define BTRFS_MAX_BIO_SECTORS		(256)
-
 typedef void (*btrfs_bio_end_io_t)(struct btrfs_bio *bbio);
 
 /*
@@ -59,6 +52,7 @@ struct btrfs_bio {
 		 * - pointer to the checksums for this bio
 		 * - original physical address from the allocator
 		 *   (for zone append only)
+		 * - original logical address, used for checksumming fscrypt bios
 		 */
 		struct {
 			struct btrfs_ordered_extent *ordered;
@@ -67,38 +61,43 @@ struct btrfs_bio {
 			struct completion csum_done;
 			struct bvec_iter csum_saved_iter;
 			u64 orig_physical;
+			u64 orig_logical;
 		};
 
 		/* For metadata reads: parentness verification. */
 		struct btrfs_tree_parent_check parent_check;
 	};
 
+	/* For internal use in read end I/O handling */
+	struct work_struct end_io_work;
+
 	/* End I/O information supplied to btrfs_bio_alloc */
 	btrfs_bio_end_io_t end_io;
 	void *private;
 
-	/* For internal use in read end I/O handling */
-	unsigned int mirror_num;
 	atomic_t pending_ios;
-	struct work_struct end_io_work;
+	u16 mirror_num;
 
 	/* Save the first error status of split bio. */
 	blk_status_t status;
 
 	/* Use the commit root to look up csums (data read bio only). */
-	bool csum_search_commit_root;
+	bool csum_search_commit_root:1;
 
 	/*
 	 * Since scrub will reuse btree inode, we need this flag to distinguish
 	 * scrub bios.
 	 */
-	bool is_scrub;
+	bool is_scrub:1;
+
+	/* Whether the bio is coming from copy_remapped_data_io(). */
+	bool is_remap:1;
 
 	/* Whether the csum generation for data write is async. */
-	bool async_csum;
+	bool async_csum:1;
 
 	/* Whether the bio is written using zone append. */
-	bool can_use_append;
+	bool can_use_append:1;
 
 	/*
 	 * This member must come last, bio_alloc_bioset will allocate enough

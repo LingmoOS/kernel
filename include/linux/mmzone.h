@@ -2,7 +2,7 @@
 #ifndef _LINUX_MMZONE_H
 #define _LINUX_MMZONE_H
 
-#ifndef __ASSEMBLY__
+#ifndef __ASSEMBLER__
 #ifndef __GENERATING_BOUNDS_H
 
 #include <linux/spinlock.h>
@@ -23,6 +23,7 @@
 #include <linux/page-flags.h>
 #include <linux/local_lock.h>
 #include <linux/zswap.h>
+#include <linux/sizes.h>
 #include <asm/page.h>
 
 /* Free memory management - zoned buddy allocator.  */
@@ -60,6 +61,59 @@
  * will not.
  */
 #define PAGE_ALLOC_COSTLY_ORDER 3
+
+#if !defined(CONFIG_HAVE_GIGANTIC_FOLIOS)
+/*
+ * We don't expect any folios that exceed buddy sizes (and consequently
+ * memory sections).
+ */
+#define MAX_FOLIO_ORDER		MAX_PAGE_ORDER
+#elif defined(CONFIG_SPARSEMEM) && !defined(CONFIG_SPARSEMEM_VMEMMAP)
+/*
+ * Only pages within a single memory section are guaranteed to be
+ * contiguous. By limiting folios to a single memory section, all folio
+ * pages are guaranteed to be contiguous.
+ */
+#define MAX_FOLIO_ORDER		PFN_SECTION_SHIFT
+#elif defined(CONFIG_HUGETLB_PAGE)
+/*
+ * There is no real limit on the folio size. We limit them to the maximum we
+ * currently expect (see CONFIG_HAVE_GIGANTIC_FOLIOS): with hugetlb, we expect
+ * no folios larger than 16 GiB on 64bit and 1 GiB on 32bit.
+ */
+#ifdef CONFIG_64BIT
+#define MAX_FOLIO_ORDER		(ilog2(SZ_16G) - PAGE_SHIFT)
+#else
+#define MAX_FOLIO_ORDER		(ilog2(SZ_1G) - PAGE_SHIFT)
+#endif
+#else
+/*
+ * Without hugetlb, gigantic folios that are bigger than a single PUD are
+ * currently impossible.
+ */
+#define MAX_FOLIO_ORDER		(PUD_SHIFT - PAGE_SHIFT)
+#endif
+
+#define MAX_FOLIO_NR_PAGES	(1UL << MAX_FOLIO_ORDER)
+
+/*
+ * HugeTLB Vmemmap Optimization (HVO) requires struct pages of the head page to
+ * be naturally aligned with regard to the folio size.
+ *
+ * HVO which is only active if the size of struct page is a power of 2.
+ */
+#define MAX_FOLIO_VMEMMAP_ALIGN \
+	(IS_ENABLED(CONFIG_HUGETLB_PAGE_OPTIMIZE_VMEMMAP) && \
+	 is_power_of_2(sizeof(struct page)) ? \
+	 MAX_FOLIO_NR_PAGES * sizeof(struct page) : 0)
+
+/*
+ * vmemmap optimization (like HVO) is only possible for page orders that fill
+ * two or more pages with struct pages.
+ */
+#define VMEMMAP_TAIL_MIN_ORDER (ilog2(2 * PAGE_SIZE / sizeof(struct page)))
+#define __NR_VMEMMAP_TAILS (MAX_FOLIO_ORDER - VMEMMAP_TAIL_MIN_ORDER + 1)
+#define NR_VMEMMAP_TAILS (__NR_VMEMMAP_TAILS > 0 ? __NR_VMEMMAP_TAILS : 0)
 
 enum migratetype {
 	MIGRATE_UNMOVABLE,
@@ -123,9 +177,12 @@ static inline bool migratetype_is_mergeable(int mt)
 	return mt < MIGRATE_PCPTYPES;
 }
 
-#define for_each_migratetype_order(order, type) \
-	for (order = 0; order < NR_PAGE_ORDERS; order++) \
-		for (type = 0; type < MIGRATE_TYPES; type++)
+#define for_each_free_list(list, zone, order) 				\
+	for (order = 0; order < NR_PAGE_ORDERS; order++) 		\
+		for (unsigned int __type = 0; 				\
+		     __type < MIGRATE_TYPES &&				\
+			(list = &(zone)->free_area[order].free_list[__type], 1); \
+		     __type++)
 
 extern int page_group_by_mobility_disabled;
 
@@ -157,7 +214,6 @@ enum numa_stat_item {
 #endif
 
 enum zone_stat_item {
-	/* First 128 byte cacheline (assuming 64 bit words) */
 	NR_FREE_PAGES,
 	NR_FREE_PAGES_BLOCKS,
 	NR_ZONE_LRU_BASE, /* Used only for compaction and reclaim retry */
@@ -168,7 +224,6 @@ enum zone_stat_item {
 	NR_ZONE_UNEVICTABLE,
 	NR_ZONE_WRITE_PENDING,	/* Count of dirty, writeback and unstable pages */
 	NR_MLOCK,		/* mlock()ed pages found and moved off LRU */
-	/* Second 128 byte cacheline */
 #if IS_ENABLED(CONFIG_ZSMALLOC)
 	NR_ZSPAGES,		/* allocated in zsmalloc */
 #endif
@@ -220,6 +275,7 @@ enum node_stat_item {
 	NR_KERNEL_MISC_RECLAIMABLE,	/* reclaimable non-slab kernel pages */
 	NR_FOLL_PIN_ACQUIRED,	/* via: pin_user_page(), gup flag: FOLL_PIN */
 	NR_FOLL_PIN_RELEASED,	/* pages returned via unpin_user_page() */
+	NR_VMALLOC,
 	NR_KERNEL_STACK_KB,	/* measured in KiB */
 #if IS_ENABLED(CONFIG_SHADOW_CALL_STACK)
 	NR_KERNEL_SCS_KB,	/* measured in KiB */
@@ -255,11 +311,28 @@ enum node_stat_item {
 	PGDEMOTE_DIRECT,
 	PGDEMOTE_KHUGEPAGED,
 	PGDEMOTE_PROACTIVE,
+	PGSTEAL_KSWAPD,
+	PGSTEAL_DIRECT,
+	PGSTEAL_KHUGEPAGED,
+	PGSTEAL_PROACTIVE,
+	PGSTEAL_ANON,
+	PGSTEAL_FILE,
+	PGSCAN_KSWAPD,
+	PGSCAN_DIRECT,
+	PGSCAN_KHUGEPAGED,
+	PGSCAN_PROACTIVE,
+	PGSCAN_ANON,
+	PGSCAN_FILE,
+	PGROTATE_ANON,
+	PGROTATE_FILE,
+	PGREFILL,
 #ifdef CONFIG_HUGETLB_PAGE
 	NR_HUGETLB,
 #endif
 	NR_BALLOON_PAGES,
 	NR_KERNEL_FILE_PAGES,
+	NR_GPU_ACTIVE,	/* Pages assigned to GPU objects */
+	NR_GPU_RECLAIM,	/* Pages in shrinkable GPU pools */
 	NR_VM_NODE_STAT_ITEMS
 };
 
@@ -380,15 +453,15 @@ enum lruvec_flags {
  * least twice before handing this folio over to the eviction. The first check
  * clears the accessed bit from the initial fault; the second check makes sure
  * this folio hasn't been used since then. This process, AKA second chance,
- * requires a minimum of two generations, hence MIN_NR_GENS. And to maintain ABI
- * compatibility with the active/inactive LRU, e.g., /proc/vmstat, these two
- * generations are considered active; the rest of generations, if they exist,
- * are considered inactive. See lru_gen_is_active().
+ * requires a minimum of two generations, hence MIN_NR_GENS.
+ *
+ * Active/inactive is per-folio based on the referenced count;
+ * see the comment above MAX_NR_TIERS.
  *
  * PG_active is always cleared while a folio is on one of lrugen->folios[] so
- * that the sliding window needs not to worry about it. And it's set again when
- * a folio considered active is isolated for non-reclaiming purposes, e.g.,
- * migration. See lru_gen_add_folio() and lru_gen_del_folio().
+ * that the sliding window needs not to worry about it.  It is set on a
+ * fault-driven refault (see lru_gen_refault), or isolation (see
+ * lru_gen_del_folio).
  *
  * MAX_NR_GENS is set to 4 so that the multi-gen LRU can support twice the
  * number of categories of the active/inactive LRU when keeping track of
@@ -399,54 +472,128 @@ enum lruvec_flags {
 #define MAX_NR_GENS		4U
 
 /*
- * Each generation is divided into multiple tiers. A folio accessed N times
- * through file descriptors is in tier order_base_2(N). A folio in the first
- * tier (N=0,1) is marked by PG_referenced unless it was faulted in through page
- * tables or read ahead. A folio in the last tier (MAX_NR_TIERS-1) is marked by
- * PG_workingset. A folio in any other tier (1<N<5) between the first and last
- * is marked by additional bits of LRU_REFS_WIDTH in folio->flags.
+ * Each generation is divided into multiple tiers. A folio's referenced
+ * count maps to a tier as shown below:
  *
- * In contrast to moving across generations which requires the LRU lock, moving
- * across tiers only involves atomic operations on folio->flags and therefore
- * has a negligible cost in the buffered access path. In the eviction path,
- * comparisons of refaulted/(evicted+protected) from the first tier and the rest
- * infer whether folios accessed multiple times through file descriptors are
- * statistically hot and thus worth protecting.
+ * MGLRU (frequency guidance)
+ *  Refs  Tier  |- Refs: how many times (at least) a folio has been referenced.
+ *   0      0   |- Mostly cold pages, readahead, etc. [1]
+ *   1      0   |= LRU_REFS_REFERENCED: Used at least once. [2]
+ * -WORKINGSET-+|- Pages beyond are workingset and never fall below this floor. [3]
+ *   2      1<-+|= LRU_REFS_WORKINGSET: Classical workingset, accessed twice, protected. [4]
+ *   3      2   |- LRU_REFS_PROTECTED: Protected workingset, promoted pages capped at here. [5]
+ *   4      2   |
+ *   5      3   |- The tier here is MAX_NR_TIERS - 1
+ *   6      3   |
+ *   7      3   |= LRU_REFS_MAX: Promotion candidate. [6]
+ * -PROMOTION->-/
  *
- * MAX_NR_TIERS is set to 4 so that the multi-gen LRU can support twice the
- * number of categories of the active/inactive LRU when keeping track of
- * accesses through file descriptors. This uses MAX_NR_TIERS-2 spare bits in
- * folio->flags, masked by LRU_REFS_MASK.
+ * Ideally each tier holds folios of similar access patterns: lower tiers
+ * are less important and evicted faster.  A page's reference count and
+ * tier are capped when it changes generation, preventing it from
+ * dominating the new generation based on old-generation access history.
+ * Generation ordering already ensures a newer-gen page is hotter than an
+ * older-gen one regardless of tier.
+ *
+ * Refs tracks accesses from two sources: page table (lazily collected by
+ * the page table aging walk or rmap eviction lookup) and file descriptors
+ * (by folio_mark_accessed).  Page table accesses are weighted heavier
+ * because the accessed bit is sticky (undercounts repeated accesses),
+ * passively collected, and page faults are generally more important as
+ * userspace does not expect a memory access to block on reclaim.  Both
+ * access types increment refs by one; the result is capped at
+ * LRU_REFS_PROTECTED on promotion or deferral, or LRU_REFS_MAX otherwise.
+ *
+ * 1. Tier is fls(N-1) for N > 1, 0 otherwise.  Folios with zero
+ *    accesses (refs == 0) are generally cold, e.g. readahead folios.
+ *
+ *    Freshly allocated folios start with refs == 0; faulted and mapped
+ *    folios have their page table access bit set, so the first page table
+ *    access check always sets LRU_REFS_REFERENCED.  That is the second
+ *    chance described above MIN_NR_GENS: it moves the folio one
+ *    generation forward if it is at the tail of its LRU, i.e., in one
+ *    of the two oldest generations of its type.
+ *
+ * 2. Folios accessed once stay on tier 0: one-time usage does not
+ *    qualify for protection.  A second access advances the folio,
+ *    aligning with classical LRU's use-twice threshold.  A second page
+ *    table access promotes to the latest gen; file access only defers
+ *    eviction from the tail gens of its type.
+ *
+ * 3. Folios accessed at least twice are considered workingset.  This
+ *    mostly aligns with classical LRU: at least one I/O is saved by
+ *    keeping them in memory.  Folios at or above this level never fall
+ *    below tier 1 (the workingset floor), so tier 0 stays a clean tier
+ *    for cold cache while tier 1 serves as the fallback line for
+ *    actually reused or historically hot folios.
+ *
+ *    Folios refaulted through a page fault at refs 1 will enter the second
+ *    newest gen, so faulting will be protected better.
+ *
+ * 4. Starting from tier 1, PID protection sacrifices lower tiers to
+ *    protect higher tiers by comparing refault rates for long-term
+ *    accuracy, and caps higher refs to this value.  Since PID protection
+ *    bypasses page table lookup and clearing, when a further eviction
+ *    attempt occurs after PID loosens, the folio's page table access is
+ *    rechecked and a referenced folio is put back with refs capped to
+ *    this value as well.  This also gives folios a fair opportunity to be
+ *    promoted by file access again.
+ *
+ *    Folios refaulted through a page fault at tier 1 or above are activated
+ *    and enter the newest gen. Non fault page will enter second oldest gen,
+ *    driving aging and workingset shifting.
+ *
+ * 5. Pages beyond the ordinary workingset tier form new tiers for the
+ *    PID controller to protect differently.  Folios at or above this
+ *    level are capped at LRU_REFS_PROTECTED on promotion or deferral,
+ *    and at LRU_REFS_WORKINGSET under PID protection in the oldest
+ *    generation, where they represent a historical workingset.
+ *
+ * 6. Folios that reach LRU_REFS_MAX are advanced to the next generation
+ *    on further access, with refs capped to LRU_REFS_PROTECTED.  This
+ *    gives them a fair start for advancement to an even newer generation
+ *    while keeping hot folios distinguishable.
+ *
+ * Tiering uses PG_referenced and PG_workingset as the lower two bits,
+ * and the bits masked by LRU_REFS_MASK as the higher bits, so the refs
+ * count ranges from 0 to LRU_REFS_MAX.  A folio is on the workingset
+ * tier once accessed at least twice, which is more consistent with the
+ * classical LRU.
+ *
+ * A folio's referenced count never goes backwards except upon gen
+ * increase as described above, or when explicitly reset by
+ * folio_reset_lru_refs().  Refault of a reclaimed folio restores
+ * its referenced count, capped at LRU_REFS_PROTECTED, which aligns with
+ * promotion.  Page table refaults of previous workingset folios send
+ * them to the latest gen, driving aging faster.
+ *
+ * For the active/inactive LRU ABI (/proc/vmstat), a folio is active
+ * if its referenced count reaches LRU_REFS_ACTIVATED.  The threshold
+ * currently set to LRU_REFS_PROTECTED, which is tier 2.
+ *
+ * MAX_NR_TIERS is set to 4 so that the multi-gen LRU can support twice
+ * the number of categories of the active/inactive LRU.
  */
 #define MAX_NR_TIERS		4U
+#define LRU_TIER_MIN		0U
+#define LRU_TIER_MAX		(MAX_NR_TIERS - 1)
+
+/* Flags for folio_inc_lru_refs() */
+#define LRU_REF_MAPPED		0x1U
+#define LRU_REF_EXEC		0x2U
+#define LRU_REF_FORCE		0x4U
+
+#define LRU_REFS_REFERENCED	0x1
+#define LRU_REFS_WORKINGSET	0x2
+#define LRU_REFS_PROTECTED	0x3
+#define LRU_REFS_ACTIVATED	LRU_REFS_PROTECTED
 
 #ifndef __GENERATING_BOUNDS_H
 
 #define LRU_GEN_MASK		((BIT(LRU_GEN_WIDTH) - 1) << LRU_GEN_PGOFF)
 #define LRU_REFS_MASK		((BIT(LRU_REFS_WIDTH) - 1) << LRU_REFS_PGOFF)
-
-/*
- * For folios accessed multiple times through file descriptors,
- * lru_gen_inc_refs() sets additional bits of LRU_REFS_WIDTH in folio->flags
- * after PG_referenced, then PG_workingset after LRU_REFS_WIDTH. After all its
- * bits are set, i.e., LRU_REFS_FLAGS|BIT(PG_workingset), a folio is lazily
- * promoted into the second oldest generation in the eviction path. And when
- * folio_inc_gen() does that, it clears LRU_REFS_FLAGS so that
- * lru_gen_inc_refs() can start over. Note that for this case, LRU_REFS_MASK is
- * only valid when PG_referenced is set.
- *
- * For folios accessed multiple times through page tables, folio_update_gen()
- * from a page table walk or lru_gen_set_refs() from a rmap walk sets
- * PG_referenced after the accessed bit is cleared for the first time.
- * Thereafter, those two paths set PG_workingset and promote folios to the
- * youngest generation. Like folio_inc_gen(), folio_update_gen() also clears
- * PG_referenced. Note that for this case, LRU_REFS_MASK is not used.
- *
- * For both cases above, after PG_workingset is set on a folio, it remains until
- * this folio is either reclaimed, or "deactivated" by lru_gen_clear_refs(). It
- * can be set again if lru_gen_test_recent() returns true upon a refault.
- */
-#define LRU_REFS_FLAGS		(LRU_REFS_MASK | BIT(PG_referenced))
+#define LRU_REFS_FLAGS		(LRU_REFS_MASK | BIT(PG_referenced) | BIT(PG_workingset))
+#define LRU_REFS_MAX		(BIT(LRU_REFS_WIDTH + 2) - 1)
 
 struct lruvec;
 struct page_vma_mapped_walk;
@@ -497,7 +644,7 @@ struct lru_gen_folio {
 	/* the multi-gen LRU lists, lazily sorted on eviction */
 	struct list_head folios[MAX_NR_GENS][ANON_AND_FILE][MAX_NR_ZONES];
 	/* the multi-gen LRU sizes, eventually consistent */
-	long nr_pages[MAX_NR_GENS][ANON_AND_FILE][MAX_NR_ZONES];
+	atomic_long_t nr_pages[MAX_NR_GENS][ANON_AND_FILE][MAX_NR_ZONES];
 	/* the exponential moving average of refaulted */
 	unsigned long avg_refaulted[ANON_AND_FILE][MAX_NR_TIERS];
 	/* the exponential moving average of evicted+protected */
@@ -548,6 +695,8 @@ struct lru_gen_mm_walk {
 	unsigned long seq;
 	/* the next address within an mm to scan */
 	unsigned long next_addr;
+	/* to batch activated pages */
+	int nr_activated[ANON_AND_FILE][MAX_NR_ZONES];
 	/* to batch promoted pages */
 	int nr_pages[MAX_NR_GENS][ANON_AND_FILE][MAX_NR_ZONES];
 	/* to batch the mm stats */
@@ -616,7 +765,7 @@ struct lru_gen_memcg {
 
 void lru_gen_init_pgdat(struct pglist_data *pgdat);
 void lru_gen_init_lruvec(struct lruvec *lruvec);
-bool lru_gen_look_around(struct page_vma_mapped_walk *pvmw);
+bool lru_gen_look_around(struct page_vma_mapped_walk *pvmw, unsigned int nr);
 
 void lru_gen_init_memcg(struct mem_cgroup *memcg);
 void lru_gen_exit_memcg(struct mem_cgroup *memcg);
@@ -624,6 +773,9 @@ void lru_gen_online_memcg(struct mem_cgroup *memcg);
 void lru_gen_offline_memcg(struct mem_cgroup *memcg);
 void lru_gen_release_memcg(struct mem_cgroup *memcg);
 void lru_gen_soft_reclaim(struct mem_cgroup *memcg, int nid);
+void max_lru_gen_memcg(struct mem_cgroup *memcg, int nid);
+bool recheck_lru_gen_max_memcg(struct mem_cgroup *memcg, int nid);
+void lru_gen_reparent_memcg(struct mem_cgroup *memcg, struct mem_cgroup *parent, int nid);
 
 #else /* !CONFIG_LRU_GEN */
 
@@ -635,7 +787,8 @@ static inline void lru_gen_init_lruvec(struct lruvec *lruvec)
 {
 }
 
-static inline bool lru_gen_look_around(struct page_vma_mapped_walk *pvmw)
+static inline bool lru_gen_look_around(struct page_vma_mapped_walk *pvmw,
+		unsigned int nr)
 {
 	return false;
 }
@@ -664,7 +817,27 @@ static inline void lru_gen_soft_reclaim(struct mem_cgroup *memcg, int nid)
 {
 }
 
+static inline void max_lru_gen_memcg(struct mem_cgroup *memcg, int nid)
+{
+}
+
+static inline bool recheck_lru_gen_max_memcg(struct mem_cgroup *memcg, int nid)
+{
+	return true;
+}
+
+static inline
+void lru_gen_reparent_memcg(struct mem_cgroup *memcg, struct mem_cgroup *parent, int nid)
+{
+}
+
 #endif /* CONFIG_LRU_GEN */
+
+struct lru_cost {
+	unsigned long		count;
+	unsigned long		last_rotated;
+	unsigned long		last_io;
+};
 
 struct lruvec {
 	struct list_head		lists[NR_LRU_LISTS];
@@ -674,9 +847,12 @@ struct lruvec {
 	 * These track the cost of reclaiming one LRU - file or anon -
 	 * over the other. As the observed cost of reclaiming one LRU
 	 * increases, the reclaim scan balance tips toward the other.
+	 * Updated and decayed at prepare_scan_control() time; cost_lock
+	 * serialises that update.
 	 */
-	unsigned long			anon_cost;
-	unsigned long			file_cost;
+	struct lru_cost			cost[ANON_AND_FILE];
+	/* Protects cost[]. */
+	spinlock_t			cost_lock;
 	/* Non-resident age, driven by LRU movement */
 	atomic_long_t			nonresident_age;
 	/* Refaults at the time of last reclaim cycle */
@@ -1057,13 +1233,12 @@ struct zone {
 	/* Zone statistics */
 	atomic_long_t		vm_stat[NR_VM_ZONE_STAT_ITEMS];
 	atomic_long_t		vm_numa_event[NR_VM_NUMA_EVENT_ITEMS];
+#ifdef CONFIG_HUGETLB_PAGE_OPTIMIZE_VMEMMAP
+	struct page *vmemmap_tails[NR_VMEMMAP_TAILS];
+#endif
 } ____cacheline_internodealigned_in_smp;
 
 enum pgdat_flags {
-	PGDAT_DIRTY,			/* reclaim scanning has recently found
-					 * many dirty file pages at the tail
-					 * of the LRU.
-					 */
 	PGDAT_WRITEBACK,		/* reclaim scanning has recently found
 					 * many pages under writeback
 					 */
@@ -1184,31 +1359,33 @@ static inline bool zone_is_empty(const struct zone *zone)
 #define KASAN_TAG_MASK		((1UL << KASAN_TAG_WIDTH) - 1)
 #define ZONEID_MASK		((1UL << ZONEID_SHIFT) - 1)
 
-static inline enum zone_type memdesc_zonenum(memdesc_flags_t flags)
+static inline enum zone_type memdesc_zonenum(const memdesc_flags_t *flags)
 {
-	ASSERT_EXCLUSIVE_BITS(flags.f, ZONES_MASK << ZONES_PGSHIFT);
-	return (flags.f >> ZONES_PGSHIFT) & ZONES_MASK;
+#if ZONES_WIDTH != 0
+	ASSERT_EXCLUSIVE_BITS(flags->f, ZONES_MASK << ZONES_PGSHIFT);
+#endif
+	return (flags->f >> ZONES_PGSHIFT) & ZONES_MASK;
 }
 
 static inline enum zone_type page_zonenum(const struct page *page)
 {
-	return memdesc_zonenum(page->flags);
+	return memdesc_zonenum(&page->flags);
 }
 
 static inline enum zone_type folio_zonenum(const struct folio *folio)
 {
-	return memdesc_zonenum(folio->flags);
+	return memdesc_zonenum(&folio->flags);
 }
 
 #ifdef CONFIG_ZONE_DEVICE
-static inline bool memdesc_is_zone_device(memdesc_flags_t mdf)
+static inline bool memdesc_is_zone_device(const memdesc_flags_t *mdf)
 {
 	return memdesc_zonenum(mdf) == ZONE_DEVICE;
 }
 
 static inline struct dev_pagemap *page_pgmap(const struct page *page)
 {
-	VM_WARN_ON_ONCE_PAGE(!memdesc_is_zone_device(page->flags), page);
+	VM_WARN_ON_ONCE_PAGE(!memdesc_is_zone_device(&page->flags), page);
 	return page_folio(page)->pgmap;
 }
 
@@ -1223,9 +1400,9 @@ static inline struct dev_pagemap *page_pgmap(const struct page *page)
 static inline bool zone_device_pages_have_same_pgmap(const struct page *a,
 						     const struct page *b)
 {
-	if (memdesc_is_zone_device(a->flags) != memdesc_is_zone_device(b->flags))
+	if (memdesc_is_zone_device(&a->flags) != memdesc_is_zone_device(&b->flags))
 		return false;
-	if (!memdesc_is_zone_device(a->flags))
+	if (!memdesc_is_zone_device(&a->flags))
 		return true;
 	return page_pgmap(a) == page_pgmap(b);
 }
@@ -1233,7 +1410,7 @@ static inline bool zone_device_pages_have_same_pgmap(const struct page *a,
 extern void memmap_init_zone_device(struct zone *, unsigned long,
 				    unsigned long, struct dev_pagemap *);
 #else
-static inline bool memdesc_is_zone_device(memdesc_flags_t mdf)
+static inline bool memdesc_is_zone_device(const memdesc_flags_t *mdf)
 {
 	return false;
 }
@@ -1250,12 +1427,12 @@ static inline struct dev_pagemap *page_pgmap(const struct page *page)
 
 static inline bool is_zone_device_page(const struct page *page)
 {
-	return memdesc_is_zone_device(page->flags);
+	return memdesc_is_zone_device(&page->flags);
 }
 
 static inline bool folio_is_zone_device(const struct folio *folio)
 {
-	return memdesc_is_zone_device(folio->flags);
+	return memdesc_is_zone_device(&folio->flags);
 }
 
 static inline bool is_zone_movable_page(const struct page *page)
@@ -1340,14 +1517,6 @@ struct zonelist {
  * that rely on that.
  */
 extern struct page *mem_map;
-
-#ifdef CONFIG_TRANSPARENT_HUGEPAGE
-struct deferred_split {
-	spinlock_t split_queue_lock;
-	struct list_head split_queue;
-	unsigned long split_queue_len;
-};
-#endif
 
 #ifdef CONFIG_MEMORY_FAILURE
 /*
@@ -1474,10 +1643,6 @@ typedef struct pglist_data {
 	unsigned long first_deferred_pfn;
 #endif /* CONFIG_DEFERRED_STRUCT_PAGE_INIT */
 
-#ifdef CONFIG_TRANSPARENT_HUGEPAGE
-	struct deferred_split deferred_split_queue;
-#endif
-
 #ifdef CONFIG_NUMA_BALANCING
 	/* start time in ms of current promote rate limit period */
 	unsigned int nbp_rl_start;
@@ -1538,14 +1703,27 @@ static inline unsigned long pgdat_end_pfn(pg_data_t *pgdat)
 #include <linux/memory_hotplug.h>
 
 void build_all_zonelists(pg_data_t *pgdat);
-void wakeup_kswapd(struct zone *zone, gfp_t gfp_mask, int order,
-		   enum zone_type highest_zoneidx);
 bool __zone_watermark_ok(struct zone *z, unsigned int order, unsigned long mark,
 			 int highest_zoneidx, unsigned int alloc_flags,
 			 long free_pages);
 bool zone_watermark_ok(struct zone *z, unsigned int order,
 		unsigned long mark, int highest_zoneidx,
 		unsigned int alloc_flags);
+
+enum kswapd_clear_hopeless_reason {
+	KSWAPD_CLEAR_HOPELESS_OTHER = 0,
+	KSWAPD_CLEAR_HOPELESS_KSWAPD,
+	KSWAPD_CLEAR_HOPELESS_DIRECT,
+	KSWAPD_CLEAR_HOPELESS_PCP,
+};
+
+void wakeup_kswapd(struct zone *zone, gfp_t gfp_mask, int order,
+		   enum zone_type highest_zoneidx);
+void kswapd_try_clear_hopeless(struct pglist_data *pgdat,
+			       unsigned int order, int highest_zoneidx);
+void kswapd_clear_hopeless(pg_data_t *pgdat, enum kswapd_clear_hopeless_reason reason);
+bool kswapd_test_hopeless(pg_data_t *pgdat);
+
 /*
  * Memory initialization context, use to differentiate memory added by
  * the platform statically or via memory hotplug interface.
@@ -1652,14 +1830,15 @@ static inline int is_highmem(const struct zone *zone)
 	return is_highmem_idx(zone_idx(zone));
 }
 
-#ifdef CONFIG_ZONE_DMA
-bool has_managed_dma(void);
-#else
+bool has_managed_zone(enum zone_type zone);
 static inline bool has_managed_dma(void)
 {
+#ifdef CONFIG_ZONE_DMA
+	return has_managed_zone(ZONE_DMA);
+#else
 	return false;
-}
 #endif
+}
 
 
 #ifndef CONFIG_NUMA
@@ -1725,7 +1904,7 @@ static inline int zonelist_node_idx(const struct zoneref *zoneref)
 
 struct zoneref *__next_zones_zonelist(struct zoneref *z,
 					enum zone_type highest_zoneidx,
-					nodemask_t *nodes);
+					const nodemask_t *nodes);
 
 /**
  * next_zones_zonelist - Returns the next zone at or below highest_zoneidx within the allowed nodemask using a cursor within a zonelist as a starting point
@@ -1744,7 +1923,7 @@ struct zoneref *__next_zones_zonelist(struct zoneref *z,
  */
 static __always_inline struct zoneref *next_zones_zonelist(struct zoneref *z,
 					enum zone_type highest_zoneidx,
-					nodemask_t *nodes)
+					const nodemask_t *nodes)
 {
 	if (likely(!nodes && zonelist_zone_idx(z) <= highest_zoneidx))
 		return z;
@@ -1770,7 +1949,7 @@ static __always_inline struct zoneref *next_zones_zonelist(struct zoneref *z,
  */
 static inline struct zoneref *first_zones_zonelist(struct zonelist *zonelist,
 					enum zone_type highest_zoneidx,
-					nodemask_t *nodes)
+					const nodemask_t *nodes)
 {
 	return next_zones_zonelist(zonelist->_zonerefs,
 							highest_zoneidx, nodes);
@@ -1900,15 +2079,13 @@ struct mem_section_usage {
 	unsigned long pageblock_flags[0];
 };
 
-void subsection_map_init(unsigned long pfn, unsigned long nr_pages);
-
 struct page;
 struct page_ext;
 struct mem_section {
 	/*
 	 * This is, logically, a pointer to an array of struct
 	 * pages.  However, it is stored with some other magic.
-	 * (see sparse.c::sparse_init_one_section())
+	 * (see sparse_init_one_section())
 	 *
 	 * Additionally during early boot we encode node id of
 	 * the location of the section here to guide allocation.
@@ -1968,24 +2145,18 @@ static inline struct mem_section *__nr_to_section(unsigned long nr)
 #endif
 	return &mem_section[root][nr & SECTION_ROOT_MASK];
 }
-extern size_t mem_section_usage_size(void);
 
 /*
- * We use the lower bits of the mem_map pointer to store
- * a little bit of information.  The pointer is calculated
- * as mem_map - section_nr_to_pfn(pnum).  The result is
- * aligned to the minimum alignment of the two values:
- *   1. All mem_map arrays are page-aligned.
- *   2. section_nr_to_pfn() always clears PFN_SECTION_SHIFT
- *      lowest bits.  PFN_SECTION_SHIFT is arch-specific
- *      (equal SECTION_SIZE_BITS - PAGE_SHIFT), and the
- *      worst combination is powerpc with 256k pages,
- *      which results in PFN_SECTION_SHIFT equal 6.
- * To sum it up, at least 6 bits are available on all architectures.
- * However, we can exceed 6 bits on some other architectures except
- * powerpc (e.g. 15 bits are available on x86_64, 13 bits are available
- * with the worst case of 64K pages on arm64) if we make sure the
- * exceeded bit is not applicable to powerpc.
+ * We use the lower bits of the mem_map pointer to store a little bit of
+ * information. The pointer is calculated as mem_map - section_nr_to_pfn().
+ * The result is aligned to the minimum alignment of the two values:
+ *
+ * 1. All mem_map arrays are page-aligned.
+ * 2. section_nr_to_pfn() always clears PFN_SECTION_SHIFT lowest bits.
+ *
+ * We always expect a single section to cover full pages. Therefore,
+ * we can safely assume that PFN_SECTION_SHIFT is large enough to
+ * accommodate SECTION_MAP_LAST_BIT. We use BUILD_BUG_ON() to ensure this.
  */
 enum {
 	SECTION_MARKED_PRESENT_BIT,
@@ -2073,18 +2244,12 @@ static inline int preinited_vmemmap_section(const struct mem_section *section)
 }
 
 void sparse_vmemmap_init_nid_early(int nid);
-void sparse_vmemmap_init_nid_late(int nid);
-
 #else
 static inline int preinited_vmemmap_section(const struct mem_section *section)
 {
 	return 0;
 }
 static inline void sparse_vmemmap_init_nid_early(int nid)
-{
-}
-
-static inline void sparse_vmemmap_init_nid_late(int nid)
 {
 }
 #endif
@@ -2289,14 +2454,9 @@ static inline unsigned long next_present_section_nr(unsigned long section_nr)
 #define pfn_to_nid(pfn)		(0)
 #endif
 
-void sparse_init(void);
 #else
-#define sparse_init()	do {} while (0)
-#define sparse_index_init(_sec, _nid)  do {} while (0)
-#define sparse_vmemmap_init_nid_early(_nid, _use) do {} while (0)
-#define sparse_vmemmap_init_nid_late(_nid) do {} while (0)
+#define sparse_vmemmap_init_nid_early(_nid) do {} while (0)
 #define pfn_in_present_section pfn_valid
-#define subsection_map_init(_pfn, _nr_pages) do {} while (0)
 #endif /* CONFIG_SPARSEMEM */
 
 /*
@@ -2310,5 +2470,5 @@ void sparse_init(void);
 #endif
 
 #endif /* !__GENERATING_BOUNDS.H */
-#endif /* !__ASSEMBLY__ */
+#endif /* !__ASSEMBLER__ */
 #endif /* _LINUX_MMZONE_H */

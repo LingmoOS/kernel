@@ -47,9 +47,9 @@
  * want to register another driver on the same PCI id.
  */
 static const struct pci_device_id pci_tbl[] = {
-	{ PCI_VDEVICE(AMD, 0x7443), 0, },
-	{ PCI_VDEVICE(AMD, 0x746b), 0, },
-	{ 0, },	/* terminate list */
+	{ PCI_VDEVICE(AMD, 0x7443) },
+	{ PCI_VDEVICE(AMD, 0x746b) },
+	{ }	/* terminate list */
 };
 MODULE_DEVICE_TABLE(pci, pci_tbl);
 
@@ -80,7 +80,7 @@ static int amd_rng_read(struct hwrng *rng, void *buf, size_t max, bool wait)
 				if (timeout-- == 0)
 					return read;
 			} else {
-				return 0;
+				return read;
 			}
 		} else {
 			*data = ioread32(priv->iobase + RNGDATA);
@@ -154,7 +154,7 @@ found:
 		goto put_dev;
 	}
 
-	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+	priv = kzalloc_obj(*priv);
 	if (!priv) {
 		err = -ENOMEM;
 		goto put_dev;

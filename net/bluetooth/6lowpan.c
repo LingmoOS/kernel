@@ -647,7 +647,7 @@ static struct l2cap_chan *add_peer_chan(struct l2cap_chan *chan,
 {
 	struct lowpan_peer *peer;
 
-	peer = kzalloc(sizeof(*peer), GFP_ATOMIC);
+	peer = kzalloc_obj(*peer, GFP_ATOMIC);
 	if (!peer)
 		return NULL;
 
@@ -1007,6 +1007,8 @@ static int get_l2cap_conn(char *buf, bdaddr_t *addr, u8 *addr_type,
 		return -ENOENT;
 	}
 
+	lockdep_assert_held(&hcon->hdev->lock);
+
 	*conn = l2cap_conn_hold_unless_zero(hcon->l2cap_data);
 
 	BT_DBG("conn %p dst %pMR type %u", *conn, &hcon->dst, hcon->dst_type);
@@ -1207,6 +1209,7 @@ static int lowpan_control_open(struct inode *inode, struct file *file)
 }
 
 static const struct file_operations lowpan_control_fops = {
+	.owner		= THIS_MODULE,
 	.open		= lowpan_control_open,
 	.read		= seq_read,
 	.write		= lowpan_control_write,
@@ -1229,7 +1232,7 @@ static void disconnect_devices(void)
 	rcu_read_lock();
 
 	list_for_each_entry_rcu(entry, &bt_6lowpan_devices, list) {
-		new_dev = kmalloc(sizeof(*new_dev), GFP_ATOMIC);
+		new_dev = kmalloc_obj(*new_dev, GFP_ATOMIC);
 		if (!new_dev)
 			break;
 

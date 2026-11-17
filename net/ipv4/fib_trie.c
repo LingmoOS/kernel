@@ -2044,18 +2044,12 @@ int fib_table_flush(struct net *net, struct fib_table *tb, bool flush_all)
 		hlist_for_each_entry_safe(fa, tmp, &n->leaf, fa_list) {
 			struct fib_info *fi = fa->fa_info;
 
-			if (!fi || tb->tb_id != fa->tb_id ||
-			    (!(fi->fib_flags & RTNH_F_DEAD) &&
-			     !fib_props[fa->fa_type].error)) {
+			if (!fi || tb->tb_id != fa->tb_id) {
 				slen = fa->fa_slen;
 				continue;
 			}
 
-			/* When not flushing the entire table, skip error
-			 * routes that are not marked for deletion.
-			 */
-			if (!flush_all && fib_props[fa->fa_type].error &&
-			    !(fi->fib_flags & RTNH_F_DEAD)) {
+			if (!flush_all && !(fi->fib_flags & RTNH_F_DEAD)) {
 				slen = fa->fa_slen;
 				continue;
 			}
@@ -2141,8 +2135,7 @@ void fib_info_notify_update(struct net *net, struct nl_info *info)
 		struct hlist_head *head = &net->ipv4.fib_table_hash[h];
 		struct fib_table *tb;
 
-		hlist_for_each_entry_rcu(tb, head, tb_hlist,
-					 lockdep_rtnl_is_held())
+		hlist_for_each_entry_rcu(tb, head, tb_hlist, true)
 			__fib_info_notify_update(net, tb, info);
 	}
 }

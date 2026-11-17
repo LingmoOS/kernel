@@ -138,14 +138,32 @@ static void io_init_poll_iocb(struct io_poll *poll, __poll_t events)
 	init_waitqueue_func_entry(&poll->wait, io_poll_wake);
 }
 
+static void io_poll_remove_waitq(struct io_poll *poll)
+{
+	/*
+	 * If the waitqueue is being freed early but someone is already holds
+	 * ownership over it, we have to tear down the request as best we can.
+	 * That means immediately removing the request from its waitqueue and
+	 * preventing all further accesses to the waitqueue via the request.
+	 */
+	list_del_init(&poll->wait.entry);
+
+	/*
+	 * Careful: this *must* be the last step, since as soon as req->head is
+	 * NULL'ed out, the request can be completed and freed, since
+	 * io_poll_remove_entry() will no longer need to take the waitqueue
+	 * lock.
+	 */
+	smp_store_release(&poll->head, NULL);
+}
+
 static inline void io_poll_remove_entry(struct io_poll *poll)
 {
 	struct wait_queue_head *head = smp_load_acquire(&poll->head);
 
 	if (head) {
 		spin_lock_irq(&head->lock);
-		list_del_init(&poll->wait.entry);
-		poll->head = NULL;
+		io_poll_remove_waitq(poll);
 		spin_unlock_irq(&head->lock);
 	}
 }
@@ -262,8 +280,10 @@ static int io_poll_check_events(struct io_kiocb *req, io_tw_token_t tw)
 
 		/* the mask was stashed in __io_poll_execute */
 		if (!req->cqe.res) {
-			struct poll_table_struct pt = { ._key = req->apoll_events };
-			req->cqe.res = vfs_poll(req->file, &pt) & req->apoll_events;
+			__poll_t events = req->apoll_events;
+			struct poll_table_struct pt = { ._key = events };
+
+			req->cqe.res = vfs_poll(req->file, &pt) & events;
 			/*
 			 * We got woken with a mask, but someone else got to
 			 * it first. The above vfs_poll() doesn't add us back
@@ -272,7 +292,7 @@ static int io_poll_check_events(struct io_kiocb *req, io_tw_token_t tw)
 			 */
 			if (unlikely(!req->cqe.res)) {
 				/* Multishot armed need not reissue */
-				if (!(req->apoll_events & EPOLLONESHOT))
+				if (!(events & EPOLLONESHOT))
 					continue;
 				return IOU_POLL_REISSUE;
 			}
@@ -383,23 +403,7 @@ static __cold int io_pollfree_wake(struct io_kiocb *req, struct io_poll *poll)
 	io_poll_mark_cancelled(req);
 	/* we have to kick tw in case it's not already */
 	io_poll_execute(req, 0, IOU_F_TWQ_IN_WAKE);
-
-	/*
-	 * If the waitqueue is being freed early but someone is already
-	 * holds ownership over it, we have to tear down the request as
-	 * best we can. That means immediately removing the request from
-	 * its waitqueue and preventing all further accesses to the
-	 * waitqueue via the request.
-	 */
-	list_del_init(&poll->wait.entry);
-
-	/*
-	 * Careful: this *must* be the last step, since as soon
-	 * as req->head is NULL'ed out, the request can be
-	 * completed and freed, since aio_poll_complete_work()
-	 * will no longer need to take the waitqueue lock.
-	 */
-	smp_store_release(&poll->head, NULL);
+	io_poll_remove_waitq(poll);
 	return 1;
 }
 
@@ -430,8 +434,7 @@ static int io_poll_wake(struct wait_queue_entry *wait, unsigned mode, int sync,
 
 		/* optional, saves extra locking for removal in tw handler */
 		if (mask && poll->events & EPOLLONESHOT) {
-			list_del_init(&poll->wait.entry);
-			poll->head = NULL;
+			io_poll_remove_waitq(poll);
 			if (wqe_is_double(wait))
 				req->flags &= ~REQ_F_DOUBLE_POLL;
 			else
@@ -494,7 +497,7 @@ static void __io_queue_proc(struct io_poll *poll, struct io_poll_table *pt,
 			return;
 		}
 
-		poll = kmalloc(sizeof(*poll), GFP_ATOMIC);
+		poll = kmalloc_obj(*poll, GFP_ATOMIC);
 		if (!poll) {
 			pt->error = -ENOMEM;
 			return;
@@ -683,7 +686,7 @@ static struct async_poll *io_req_alloc_apoll(struct io_kiocb *req,
 		if (!(issue_flags & IO_URING_F_UNLOCKED))
 			apoll = io_cache_alloc(&ctx->apoll_cache, GFP_ATOMIC);
 		else
-			apoll = kmalloc(sizeof(*apoll), GFP_ATOMIC);
+			apoll = kmalloc_obj(*apoll, GFP_ATOMIC);
 		if (!apoll)
 			return NULL;
 		apoll->poll.retries = APOLL_MAX_RETRY;

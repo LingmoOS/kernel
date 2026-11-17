@@ -13,13 +13,26 @@
 #include <linux/err.h>
 #include <linux/init.h>
 #include <linux/io.h>
+#include <linux/ioport.h>
 #include <linux/kernel.h>
+#include <linux/device-id/coreboot.h>
+#include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 
 #include "coreboot_table.h"
+
+/* Coreboot table header structure */
+struct coreboot_table_header {
+	char signature[4];
+	u32 header_bytes;
+	u32 header_checksum;
+	u32 table_bytes;
+	u32 table_checksum;
+	u32 table_entries;
+};
 
 #define CB_DEV(d) container_of(d, struct coreboot_device, dev)
 #define CB_DRV(d) container_of_const(d, struct coreboot_driver, drv)
@@ -112,7 +125,7 @@ static int coreboot_table_populate(struct device *dev, void *ptr, resource_size_
 
 	ptr_end = ptr + len;
 	ptr_entry = ptr + header->header_bytes;
-	for (i = 0; i < header->table_entries; i++) {
+	for (i = 0; i < header->table_entries; i++, ptr_entry += entry->size) {
 		if (ptr_entry + sizeof(*entry) > ptr_end)
 			return -EINVAL;
 		entry = ptr_entry;
@@ -136,6 +149,26 @@ static int coreboot_table_populate(struct device *dev, void *ptr, resource_size_
 
 		switch (device->entry.tag) {
 		case LB_TAG_CBMEM_ENTRY:
+			/*
+			 * Skip entries that are not exclusively System RAM or
+			 * Reserved memory.
+			 * On ARM64, no-map regions are filtered out as they are
+			 * IORESOURCE_MEM (see request_standard_resources() in
+			 * arch/arm64/kernel/setup.c).
+			 * On x86, CBMEM often resides in standard reserved regions
+			 * (IORES_DESC_RESERVED).
+			 */
+			if (region_intersects(device->cbmem_entry.address,
+					      device->cbmem_entry.entry_size,
+					      IORESOURCE_SYSTEM_RAM,
+					      IORES_DESC_NONE) != REGION_INTERSECTS &&
+			    region_intersects(device->cbmem_entry.address,
+					      device->cbmem_entry.entry_size,
+					      IORESOURCE_MEM,
+					      IORES_DESC_RESERVED) != REGION_INTERSECTS) {
+				kfree(device);
+				continue;
+			}
 			dev_set_name(&device->dev, "cbmem-%08x",
 				     device->cbmem_entry.id);
 			break;
@@ -146,11 +179,9 @@ static int coreboot_table_populate(struct device *dev, void *ptr, resource_size_
 
 		ret = device_register(&device->dev);
 		if (ret) {
+			dev_warn(dev, "failed to register coreboot device: %d\n", ret);
 			put_device(&device->dev);
-			return ret;
 		}
-
-		ptr_entry += entry->size;
 	}
 
 	return 0;
@@ -267,7 +298,7 @@ static void __exit coreboot_table_driver_exit(void)
 	bus_unregister(&coreboot_bus_type);
 }
 
-module_init(coreboot_table_driver_init);
+subsys_initcall(coreboot_table_driver_init);
 module_exit(coreboot_table_driver_exit);
 
 MODULE_AUTHOR("Google, Inc.");

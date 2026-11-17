@@ -31,29 +31,29 @@
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
-#include <linux/platform_device.h>
-#include <linux/dma-mapping.h>
-#include <linux/init.h>
-#include <linux/module.h>
-#include <linux/mm.h>
-#include <linux/device.h>
-#include <linux/dmaengine.h>
-#include <linux/hardirq.h>
-#include <linux/spinlock.h>
-#include <linux/of.h>
-#include <linux/property.h>
-#include <linux/percpu.h>
-#include <linux/rcupdate.h>
-#include <linux/mutex.h>
-#include <linux/jiffies.h>
-#include <linux/rculist.h>
-#include <linux/idr.h>
-#include <linux/slab.h>
 #include <linux/acpi.h>
 #include <linux/acpi_dma.h>
-#include <linux/of_dma.h>
+#include <linux/device.h>
+#include <linux/dma-mapping.h>
+#include <linux/dmaengine.h>
+#include <linux/hardirq.h>
+#include <linux/idr.h>
+#include <linux/init.h>
+#include <linux/jiffies.h>
 #include <linux/mempool.h>
+#include <linux/mm.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/numa.h>
+#include <linux/of.h>
+#include <linux/of_dma.h>
+#include <linux/percpu.h>
+#include <linux/platform_device.h>
+#include <linux/property.h>
+#include <linux/rculist.h>
+#include <linux/rcupdate.h>
+#include <linux/slab.h>
+#include <linux/spinlock.h>
 
 #include "dmaengine.h"
 
@@ -434,6 +434,12 @@ static void dma_device_release(struct kref *ref)
 		device->device_release(device);
 }
 
+static int __must_check dma_device_get(struct dma_device *device)
+{
+	lockdep_assert_held(&dma_list_mutex);
+	return kref_get_unless_zero(&device->ref);
+}
+
 static void dma_device_put(struct dma_device *device)
 {
 	lockdep_assert_held(&dma_list_mutex);
@@ -461,8 +467,7 @@ static int dma_chan_get(struct dma_chan *chan)
 	if (!try_module_get(owner))
 		return -ENODEV;
 
-	ret = kref_get_unless_zero(&chan->device->ref);
-	if (!ret) {
+	if (!dma_device_get(chan->device)) {
 		ret = -ENODEV;
 		goto module_put_out;
 	}
@@ -771,7 +776,7 @@ struct dma_chan *__dma_request_channel(const dma_cap_mask_t *mask,
 	mutex_lock(&dma_list_mutex);
 	list_for_each_entry_safe(device, _d, &dma_device_list, global_node) {
 		/* Finds a DMA controller with matching device node */
-		if (np && device->dev->of_node && np != device->dev->of_node)
+		if (np && !device_match_of_node(device->dev, np))
 			continue;
 
 		chan = find_candidate(device, mask, fn, fn_param);
@@ -820,9 +825,14 @@ static const struct dma_slave_map *dma_filter_match(struct dma_device *device,
  */
 struct dma_chan *dma_request_chan(struct device *dev, const char *name)
 {
-	struct fwnode_handle *fwnode = dev_fwnode(dev);
+	struct fwnode_handle *fwnode;
 	struct dma_device *d, *_d;
 	struct dma_chan *chan = NULL;
+
+	if (WARN_ON(!dev || !name))
+		return ERR_PTR(-EINVAL);
+
+	fwnode = dev_fwnode(dev);
 
 	if (is_of_node(fwnode))
 		chan = of_dma_request_slave_channel(to_of_node(fwnode), name);
@@ -950,12 +960,14 @@ static void dmaenginem_release_channel(void *chan)
 
 struct dma_chan *devm_dma_request_chan(struct device *dev, const char *name)
 {
-	struct dma_chan *chan = dma_request_chan(dev, name);
-	int ret = 0;
+	struct dma_chan *chan;
+	int ret;
 
-	if (!IS_ERR(chan))
-		ret = devm_add_action_or_reset(dev, dmaenginem_release_channel, chan);
+	chan = dma_request_chan(dev, name);
+	if (IS_ERR(chan))
+		return chan;
 
+	ret = devm_add_action_or_reset(dev, dmaenginem_release_channel, chan);
 	if (ret)
 		return ERR_PTR(ret);
 
@@ -1082,7 +1094,7 @@ static int __dma_async_device_channel_register(struct dma_device *device,
 	chan->local = alloc_percpu(typeof(*chan->local));
 	if (!chan->local)
 		return -ENOMEM;
-	chan->dev = kzalloc(sizeof(*chan->dev), GFP_KERNEL);
+	chan->dev = kzalloc_obj(*chan->dev);
 	if (!chan->dev) {
 		rc = -ENOMEM;
 		goto err_free_local;
@@ -1104,6 +1116,8 @@ static int __dma_async_device_channel_register(struct dma_device *device,
 	chan->dev->device.parent = device->dev;
 	chan->dev->chan = chan;
 	chan->dev->dev_id = device->dev_id;
+	spin_lock_init(&chan->lock);
+
 	if (!name)
 		dev_set_name(&chan->dev->device, "dma%dchan%d", device->dev_id, chan->chan_id);
 	else

@@ -45,9 +45,11 @@
 #include <linux/task_work.h>
 #include <linux/hardirq.h>
 #include <linux/kexec.h>
+#include <linux/vmcore_info.h>
 
 #include <asm/fred.h>
 #include <asm/cpu_device_id.h>
+#include <asm/cpuid/api.h>
 #include <asm/processor.h>
 #include <asm/traps.h>
 #include <asm/tlbflush.h>
@@ -65,8 +67,6 @@ static DEFINE_MUTEX(mce_sysfs_mutex);
 #include <trace/events/mce.h>
 
 #define SPINUNIT		100	/* 100ns */
-
-DEFINE_PER_CPU(unsigned, mce_exception_count);
 
 DEFINE_PER_CPU_READ_MOSTLY(unsigned int, mce_num_banks);
 
@@ -664,7 +664,10 @@ static noinstr void mce_read_aux(struct mce_hw_err *err, int i)
 		m->misc = mce_rdmsrq(mca_msr_reg(i, MCA_MISC));
 
 	if (m->status & MCI_STATUS_ADDRV) {
-		m->addr = mce_rdmsrq(mca_msr_reg(i, MCA_ADDR));
+		if (m->kflags & MCE_CHECK_DFR_REGS)
+			m->addr = mce_rdmsrq(MSR_AMD64_SMCA_MCx_DEADDR(i));
+		else
+			m->addr = mce_rdmsrq(mca_msr_reg(i, MCA_ADDR));
 
 		/*
 		 * Mask the reported address by the reported granularity.
@@ -689,7 +692,28 @@ static noinstr void mce_read_aux(struct mce_hw_err *err, int i)
 	}
 }
 
-DEFINE_PER_CPU(unsigned, mce_poll_count);
+/*
+ * We have three scenarios for checking for Deferred errors:
+ *
+ * 1) Non-SMCA systems check MCA_STATUS and log error if found.
+ * 2) SMCA systems check MCA_STATUS. If error is found then log it and also
+ *    clear MCA_DESTAT.
+ * 3) SMCA systems check MCA_DESTAT, if error was not found in MCA_STATUS, and
+ *    log it.
+ */
+static bool smca_should_log_poll_error(struct mce *m)
+{
+	if (m->status & MCI_STATUS_VAL)
+		return true;
+
+	m->status = mce_rdmsrq(MSR_AMD64_SMCA_MCx_DESTAT(m->bank));
+	if ((m->status & MCI_STATUS_VAL) && (m->status & MCI_STATUS_DEFERRED)) {
+		m->kflags |= MCE_CHECK_DFR_REGS;
+		return true;
+	}
+
+	return false;
+}
 
 /*
  * Newer Intel systems that support software error
@@ -716,6 +740,9 @@ static bool ser_should_log_poll_error(struct mce *m)
 static bool should_log_poll_error(enum mcp_flags flags, struct mce_hw_err *err)
 {
 	struct mce *m = &err->m;
+
+	if (mce_flags.smca)
+		return smca_should_log_poll_error(m);
 
 	/* If this entry is not valid, ignore it. */
 	if (!(m->status & MCI_STATUS_VAL))
@@ -767,7 +794,7 @@ void machine_check_poll(enum mcp_flags flags, mce_banks_t *b)
 	struct mce *m;
 	int i;
 
-	this_cpu_inc(mce_poll_count);
+	inc_irq_stat(MCE_POLL);
 
 	mce_gather_info(&err, NULL);
 	m = &err.m;
@@ -1542,7 +1569,7 @@ noinstr void do_machine_check(struct pt_regs *regs)
 	 */
 	lmce = 1;
 
-	this_cpu_inc(mce_exception_count);
+	inc_irq_stat(MCE_EXCEPTION);
 
 	mce_gather_info(&err, regs);
 	m = &err.m;
@@ -1677,6 +1704,9 @@ noinstr void do_machine_check(struct pt_regs *regs)
 	}
 
 out:
+	/* Given it didn't panic, mark it as recoverable */
+	hwerr_log_error_type(HWERR_RECOV_OTHERS);
+
 	instrumentation_end();
 
 clear:
@@ -1836,7 +1866,7 @@ static void __mcheck_cpu_init_generic(void)
 
 	rdmsrq(MSR_IA32_MCG_CAP, cap);
 	if (cap & MCG_CTL_P)
-		wrmsr(MSR_IA32_MCG_CTL, 0xffffffff, 0xffffffff);
+		wrmsrq(MSR_IA32_MCG_CTL, ~0ULL);
 }
 
 static void __mcheck_cpu_init_prepare_banks(void)
@@ -2629,7 +2659,7 @@ static int mce_device_create(unsigned int cpu)
 	if (dev)
 		return 0;
 
-	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+	dev = kzalloc_obj(*dev);
 	if (!dev)
 		return -ENOMEM;
 	dev->id  = cpu;

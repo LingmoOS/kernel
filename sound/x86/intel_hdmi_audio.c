@@ -475,7 +475,8 @@ static void had_build_channel_allocation_map(struct snd_intelhad *intelhaddata)
 	kfree(intelhaddata->chmap->chmap);
 	intelhaddata->chmap->chmap = NULL;
 
-	chmap = kzalloc(sizeof(*chmap), GFP_KERNEL);
+	/* info->chmap must be zero-terminated; allocate a spare terminator entry */
+	chmap = kzalloc_objs(*chmap, 2);
 	if (!chmap)
 		return;
 
@@ -575,6 +576,12 @@ static int had_register_chmap_ctls(struct snd_intelhad *intelhaddata,
 	intelhaddata->chmap->kctl->info = had_chmap_ctl_info;
 	intelhaddata->chmap->kctl->get = had_chmap_ctl_get;
 	intelhaddata->chmap->chmap = NULL;
+
+	/* drop the inherited TLV read: it walks chmap without our mutex */
+	intelhaddata->chmap->kctl->tlv.c = NULL;
+	intelhaddata->chmap->kctl->vd[0].access &=
+		~(SNDRV_CTL_ELEM_ACCESS_TLV_READ | SNDRV_CTL_ELEM_ACCESS_TLV_CALLBACK);
+
 	return 0;
 }
 
@@ -1517,13 +1524,12 @@ static void had_audio_wq(struct work_struct *work)
 		container_of(work, struct snd_intelhad, hdmi_audio_wq);
 	struct intel_hdmi_lpe_audio_pdata *pdata = ctx->dev->platform_data;
 	struct intel_hdmi_lpe_audio_port_pdata *ppdata = &pdata->port[ctx->port];
-	int ret;
 
-	ret = pm_runtime_resume_and_get(ctx->dev);
-	if (ret < 0)
+	PM_RUNTIME_ACQUIRE_IF_ENABLED_AUTOSUSPEND(ctx->dev, pm);
+	if (PM_RUNTIME_ACQUIRE_ERR(&pm))
 		return;
 
-	mutex_lock(&ctx->mutex);
+	guard(mutex)(&ctx->mutex);
 	if (ppdata->pipe < 0) {
 		dev_dbg(ctx->dev, "%s: Event: HAD_NOTIFY_HOT_UNPLUG : port = %d\n",
 			__func__, ctx->port);
@@ -1564,9 +1570,6 @@ static void had_audio_wq(struct work_struct *work)
 		/* Restart the stream if necessary */
 		had_process_mode_change(ctx);
 	}
-
-	mutex_unlock(&ctx->mutex);
-	pm_runtime_put_autosuspend(ctx->dev);
 }
 
 /*

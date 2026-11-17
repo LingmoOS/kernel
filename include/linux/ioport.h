@@ -10,6 +10,7 @@
 #define _LINUX_IOPORT_H
 
 #ifndef __ASSEMBLY__
+#include <linux/args.h>
 #include <linux/bits.h>
 #include <linux/compiler.h>
 #include <linux/minmax.h>
@@ -165,8 +166,12 @@ enum {
 
 #define DEFINE_RES_NAMED(_start, _size, _name, _flags)			\
 	DEFINE_RES_NAMED_DESC(_start, _size, _name, _flags, IORES_DESC_NONE)
-#define DEFINE_RES(_start, _size, _flags)				\
+#define __DEFINE_RES0()							\
+	DEFINE_RES_NAMED(0, 0, NULL, IORESOURCE_UNSET)
+#define __DEFINE_RES3(_start, _size, _flags)				\
 	DEFINE_RES_NAMED(_start, _size, NULL, _flags)
+#define DEFINE_RES(...)							\
+	CONCATENATE(__DEFINE_RES, COUNT_ARGS(__VA_ARGS__))(__VA_ARGS__)
 
 #define DEFINE_RES_IO_NAMED(_start, _size, _name)			\
 	DEFINE_RES_NAMED((_start), (_size), (_name), IORESOURCE_IO)
@@ -197,6 +202,7 @@ enum {
  * typedef resource_alignf - Resource alignment callback
  * @data:	Private data used by the callback
  * @res:	Resource candidate range (an empty resource space)
+ * @empty_res:	Empty resource range without alignment applied
  * @size:	The minimum size of the empty space
  * @align:	Alignment from the constraints
  *
@@ -207,6 +213,7 @@ enum {
  */
 typedef resource_size_t (*resource_alignf)(void *data,
 					   const struct resource *res,
+					   const struct resource *empty_res,
 					   resource_size_t size,
 					   resource_size_t align);
 
@@ -232,6 +239,7 @@ struct resource_constraint {
 /* PC/ISA/whatever - the normal PC address spaces: IO and memory */
 extern struct resource ioport_resource;
 extern struct resource iomem_resource;
+extern struct resource soft_reserve_resource;
 
 extern struct resource *request_resource_conflict(struct resource *root, struct resource *new);
 extern int request_resource(struct resource *root, struct resource *new);
@@ -253,7 +261,7 @@ extern int allocate_resource(struct resource *root, struct resource *new,
 struct resource *lookup_resource(struct resource *root, resource_size_t start);
 int adjust_resource(struct resource *res, resource_size_t start,
 		    resource_size_t size);
-resource_size_t resource_alignment(struct resource *res);
+resource_size_t resource_alignment(const struct resource *res);
 
 /**
  * resource_set_size - Calculate resource end address from size and start
@@ -348,6 +356,15 @@ static inline bool resource_union(const struct resource *r1, const struct resour
 	return true;
 }
 
+/*
+ * Check if this resource is added to a resource tree or detached. Caller is
+ * responsible for not racing assignment.
+ */
+static inline bool resource_assigned(const struct resource *res)
+{
+	return res->parent;
+}
+
 int find_resource_space(struct resource *root, struct resource *new,
 			resource_size_t size, struct resource_constraint *constraint);
 
@@ -423,6 +440,10 @@ walk_system_ram_res_rev(u64 start, u64 end, void *arg,
 extern int
 walk_iomem_res_desc(unsigned long desc, unsigned long flags, u64 start, u64 end,
 		    void *arg, int (*func)(struct resource *, void *));
+extern int walk_soft_reserve_res(u64 start, u64 end, void *arg,
+				 int (*func)(struct resource *, void *));
+extern int
+region_intersects_soft_reserve(resource_size_t start, size_t size);
 
 struct resource *devm_request_free_mem_region(struct device *dev,
 		struct resource *base, unsigned long size);

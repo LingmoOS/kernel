@@ -232,13 +232,6 @@ static int mdp4_modeset_init_intf(struct mdp4_kms *mdp4_kms,
 			return PTR_ERR(connector);
 		}
 
-		ret = drm_connector_attach_encoder(connector, encoder);
-		if (ret) {
-			DRM_DEV_ERROR(dev->dev, "failed to attach LVDS connector: %d\n", ret);
-
-			return ret;
-		}
-
 		break;
 	case DRM_MODE_ENCODER_TMDS:
 		encoder = mdp4_dtv_encoder_init(dev);
@@ -470,7 +463,7 @@ static int mdp4_kms_init(struct drm_device *dev)
 		return ret;
 	}
 
-	mdp4_kms->blank_cursor_bo = msm_gem_new(dev, SZ_16K, MSM_BO_WC | MSM_BO_SCANOUT);
+	mdp4_kms->blank_cursor_bo = msm_gem_new(dev, SZ_16K, MSM_BO_WC | MSM_BO_SCANOUT, NULL);
 	if (IS_ERR(mdp4_kms->blank_cursor_bo)) {
 		ret = PTR_ERR(mdp4_kms->blank_cursor_bo);
 		DRM_DEV_ERROR(dev->dev, "could not allocate blank-cursor bo: %d\n", ret);

@@ -48,7 +48,6 @@
 #include <linux/audit.h> /* for audit_free() */
 #include <linux/resource.h>
 #include <linux/task_io_accounting_ops.h>
-#include <linux/blkdev.h>
 #include <linux/task_work.h>
 #include <linux/fs_struct.h>
 #include <linux/init_task.h>
@@ -207,7 +206,7 @@ static void __exit_signal(struct release_task_post *post, struct task_struct *ts
 	sig->inblock += task_io_get_inblock(tsk);
 	sig->oublock += task_io_get_oublock(tsk);
 	task_io_accounting_add(&sig->ioac, &tsk->ioac);
-	sig->sum_sched_runtime += tsk->se.sum_exec_runtime;
+	sig->sum_sched_runtime += tsk_seruntime(tsk);
 	sig->nr_threads--;
 	__unhash_process(post, tsk, group_dead);
 	write_sequnlock(&sig->stats_lock);
@@ -256,13 +255,11 @@ repeat:
 	memset(&post, 0, sizeof(post));
 
 	/* don't need to get the RCU readlock here - the process is dead and
-	 * can't be modifying its own credentials. But shut RCU-lockdep up */
-	rcu_read_lock();
+	 * can't be modifying its own credentials. */
 	dec_rlimit_ucounts(task_ucounts(p), UCOUNT_RLIMIT_NPROC, 1);
-	rcu_read_unlock();
 
 	pidfs_exit(p);
-	cgroup_release(p);
+	cgroup_task_release(p);
 
 	/*
 	 * Pin @thread_pid before __unhash_process() clears it. The last
@@ -299,8 +296,9 @@ repeat:
 	write_unlock_irq(&tasklist_lock);
 	proc_flush_pid(thread_pid);
 	put_pid(thread_pid);
-	add_device_randomness(&p->se.sum_exec_runtime,
-			      sizeof(p->se.sum_exec_runtime));
+	exit_cred_namespaces(p);
+	add_device_randomness((const void*) &tsk_seruntime(p),
+			      sizeof(unsigned long long));
 	free_pids(post.pids);
 	release_thread(p);
 	/*
@@ -561,9 +559,12 @@ static void exit_mm(void)
 {
 	struct mm_struct *mm = current->mm;
 
-	exit_mm_release(current, mm);
+	mm_exit_exec_release(current, mm);
 	if (!mm)
 		return;
+
+	sched_cache_exit_mm(current);
+
 	mmap_read_lock(mm);
 	mmgrab_lazy_tlb(mm);
 	BUG_ON(mm != current->active_mm);
@@ -581,7 +582,6 @@ static void exit_mm(void)
 	 */
 	smp_mb__after_spinlock();
 	local_irq_disable();
-	current->user_dumpable = (get_dumpable(mm) == SUID_DUMP_USER);
 	current->mm = NULL;
 	membarrier_update_current_mm(NULL);
 	enter_lazy_tlb(mm, current);
@@ -619,7 +619,8 @@ static struct task_struct *find_child_reaper(struct task_struct *father,
 
 	reaper = find_alive_thread(father);
 	if (reaper) {
-		pid_ns->child_reaper = reaper;
+		ASSERT_EXCLUSIVE_WRITER(pid_ns->child_reaper);
+		WRITE_ONCE(pid_ns->child_reaper, reaper);
 		return reaper;
 	}
 
@@ -759,14 +760,12 @@ static void exit_notify(struct task_struct *tsk, int group_dead)
 	tsk->exit_state = EXIT_ZOMBIE;
 
 	if (unlikely(tsk->ptrace)) {
-		int sig = thread_group_leader(tsk) &&
-				thread_group_empty(tsk) &&
-				!ptrace_reparented(tsk) ?
-			tsk->exit_signal : SIGCHLD;
+		int sig = thread_group_empty(tsk) && !ptrace_reparented(tsk)
+			  ? tsk->exit_signal : SIGCHLD;
 		autoreap = do_notify_parent(tsk, sig);
 	} else if (thread_group_leader(tsk)) {
 		autoreap = thread_group_empty(tsk) &&
-			do_notify_parent(tsk, tsk->exit_signal);
+			   do_notify_parent(tsk, tsk->exit_signal);
 	} else {
 		autoreap = true;
 		/* untraced sub-thread */
@@ -955,7 +954,6 @@ void __noreturn do_exit(long code)
 
 	tsk->exit_code = code;
 	taskstats_exit(tsk, group_dead);
-	unwind_deferred_task_exit(tsk);
 	trace_sched_process_exit(tsk, group_dead);
 
 	/*
@@ -966,6 +964,12 @@ void __noreturn do_exit(long code)
 	 * gets woken up by child-exit notifications.
 	 */
 	perf_event_exit_task(tsk);
+	/*
+	 * PF_EXITING (above) ensures unwind_deferred_request() will no
+	 * longer add new unwinds. While exit_mm() (below) will destroy the
+	 * abaility to do unwinds. So flush any pending unwinds here.
+	 */
+	unwind_deferred_task_exit(tsk);
 
 	exit_mm();
 
@@ -984,7 +988,7 @@ void __noreturn do_exit(long code)
 	exit_thread(tsk);
 
 	sched_autogroup_exit_task(tsk);
-	cgroup_exit(tsk);
+	cgroup_task_exit(tsk);
 
 	/*
 	 * FIXME: do that only when needed, using sched_exit tracepoint
@@ -996,8 +1000,8 @@ void __noreturn do_exit(long code)
 	proc_exit_connector(tsk);
 	mpol_put_task_policy(tsk);
 #ifdef CONFIG_FUTEX
-	if (unlikely(current->pi_state_cache))
-		kfree(current->pi_state_cache);
+	if (unlikely(current->futex.pi_state_cache))
+		kfree(current->futex.pi_state_cache);
 #endif
 	/*
 	 * Make sure we are holding no locks:
@@ -1090,7 +1094,7 @@ void __noreturn make_task_dead(int signr)
 
 SYSCALL_DEFINE1(exit, int, error_code)
 {
-	do_exit((error_code&0xff)<<8);
+	do_exit((error_code & 0xff) << 8);
 }
 
 /*

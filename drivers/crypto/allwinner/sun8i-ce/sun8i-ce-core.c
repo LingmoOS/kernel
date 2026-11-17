@@ -647,6 +647,7 @@ static int sun8i_ce_debugfs_show(struct seq_file *seq, void *v)
 			seq_printf(seq, "\tFallback due to SG numbers: %lu\n",
 				   ce_algs[i].stat_fb_maxsg);
 			break;
+#ifdef CONFIG_CRYPTO_DEV_SUN8I_CE_HASH
 		case CRYPTO_ALG_TYPE_AHASH:
 			seq_printf(seq, "%s %s reqs=%lu fallback=%lu\n",
 				   ce_algs[i].alg.hash.base.halg.base.cra_driver_name,
@@ -663,6 +664,7 @@ static int sun8i_ce_debugfs_show(struct seq_file *seq, void *v)
 			seq_printf(seq, "\tFallback due to SG numbers: %lu\n",
 				   ce_algs[i].stat_fb_maxsg);
 			break;
+#endif
 		}
 	}
 #if defined(CONFIG_CRYPTO_DEV_SUN8I_CE_TRNG) && \
@@ -870,6 +872,7 @@ static int sun8i_ce_register_algs(struct sun8i_ce_dev *ce)
 				return err;
 			}
 			break;
+#ifdef CONFIG_CRYPTO_DEV_SUN8I_CE_HASH
 		case CRYPTO_ALG_TYPE_AHASH:
 			id = ce_algs[i].ce_algo_id;
 			ce_method = ce->variant->alg_hash[id];
@@ -890,6 +893,7 @@ static int sun8i_ce_register_algs(struct sun8i_ce_dev *ce)
 				return err;
 			}
 			break;
+#endif
 		default:
 			ce_algs[i].ce = NULL;
 			dev_err(ce->dev, "ERROR: tried to register an unknown algo\n");
@@ -911,11 +915,13 @@ static void sun8i_ce_unregister_algs(struct sun8i_ce_dev *ce)
 				 ce_algs[i].alg.skcipher.base.base.cra_name);
 			crypto_engine_unregister_skcipher(&ce_algs[i].alg.skcipher);
 			break;
+#ifdef CONFIG_CRYPTO_DEV_SUN8I_CE_HASH
 		case CRYPTO_ALG_TYPE_AHASH:
 			dev_info(ce->dev, "Unregister %d %s\n", i,
 				 ce_algs[i].alg.hash.base.halg.base.cra_name);
 			crypto_engine_unregister_ahash(&ce_algs[i].alg.hash);
 			break;
+#endif
 		}
 	}
 }
@@ -970,10 +976,8 @@ static int sun8i_ce_probe(struct platform_device *pdev)
 
 	err = devm_request_irq(&pdev->dev, irq, ce_irq_handler, 0,
 			       "sun8i-ce-ns", ce);
-	if (err) {
-		dev_err(ce->dev, "Cannot request CryptoEngine Non-secure IRQ (err=%d)\n", err);
+	if (err)
 		goto error_pm;
-	}
 
 	err = sun8i_ce_register_algs(ce);
 	if (err)

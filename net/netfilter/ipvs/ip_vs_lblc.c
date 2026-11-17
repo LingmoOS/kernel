@@ -34,8 +34,7 @@
  * me to write this module.
  */
 
-#define KMSG_COMPONENT "IPVS"
-#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
+#define pr_fmt(fmt) "IPVS: " fmt
 
 #include <linux/ip.h>
 #include <linux/slab.h>
@@ -209,7 +208,7 @@ ip_vs_lblc_new(struct ip_vs_lblc_table *tbl, const union nf_inet_addr *daddr,
 	if (atomic_read(&tbl->entries) >= tbl->max_size * 3 / 2)
 		return NULL;
 
-	en = kmalloc(sizeof(*en), GFP_ATOMIC);
+	en = kmalloc_obj(*en, GFP_ATOMIC);
 	if (!en)
 		return NULL;
 
@@ -352,7 +351,7 @@ static int ip_vs_lblc_init_svc(struct ip_vs_service *svc)
 	/*
 	 *    Allocate the ip_vs_lblc_table for this service
 	 */
-	tbl = kmalloc(sizeof(*tbl), GFP_KERNEL);
+	tbl = kmalloc_obj(*tbl);
 	if (tbl == NULL)
 		return -ENOMEM;
 

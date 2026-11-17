@@ -85,7 +85,7 @@ enum pnfs_try_status {
 	PNFS_TRY_AGAIN     = 2,
 };
 
-#ifdef CONFIG_NFS_V4_1
+#if IS_ENABLED(CONFIG_NFS_V4)
 
 #define LAYOUT_NFSV4_1_MODULE_PREFIX "nfs-layouttype4"
 
@@ -422,7 +422,8 @@ struct nfs4_pnfs_ds *nfs4_pnfs_ds_add(const struct net *net,
 void nfs4_pnfs_v3_ds_connect_unload(void);
 int nfs4_pnfs_ds_connect(struct nfs_server *mds_srv, struct nfs4_pnfs_ds *ds,
 			  struct nfs4_deviceid_node *devid, unsigned int timeo,
-			  unsigned int retrans, u32 version, u32 minor_version);
+			  unsigned int retrans, u32 version, u32 minor_version,
+			  bool tightly_coupled);
 struct nfs4_pnfs_ds_addr *nfs4_decode_mp_ds_addr(struct net *net,
 						 struct xdr_stream *xdr,
 						 gfp_t gfp_flags);
@@ -706,7 +707,7 @@ static inline void nfs4_print_deviceid(const struct nfs4_deviceid *dev_id)
 }
 
 #endif /* NFS_DEBUG */
-#else  /* CONFIG_NFS_V4_1 */
+#else  /* CONFIG_NFS_V4 */
 
 static inline bool nfs_have_layout(struct inode *inode)
 {
@@ -915,7 +916,7 @@ static inline bool pnfs_layout_is_valid(const struct pnfs_layout_hdr *lo)
 	return false;
 }
 
-#endif /* CONFIG_NFS_V4_1 */
+#endif /* CONFIG_NFS_V4 */
 
 #if IS_ENABLED(CONFIG_NFS_V4_2)
 int pnfs_report_layoutstat(struct inode *inode, gfp_t gfp_flags);

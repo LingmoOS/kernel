@@ -135,7 +135,7 @@ static void gab_work(struct work_struct *work)
 	adc_bat = container_of(delayed_work, struct gab, bat_work);
 	status = adc_bat->status;
 
-	if (!power_supply_am_i_supplied(adc_bat->psy))
+	if (power_supply_am_i_supplied(adc_bat->psy) <= 0)
 		adc_bat->status =  POWER_SUPPLY_STATUS_DISCHARGING;
 	else if (gab_charge_finished(adc_bat))
 		adc_bat->status = POWER_SUPPLY_STATUS_NOT_CHARGING;
@@ -251,7 +251,7 @@ static int gab_probe(struct platform_device *pdev)
 				IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,
 				"battery charged", adc_bat);
 		if (ret < 0)
-			return dev_err_probe(&pdev->dev, ret, "Failed to register irq\n");
+			return ret;
 	}
 
 	platform_set_drvdata(pdev, adc_bat);
@@ -303,3 +303,4 @@ module_platform_driver(gab_driver);
 MODULE_AUTHOR("anish kumar <yesanishhere@gmail.com>");
 MODULE_DESCRIPTION("generic battery driver using IIO");
 MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS("IIO_CONSUMER");

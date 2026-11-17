@@ -213,6 +213,7 @@ impl Allocation {
             let res = FileDescriptorReservation::get_unused_fd_flags(bindings::O_CLOEXEC)?;
             let fd = res.reserved_fd();
             self.write::<u32>(file_info.buffer_offset, &fd)?;
+            crate::trace::trace_transaction_fd_recv(self.debug_id, fd, file_info.buffer_offset);
 
             reservations.push(
                 Reservation {
@@ -265,19 +266,22 @@ impl Drop for Allocation {
                 }
             }
 
-            for &fd in &info.file_list.close_on_free {
-                let closer = match DeferredFdCloser::new(GFP_KERNEL) {
-                    Ok(closer) => closer,
-                    Err(kernel::alloc::AllocError) => {
-                        // Ignore allocation failures.
-                        break;
-                    }
-                };
+            if self.process.task == kernel::current!().group_leader() {
+                for &fd in &info.file_list.close_on_free {
+                    let closer = match DeferredFdCloser::new(GFP_KERNEL) {
+                        Ok(closer) => closer,
+                        Err(kernel::alloc::AllocError) => {
+                            // Ignore allocation failures.
+                            break;
+                        }
+                    };
 
-                // Here, we ignore errors. The operation can fail if the fd is not valid, or if the
-                // method is called from a kthread. However, this is always called from a syscall,
-                // so the latter case cannot happen, and we don't care about the first case.
-                let _ = closer.close_fd(fd);
+                    // Here, we ignore errors. The operation can fail if the fd is not valid, or if
+                    // the method is called from a kthread. However, this is always called from a
+                    // syscall, so the latter case cannot happen, and we don't care about the first
+                    // case.
+                    let _ = closer.close_fd(fd);
+                }
             }
 
             if info.clear_on_free {
@@ -380,8 +384,8 @@ impl<'a> AllocationView<'a> {
                 BINDER_TYPE_WEAK_BINDER
             };
             newobj.flags = obj.flags;
-            newobj.__bindgen_anon_1.binder = ptr as _;
-            newobj.cookie = cookie as _;
+            newobj.__bindgen_anon_1.binder = ptr as uapi::binder_uintptr_t;
+            newobj.cookie = cookie as uapi::binder_uintptr_t;
             self.write(offset, &newobj)?;
             // Increment the user ref count on the node. It will be decremented as part of the
             // destruction of the buffer, when we see a binder or weak-binder object.

@@ -310,7 +310,7 @@ static struct inode *romfs_iget(struct super_block *sb, unsigned long pos)
 	if (!i)
 		return ERR_PTR(-ENOMEM);
 
-	if (!(i->i_state & I_NEW))
+	if (!(inode_state_read_once(i) & I_NEW))
 		return i;
 
 	/* precalculate the data offset */
@@ -595,7 +595,7 @@ static void romfs_kill_sb(struct super_block *sb)
 #ifdef CONFIG_ROMFS_ON_BLOCK
 	if (sb->s_bdev) {
 		sync_blockdev(sb->s_bdev);
-		bdev_fput(sb->s_bdev_file);
+		fs_bdev_file_release(sb->s_bdev_file, sb);
 	}
 #endif
 }

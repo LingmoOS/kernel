@@ -564,12 +564,6 @@ static int pcm3168a_hw_params(struct snd_pcm_substream *substream,
 
 static const u64 pcm3168a_dai_formats[] = {
 	/*
-	 * Select below from Sound Card, not here
-	 *	SND_SOC_DAIFMT_CBC_CFC
-	 *	SND_SOC_DAIFMT_CBP_CFP
-	 */
-
-	/*
 	 * First Priority
 	 */
 	SND_SOC_POSSIBLE_DAIFMT_I2S	|
@@ -581,6 +575,8 @@ static const u64 pcm3168a_dai_formats[] = {
 	 * see
 	 *	pcm3168a_hw_params()
 	 */
+	SND_SOC_POSSIBLE_DAIFMT_I2S	|
+	SND_SOC_POSSIBLE_DAIFMT_LEFT_J	|
 	SND_SOC_POSSIBLE_DAIFMT_RIGHT_J	|
 	SND_SOC_POSSIBLE_DAIFMT_DSP_A	|
 	SND_SOC_POSSIBLE_DAIFMT_DSP_B,
@@ -799,7 +795,6 @@ int pcm3168a_probe(struct device *dev, struct regmap *regmap)
 
 	pm_runtime_set_active(dev);
 	pm_runtime_enable(dev);
-	pm_runtime_idle(dev);
 
 	memcpy(pcm3168a->dai_drv, pcm3168a_dais, sizeof(pcm3168a->dai_drv));
 	ret = devm_snd_soc_register_component(dev, &pcm3168a_driver,

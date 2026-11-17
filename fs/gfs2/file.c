@@ -637,7 +637,7 @@ int gfs2_open_common(struct inode *inode, struct file *file)
 			file->f_mode |= FMODE_CAN_ODIRECT;
 	}
 
-	fp = kzalloc(sizeof(struct gfs2_file), GFP_NOFS);
+	fp = kzalloc_obj(struct gfs2_file, GFP_NOFS);
 	if (!fp)
 		return -ENOMEM;
 
@@ -744,7 +744,7 @@ static int gfs2_fsync(struct file *file, loff_t start, loff_t end,
 {
 	struct address_space *mapping = file->f_mapping;
 	struct inode *inode = mapping->host;
-	int sync_state = inode->i_state & I_DIRTY;
+	int sync_state = inode_state_read_once(inode) & I_DIRTY;
 	struct gfs2_inode *ip = GFS2_I(inode);
 	int ret = 0, ret1 = 0;
 
@@ -1029,7 +1029,7 @@ static ssize_t gfs2_file_buffered_write(struct kiocb *iocb,
 	 */
 
 	if (inode == sdp->sd_rindex) {
-		statfs_gh = kmalloc(sizeof(*statfs_gh), GFP_NOFS);
+		statfs_gh = kmalloc_obj(*statfs_gh, GFP_NOFS);
 		if (!statfs_gh)
 			return -ENOMEM;
 	}
@@ -1177,8 +1177,7 @@ out_unlock:
 	return ret;
 }
 
-static int fallocate_chunk(struct inode *inode, loff_t offset, loff_t len,
-			   int mode)
+static int fallocate_chunk(struct inode *inode, loff_t offset, loff_t len)
 {
 	struct super_block *sb = inode->i_sb;
 	struct gfs2_inode *ip = GFS2_I(inode);
@@ -1346,7 +1345,7 @@ static long __gfs2_fallocate(struct file *file, int mode, loff_t offset, loff_t 
 		if (error)
 			goto out_trans_fail;
 
-		error = fallocate_chunk(inode, offset, max_bytes, mode);
+		error = fallocate_chunk(inode, offset, max_bytes);
 		gfs2_trans_end(sdp);
 
 		if (error)
@@ -1603,7 +1602,6 @@ const struct file_operations gfs2_file_fops = {
 	.flock		= gfs2_flock,
 	.splice_read	= copy_splice_read,
 	.splice_write	= gfs2_file_splice_write,
-	.setlease	= simple_nosetlease,
 	.fallocate	= gfs2_fallocate,
 	.fop_flags	= FOP_ASYNC_LOCK,
 };
@@ -1648,5 +1646,6 @@ const struct file_operations gfs2_dir_fops_nolock = {
 	.release	= gfs2_release,
 	.fsync		= gfs2_fsync,
 	.llseek		= default_llseek,
+	.setlease	= generic_setlease,
 };
 

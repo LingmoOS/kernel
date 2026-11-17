@@ -154,14 +154,8 @@ static void cxt_init_gpio_led(struct hda_codec *codec)
 	struct conexant_spec *spec = codec->spec;
 	unsigned int mask = spec->gpio_mute_led_mask | spec->gpio_mic_led_mask;
 
-	if (mask) {
-		snd_hda_codec_write(codec, 0x01, 0, AC_VERB_SET_GPIO_MASK,
-				    mask);
-		snd_hda_codec_write(codec, 0x01, 0, AC_VERB_SET_GPIO_DIRECTION,
-				    mask);
-		snd_hda_codec_write(codec, 0x01, 0, AC_VERB_SET_GPIO_DATA,
-				    spec->gpio_led);
-	}
+	if (mask)
+		snd_hda_codec_set_gpio(codec, mask, mask, spec->gpio_led, 0);
 }
 
 static void cx_fixup_headset_recog(struct hda_codec *codec)
@@ -229,11 +223,9 @@ static void cx_process_headset_detect_plug_type(struct hda_codec *codec)
 		count++;
 	} while (count < 3);
 	val = snd_hda_codec_read(codec, 0x1c, 0, 0xcb0, 0x0);
-	if (val & 0x800) {
-		codec_dbg(codec, "headset plugin, type is CTIA\n");
-		snd_hda_codec_write(codec, 0x19, 0, AC_VERB_SET_PIN_WIDGET_CONTROL, 0x24);
-	} else if (val & 0x400) {
-		codec_dbg(codec, "headset plugin, type is OMTP\n");
+	if (val & 0xc00) {
+		codec_dbg(codec, "headset plugin, type is %s\n",
+			  val & 0x800 ? "CTIA" : "OMTP");
 		snd_hda_codec_write(codec, 0x19, 0, AC_VERB_SET_PIN_WIDGET_CONTROL, 0x24);
 	} else {
 		codec_dbg(codec, "headphone plugin\n");
@@ -255,6 +247,25 @@ static void cx_update_headset_mic_vref(struct hda_codec *codec, struct hda_jack_
 		cx_process_headset_detect_plug_type(codec);
 		snd_hda_codec_write(codec, 0x19, 0, AC_VERB_SET_PIN_WIDGET_CONTROL, 0x24);
 	}
+}
+
+#define SN6140_S3_AFG_D0_DELAY_MS	1000
+
+static void cx_set_power_state(struct hda_codec *codec, hda_nid_t fg,
+			       unsigned int power_state)
+{
+	snd_hda_codec_write_sync(codec, fg, 0, AC_VERB_SET_POWER_STATE, power_state);
+
+	/*
+	 * SN6140 may not respond to AFG D0 immediately after S3.
+	 * Wait before the D0 verb so the power-state command itself succeeds.
+	 */
+	if (codec->core.vendor_id == 0x14f11f87 &&
+	    power_state == AC_PWRST_D0 &&
+	    codec->core.dev.power.power_state.event == PM_EVENT_RESUME)
+		msleep(SN6140_S3_AFG_D0_DELAY_MS);
+
+	snd_hda_codec_set_power_to_all(codec, fg, power_state);
 }
 
 static int cx_suspend(struct hda_codec *codec)
@@ -778,9 +789,7 @@ static void cxt_setup_gpio_unmute(struct hda_codec *codec,
 {
 	if (gpio_mute_mask) {
 		// set gpio data to 0.
-		snd_hda_codec_write(codec, 0x01, 0, AC_VERB_SET_GPIO_DATA, 0);
-		snd_hda_codec_write(codec, 0x01, 0, AC_VERB_SET_GPIO_MASK, gpio_mute_mask);
-		snd_hda_codec_write(codec, 0x01, 0, AC_VERB_SET_GPIO_DIRECTION, gpio_mute_mask);
+		snd_hda_codec_set_gpio(codec, gpio_mute_mask, gpio_mute_mask, 0, 0);
 		snd_hda_codec_write(codec, 0x01, 0, AC_VERB_SET_GPIO_STICKY_MASK, 0);
 	}
 }
@@ -1211,7 +1220,7 @@ static int cx_probe(struct hda_codec *codec, const struct hda_device_id *id)
 
 	codec_info(codec, "%s: BIOS auto-probing.\n", codec->core.chip_name);
 
-	spec = kzalloc(sizeof(*spec), GFP_KERNEL);
+	spec = kzalloc_obj(*spec);
 	if (!spec)
 		return -ENOMEM;
 	snd_hda_gen_spec_init(&spec->gen);
@@ -1318,6 +1327,7 @@ static const struct hda_codec_ops cx_codec_ops = {
 	.init = cx_init,
 	.unsol_event = snd_hda_jack_unsol_event,
 	.suspend = cx_suspend,
+	.set_power_state = cx_set_power_state,
 	.check_power_status = snd_hda_gen_check_power_status,
 	.stream_pm = snd_hda_gen_stream_pm,
 };

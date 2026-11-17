@@ -457,7 +457,7 @@ otx2_qos_alloc_root(struct otx2_nic *pfvf)
 {
 	struct otx2_qos_node *node;
 
-	node = kzalloc(sizeof(*node), GFP_KERNEL);
+	node = kzalloc_obj(*node);
 	if (!node)
 		return ERR_PTR(-ENOMEM);
 
@@ -513,7 +513,7 @@ static int otx2_qos_alloc_txschq_node(struct otx2_nic *pfvf,
 
 	parent = node;
 	for (lvl = node->level - 1; lvl >= NIX_TXSCH_LVL_MDQ; lvl--) {
-		txschq_node = kzalloc(sizeof(*txschq_node), GFP_KERNEL);
+		txschq_node = kzalloc_obj(*txschq_node);
 		if (!txschq_node)
 			goto err_out;
 
@@ -558,7 +558,7 @@ otx2_qos_sw_create_leaf_node(struct otx2_nic *pfvf,
 	struct otx2_qos_node *node;
 	int err;
 
-	node = kzalloc(sizeof(*node), GFP_KERNEL);
+	node = kzalloc_obj(*node);
 	if (!node)
 		return ERR_PTR(-ENOMEM);
 
@@ -1095,7 +1095,7 @@ static int otx2_qos_root_add(struct otx2_nic *pfvf, u16 htb_maj_id, u16 htb_defc
 	}
 
 	/* allocate txschq queue */
-	new_cfg = kzalloc(sizeof(*new_cfg), GFP_KERNEL);
+	new_cfg = kzalloc_obj(*new_cfg);
 	if (!new_cfg) {
 		NL_SET_ERR_MSG_MOD(extack, "Memory allocation error");
 		err = -ENOMEM;
@@ -1329,7 +1329,7 @@ static int otx2_qos_leaf_alloc_queue(struct otx2_nic *pfvf, u16 classid,
 	set_bit(prio, parent->prio_bmap);
 
 	/* read current txschq configuration */
-	old_cfg = kzalloc(sizeof(*old_cfg), GFP_KERNEL);
+	old_cfg = kzalloc_obj(*old_cfg);
 	if (!old_cfg) {
 		NL_SET_ERR_MSG_MOD(extack, "Memory allocation error");
 		ret = -ENOMEM;
@@ -1358,7 +1358,7 @@ static int otx2_qos_leaf_alloc_queue(struct otx2_nic *pfvf, u16 classid,
 	}
 
 	/* push new txschq config to hw */
-	new_cfg = kzalloc(sizeof(*new_cfg), GFP_KERNEL);
+	new_cfg = kzalloc_obj(*new_cfg);
 	if (!new_cfg) {
 		NL_SET_ERR_MSG_MOD(extack, "Memory allocation error");
 		ret = -ENOMEM;
@@ -1467,7 +1467,7 @@ static int otx2_qos_leaf_to_inner(struct otx2_nic *pfvf, u16 classid,
 	qid = node->qid;
 
 	/* read current txschq configuration */
-	old_cfg = kzalloc(sizeof(*old_cfg), GFP_KERNEL);
+	old_cfg = kzalloc_obj(*old_cfg);
 	if (!old_cfg) {
 		NL_SET_ERR_MSG_MOD(extack, "Memory allocation error");
 		ret = -ENOMEM;
@@ -1495,7 +1495,7 @@ static int otx2_qos_leaf_to_inner(struct otx2_nic *pfvf, u16 classid,
 	}
 
 	/* push new txschq config to hw */
-	new_cfg = kzalloc(sizeof(*new_cfg), GFP_KERNEL);
+	new_cfg = kzalloc_obj(*new_cfg);
 	if (!new_cfg) {
 		NL_SET_ERR_MSG_MOD(extack, "Memory allocation error");
 		ret = -ENOMEM;
@@ -1718,7 +1718,7 @@ static int otx2_qos_leaf_del_last(struct otx2_nic *pfvf, u16 classid, bool force
 	__set_bit(qid, pfvf->qos.qos_sq_bmap);
 
 	/* push new txschq config to hw */
-	new_cfg = kzalloc(sizeof(*new_cfg), GFP_KERNEL);
+	new_cfg = kzalloc_obj(*new_cfg);
 	if (!new_cfg) {
 		NL_SET_ERR_MSG_MOD(extack, "Memory allocation error");
 		return -ENOMEM;

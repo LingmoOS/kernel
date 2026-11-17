@@ -7,15 +7,27 @@
  * IIO driver for STK3310/STK3311. 7-bit I2C address: 0x48.
  */
 
+#include <linux/array_size.h>
+#include <linux/bits.h>
+#include <linux/dev_printk.h>
+#include <linux/err.h>
 #include <linux/i2c.h>
 #include <linux/interrupt.h>
-#include <linux/kernel.h>
 #include <linux/module.h>
-#include <linux/mod_devicetable.h>
+#include <linux/mutex.h>
+#include <linux/pm.h>
+#include <linux/property.h>
 #include <linux/regmap.h>
+#include <linux/sprintf.h>
+#include <linux/sysfs.h>
+#include <linux/types.h>
+
 #include <linux/iio/events.h>
 #include <linux/iio/iio.h>
 #include <linux/iio/sysfs.h>
+#include <linux/iio/types.h>
+
+#include <asm/byteorder.h>
 
 #define STK3310_REG_STATE			0x00
 #define STK3310_REG_PSCTRL			0x01
@@ -115,12 +127,6 @@ static const int stk3310_it_table[][2] = {
 struct stk3310_data {
 	struct i2c_client *client;
 	struct mutex lock;
-	bool als_enabled;
-	bool ps_enabled;
-	bool ps_int_enabled;
-	uint32_t ps_thdl;
-	uint32_t ps_thdh;
-	uint32_t ps_near_level;
 	u64 timestamp;
 	struct regmap *regmap;
 	struct regmap_field *reg_state;
@@ -131,6 +137,12 @@ struct stk3310_data {
 	struct regmap_field *reg_int_ps;
 	struct regmap_field *reg_flag_psint;
 	struct regmap_field *reg_flag_nf;
+	u32 ps_thdl;
+	u32 ps_thdh;
+	u32 ps_near_level;
+	bool als_enabled;
+	bool ps_enabled;
+	bool ps_int_enabled;
 };
 
 static const struct iio_event_spec stk3310_events[] = {
@@ -258,7 +270,7 @@ static int stk3310_read_event(struct iio_dev *indio_dev,
 		return -EINVAL;
 
 	mutex_lock(&data->lock);
-	ret = regmap_bulk_read(data->regmap, reg, &buf, 2);
+	ret = regmap_bulk_read(data->regmap, reg, &buf, sizeof(buf));
 	mutex_unlock(&data->lock);
 	if (ret < 0) {
 		dev_err(&data->client->dev, "register read failed\n");
@@ -298,7 +310,7 @@ static int stk3310_write_event(struct iio_dev *indio_dev,
 		return -EINVAL;
 
 	buf = cpu_to_be16(val);
-	ret = regmap_bulk_write(data->regmap, reg, &buf, 2);
+	ret = regmap_bulk_write(data->regmap, reg, &buf, sizeof(buf));
 	if (ret < 0) {
 		dev_err(&client->dev, "failed to set PS threshold!\n");
 		return ret;
@@ -376,7 +388,7 @@ static int stk3310_read_raw(struct iio_dev *indio_dev,
 			reg = STK3310_REG_PS_DATA_MSB;
 
 		mutex_lock(&data->lock);
-		ret = regmap_bulk_read(data->regmap, reg, &buf, 2);
+		ret = regmap_bulk_read(data->regmap, reg, &buf, sizeof(buf));
 		if (ret < 0) {
 			dev_err(&client->dev, "register read failed\n");
 			mutex_unlock(&data->lock);
@@ -661,11 +673,8 @@ static int stk3310_probe(struct i2c_client *client)
 						IRQF_TRIGGER_FALLING |
 						IRQF_ONESHOT,
 						"stk3310_event", indio_dev);
-		if (ret < 0) {
-			dev_err(&client->dev, "request irq %d failed\n",
-				client->irq);
+		if (ret)
 			goto err_standby;
-		}
 	}
 
 	ret = iio_device_register(indio_dev);
@@ -726,7 +735,7 @@ static int stk3310_resume(struct device *dev)
 
 	if (data->ps_thdl != 0x0) {
 		buf = cpu_to_be16(data->ps_thdl);
-		ret = regmap_bulk_write(data->regmap, STK3310_REG_THDL_PS, &buf, 2);
+		ret = regmap_bulk_write(data->regmap, STK3310_REG_THDL_PS, &buf, sizeof(buf));
 		if (ret < 0) {
 			dev_err(dev, "failed to set reg THDL_PS at resume.\n");
 			return ret;
@@ -735,7 +744,7 @@ static int stk3310_resume(struct device *dev)
 
 	if (data->ps_thdh != STK3310_PS_MAX_VAL) {
 		buf = cpu_to_be16(data->ps_thdh);
-		ret = regmap_bulk_write(data->regmap, STK3310_REG_THDH_PS, &buf, 2);
+		ret = regmap_bulk_write(data->regmap, STK3310_REG_THDH_PS, &buf, sizeof(buf));
 		if (ret < 0) {
 			dev_err(dev, "failed to set reg THDH_PS at resume.\n");
 			return ret;
@@ -757,10 +766,10 @@ static DEFINE_SIMPLE_DEV_PM_OPS(stk3310_pm_ops, stk3310_suspend,
 				stk3310_resume);
 
 static const struct i2c_device_id stk3310_i2c_id[] = {
-	{ "STK3013" },
-	{ "STK3310" },
-	{ "STK3311" },
-	{ "STK3335" },
+	{ .name = "STK3013" },
+	{ .name = "STK3310" },
+	{ .name = "STK3311" },
+	{ .name = "STK3335" },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, stk3310_i2c_id);

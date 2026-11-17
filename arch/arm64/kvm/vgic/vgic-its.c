@@ -27,7 +27,7 @@ static struct kvm_device_ops kvm_arm_vgic_its_ops;
 
 static int vgic_its_save_tables_v0(struct vgic_its *its);
 static int vgic_its_restore_tables_v0(struct vgic_its *its);
-static int vgic_its_commit_v0(struct vgic_its *its);
+static void vgic_its_commit_v0(struct vgic_its *its);
 static int update_lpi_config(struct kvm *kvm, struct vgic_irq *irq,
 			     struct kvm_vcpu *filter_vcpu, bool needs_inv);
 
@@ -85,7 +85,7 @@ static struct vgic_irq *vgic_add_lpi(struct kvm *kvm, u32 intid,
 	if (irq)
 		return irq;
 
-	irq = kzalloc(sizeof(struct vgic_irq), GFP_KERNEL_ACCOUNT);
+	irq = kzalloc_obj(struct vgic_irq, GFP_KERNEL_ACCOUNT);
 	if (!irq)
 		return ERR_PTR(-ENOMEM);
 
@@ -121,7 +121,8 @@ static struct vgic_irq *vgic_add_lpi(struct kvm *kvm, u32 intid,
 		 * from the deferred release path, pending cleanup by
 		 * vgic_release_deleted_lpis(). Evict and free it if present.
 		 */
-		oldirq = __xa_store(&dist->lpi_xa, intid, irq, 0);
+		oldirq = __xa_store(&dist->lpi_xa, intid, irq,
+				    GFP_NOWAIT | __GFP_ACCOUNT);
 		ret = xa_err(oldirq);
 		if (ret) {
 			xa_unlock_irqrestore(&dist->lpi_xa, flags);
@@ -176,7 +177,7 @@ struct vgic_its_abi {
 	int ite_esz;
 	int (*save_tables)(struct vgic_its *its);
 	int (*restore_tables)(struct vgic_its *its);
-	int (*commit)(struct vgic_its *its);
+	void (*commit)(struct vgic_its *its);
 };
 
 #define ABI_0_ESZ	8
@@ -200,13 +201,13 @@ inline const struct vgic_its_abi *vgic_its_get_abi(struct vgic_its *its)
 	return &its_table_abi_versions[its->abi_rev];
 }
 
-static int vgic_its_set_abi(struct vgic_its *its, u32 rev)
+static void vgic_its_set_abi(struct vgic_its *its, u32 rev)
 {
 	const struct vgic_its_abi *abi;
 
 	its->abi_rev = rev;
 	abi = vgic_its_get_abi(its);
-	return abi->commit(its);
+	abi->commit(its);
 }
 
 /*
@@ -484,7 +485,8 @@ static int vgic_mmio_uaccess_write_its_iidr(struct kvm *kvm,
 
 	if (rev >= NR_ITS_ABIS)
 		return -EINVAL;
-	return vgic_its_set_abi(its, rev);
+	vgic_its_set_abi(its, rev);
+	return 0;
 }
 
 static unsigned long vgic_mmio_read_its_idregs(struct kvm *kvm,
@@ -774,12 +776,30 @@ static void its_free_ite(struct kvm *kvm, struct its_ite *ite)
 				its_unmap_vlpi(ite->irq->host_irq);
 
 			irq->hw = false;
+			irq->mapped = false;
 		}
 
 		vgic_put_irq(kvm, ite->irq);
 	}
 
 	kfree(ite);
+}
+
+/* Mapping one LPI from two events is UNPREDICTABLE: the first ITE keeps it. */
+static bool vgic_its_map_lpi(struct kvm *kvm, struct its_ite *ite,
+			     struct vgic_irq *irq, struct kvm_vcpu *vcpu)
+{
+	scoped_guard(raw_spinlock_irqsave, &irq->irq_lock) {
+		if (!irq->mapped) {
+			irq->mapped = true;
+			irq->target_vcpu = vcpu;
+			ite->irq = irq;
+			return true;
+		}
+	}
+
+	vgic_put_irq(kvm, irq);
+	return false;
 }
 
 static u64 its_cmd_mask_field(u64 *its_cmd, int word, int shift, int size)
@@ -976,7 +996,7 @@ static int vgic_its_alloc_collection(struct vgic_its *its,
 {
 	struct its_collection *collection;
 
-	collection = kzalloc(sizeof(*collection), GFP_KERNEL_ACCOUNT);
+	collection = kzalloc_obj(*collection, GFP_KERNEL_ACCOUNT);
 	if (!collection)
 		return -ENOMEM;
 
@@ -1020,7 +1040,7 @@ static struct its_ite *vgic_its_alloc_ite(struct its_device *device,
 {
 	struct its_ite *ite;
 
-	ite = kzalloc(sizeof(*ite), GFP_KERNEL_ACCOUNT);
+	ite = kzalloc_obj(*ite, GFP_KERNEL_ACCOUNT);
 	if (!ite)
 		return ERR_PTR(-ENOMEM);
 
@@ -1091,13 +1111,14 @@ static int vgic_its_cmd_handle_mapi(struct kvm *kvm, struct vgic_its *its,
 		vcpu = collection_to_vcpu(kvm, collection);
 
 	irq = vgic_add_lpi(kvm, lpi_nr, vcpu);
+	if (!IS_ERR(irq) && !vgic_its_map_lpi(kvm, ite, irq, vcpu))
+		irq = ERR_PTR(-EEXIST);
 	if (IS_ERR(irq)) {
 		if (new_coll)
 			vgic_its_free_collection(its, coll_id);
 		its_free_ite(kvm, ite);
 		return PTR_ERR(irq);
 	}
-	ite->irq = irq;
 
 	return 0;
 }
@@ -1147,7 +1168,7 @@ static struct its_device *vgic_its_alloc_device(struct vgic_its *its,
 {
 	struct its_device *device;
 
-	device = kzalloc(sizeof(*device), GFP_KERNEL_ACCOUNT);
+	device = kzalloc_obj(*device, GFP_KERNEL_ACCOUNT);
 	if (!device)
 		return ERR_PTR(-ENOMEM);
 
@@ -1867,7 +1888,7 @@ static int vgic_its_create(struct kvm_device *dev, u32 type)
 	if (type != KVM_DEV_TYPE_ARM_VGIC_ITS)
 		return -ENODEV;
 
-	its = kzalloc(sizeof(struct vgic_its), GFP_KERNEL_ACCOUNT);
+	its = kzalloc_obj(struct vgic_its, GFP_KERNEL_ACCOUNT);
 	if (!its)
 		return -ENOMEM;
 
@@ -1909,14 +1930,11 @@ static int vgic_its_create(struct kvm_device *dev, u32 type)
 	its->baser_coll_table = INITIAL_BASER_VALUE |
 		((u64)GITS_BASER_TYPE_COLLECTION << GITS_BASER_TYPE_SHIFT);
 	dev->kvm->arch.vgic.propbaser = INITIAL_PROPBASER_VALUE;
-
 	dev->private = its;
 
-	ret = vgic_its_set_abi(its, NR_ITS_ABIS - 1);
-
+	vgic_its_set_abi(its, NR_ITS_ABIS - 1);
 	mutex_unlock(&dev->kvm->arch.config_lock);
-
-	return ret;
+	return 0;
 }
 
 static void vgic_its_destroy(struct kvm_device *kvm_dev)
@@ -2049,15 +2067,16 @@ static u32 compute_next_devid_offset(struct vgic_its *its, u64 baser,
 
 static u32 compute_next_eventid_offset(struct list_head *h, struct its_ite *ite)
 {
-	struct its_ite *next;
-	u32 next_offset;
+	struct its_ite *next = ite;
 
-	if (list_is_last(&ite->ite_list, h))
-		return 0;
-	next = list_next_entry(ite, ite_list);
-	next_offset = next->event_id - ite->event_id;
+	/* Point at the next ITE that vgic_its_save_ite() stores as valid. */
+	list_for_each_entry_continue(next, h, ite_list) {
+		if (next->collection)
+			return min_t(u32, next->event_id - ite->event_id,
+				     VITS_ITE_MAX_EVENTID_OFFSET);
+	}
 
-	return min_t(u32, next_offset, VITS_ITE_MAX_EVENTID_OFFSET);
+	return 0;
 }
 
 /**
@@ -2208,7 +2227,10 @@ static int vgic_its_restore_ite(struct vgic_its *its, u32 event_id,
 		its_free_ite(kvm, ite);
 		return PTR_ERR(irq);
 	}
-	ite->irq = irq;
+
+	/* Drop an ITE whose LPI another ITE maps, as MAPTI does. */
+	if (!vgic_its_map_lpi(kvm, ite, irq, vcpu))
+		its_free_ite(kvm, ite);
 
 	return offset;
 }
@@ -2645,7 +2667,7 @@ static int vgic_its_restore_tables_v0(struct vgic_its *its)
 	return ret;
 }
 
-static int vgic_its_commit_v0(struct vgic_its *its)
+static void vgic_its_commit_v0(struct vgic_its *its)
 {
 	const struct vgic_its_abi *abi;
 
@@ -2658,7 +2680,6 @@ static int vgic_its_commit_v0(struct vgic_its *its)
 
 	its->baser_device_table |= (GIC_ENCODE_SZ(abi->dte_esz, 5)
 					<< GITS_BASER_ENTRY_SIZE_SHIFT);
-	return 0;
 }
 
 static void vgic_its_reset(struct kvm *kvm, struct vgic_its *its)

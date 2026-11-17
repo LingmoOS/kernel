@@ -187,10 +187,8 @@ static int apple_soc_cpufreq_set_target(struct cpufreq_policy *policy,
 
 	reg &= ~priv->info->ps1_mask;
 	reg |= pstate << priv->info->ps1_shift;
-	if (priv->info->has_ps2) {
-		reg &= ~APPLE_DVFS_CMD_PS2;
-		reg |= FIELD_PREP(APPLE_DVFS_CMD_PS2, pstate);
-	}
+	if (priv->info->has_ps2)
+		FIELD_MODIFY(APPLE_DVFS_CMD_PS2, &reg, pstate);
 	reg |= APPLE_DVFS_CMD_SET;
 
 	writeq_relaxed(reg, priv->reg_base + APPLE_DVFS_CMD);
@@ -251,7 +249,7 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 		return -ENODEV;
 	}
 
-	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+	priv = kzalloc_obj(*priv);
 	if (!priv)
 		return -ENOMEM;
 
@@ -282,7 +280,7 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 
 	/* Get OPP levels (p-state indexes) and stash them in driver_data */
 	for (i = 0; freq_table[i].frequency != CPUFREQ_TABLE_END; i++) {
-		unsigned long rate = freq_table[i].frequency * 1000 + 999;
+		unsigned long rate = freq_table[i].frequency * 1000UL + 999;
 		struct dev_pm_opp *opp = dev_pm_opp_find_freq_floor(cpu_dev, &rate);
 
 		if (IS_ERR(opp)) {

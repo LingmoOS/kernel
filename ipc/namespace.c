@@ -58,7 +58,7 @@ static struct ipc_namespace *create_ipc_ns(struct user_namespace *user_ns,
 	}
 
 	err = -ENOMEM;
-	ns = kzalloc(sizeof(struct ipc_namespace), GFP_KERNEL_ACCOUNT);
+	ns = kzalloc_obj(struct ipc_namespace, GFP_KERNEL_ACCOUNT);
 	if (ns == NULL)
 		goto fail_dec;
 
@@ -66,6 +66,7 @@ static struct ipc_namespace *create_ipc_ns(struct user_namespace *user_ns,
 	if (err)
 		goto fail_free;
 
+	ns_tree_gen_id(ns);
 	ns->user_ns = get_user_ns(user_ns);
 	ns->ucounts = ucounts;
 
@@ -86,7 +87,7 @@ static struct ipc_namespace *create_ipc_ns(struct user_namespace *user_ns,
 
 	sem_init_ns(ns);
 	shm_init_ns(ns);
-	ns_tree_add(ns);
+	ns_tree_add_raw(ns);
 
 	return ns;
 
@@ -209,23 +210,6 @@ void put_ipc_ns(struct ipc_namespace *ns)
 			schedule_work(&free_ipc_work);
 	}
 }
-EXPORT_SYMBOL(put_ipc_ns);
-
-struct ipc_namespace *get_ipc_ns_exported(struct ipc_namespace *ns)
-{
-	return get_ipc_ns(ns);
-}
-EXPORT_SYMBOL(get_ipc_ns_exported);
-
-struct ipc_namespace *show_init_ipc_ns(void)
-{
-#if defined(CONFIG_IPC_NS)
-	return &init_ipc_ns;
-#else
-	return NULL;
-#endif
-}
-EXPORT_SYMBOL(show_init_ipc_ns);
 
 static struct ns_common *ipcns_get(struct task_struct *task)
 {
@@ -271,3 +255,10 @@ const struct proc_ns_operations ipcns_operations = {
 	.install	= ipcns_install,
 	.owner		= ipcns_owner,
 };
+
+static int __init ipc_ns_tree_init(void)
+{
+	ns_tree_add(&init_ipc_ns);
+	return 0;
+}
+pure_initcall(ipc_ns_tree_init);

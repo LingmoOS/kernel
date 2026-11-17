@@ -280,7 +280,7 @@ int amdgpu_uvd_sw_init(struct amdgpu_device *adev)
 
 		version_major = (le32_to_cpu(hdr->ucode_version) >> 24) & 0xff;
 		version_minor = (le32_to_cpu(hdr->ucode_version) >> 8) & 0xff;
-		DRM_INFO("Found UVD firmware Version: %u.%u Family ID: %u\n",
+		drm_info(adev_to_drm(adev), "Found UVD firmware Version: %u.%u Family ID: %u\n",
 			version_major, version_minor, family_id);
 
 		/*
@@ -307,7 +307,7 @@ int amdgpu_uvd_sw_init(struct amdgpu_device *adev)
 		dec_minor = (le32_to_cpu(hdr->ucode_version) >> 8) & 0xff;
 		enc_minor = (le32_to_cpu(hdr->ucode_version) >> 24) & 0x3f;
 		enc_major = (le32_to_cpu(hdr->ucode_version) >> 30) & 0x3;
-		DRM_INFO("Found UVD firmware ENC: %u.%u DEC: .%u Family ID: %u\n",
+		drm_info(adev_to_drm(adev), "Found UVD firmware ENC: %u.%u DEC: .%u Family ID: %u\n",
 			enc_major, enc_minor, dec_minor, family_id);
 
 		adev->uvd.max_handles = AMDGPU_MAX_UVD_HANDLES;
@@ -377,7 +377,8 @@ int amdgpu_uvd_sw_fini(struct amdgpu_device *adev)
 	void *addr = amdgpu_bo_kptr(adev->uvd.ib_bo);
 	int i, j;
 
-	drm_sched_entity_destroy(&adev->uvd.entity);
+	if (adev->uvd.entity.rq)
+		drm_sched_entity_destroy(&adev->uvd.entity);
 
 	for (j = 0; j < adev->uvd.num_uvd_inst; ++j) {
 		if (adev->uvd.harvest_config & (1 << j))
@@ -472,7 +473,8 @@ int amdgpu_uvd_prepare_suspend(struct amdgpu_device *adev)
 int amdgpu_uvd_suspend(struct amdgpu_device *adev)
 {
 	if (amdgpu_ras_intr_triggered())
-		DRM_WARN("UVD VCPU state may lost due to RAS ERREVENT_ATHUB_INTERRUPT\n");
+		drm_warn(adev_to_drm(adev),
+			"UVD VCPU state may lost due to RAS ERREVENT_ATHUB_INTERRUPT\n");
 
 	return 0;
 }
@@ -1116,8 +1118,9 @@ static int amdgpu_uvd_send_msg(struct amdgpu_ring *ring, struct amdgpu_bo *bo,
 	r = amdgpu_job_alloc_with_ib(ring->adev, &adev->uvd.entity,
 				     AMDGPU_FENCE_OWNER_UNDEFINED,
 				     64, direct ? AMDGPU_IB_POOL_DIRECT :
-				     AMDGPU_IB_POOL_DELAYED, &job,
-				     AMDGPU_KERNEL_JOB_ID_VCN_RING_TEST);
+				     AMDGPU_IB_POOL_DELAYED,
+				     AMDGPU_KERNEL_JOB_ID_VCN_RING_TEST,
+				     &job);
 	if (r)
 		return r;
 

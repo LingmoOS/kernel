@@ -87,7 +87,7 @@ static int usbtv_probe(struct usb_interface *intf,
 	size = size * usb_endpoint_maxp_mult(&ep->desc);
 
 	/* Device structure */
-	usbtv = kzalloc(sizeof(struct usbtv), GFP_KERNEL);
+	usbtv = kzalloc_obj(struct usbtv);
 	if (usbtv == NULL)
 		return -ENOMEM;
 	usbtv->dev = dev;
@@ -119,7 +119,10 @@ usbtv_audio_fail:
 
 usbtv_video_fail:
 	usb_set_intfdata(intf, NULL);
-	kfree(usbtv);
+	if (usbtv->v4l2_dev.dev)
+		v4l2_device_put(&usbtv->v4l2_dev);
+	else
+		kfree(usbtv);
 
 	return ret;
 }

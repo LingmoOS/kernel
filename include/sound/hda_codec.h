@@ -9,7 +9,7 @@
 #define __SOUND_HDA_CODEC_H
 
 #include <linux/refcount.h>
-#include <linux/mod_devicetable.h>
+#include <linux/device-id/hda.h>
 #include <sound/info.h>
 #include <sound/control.h>
 #include <sound/pcm.h>
@@ -188,8 +188,7 @@ struct hda_codec {
 
 	/* PCM to create, set by hda_codec_ops.build_pcms callback */
 	struct list_head pcm_list_head;
-	refcount_t pcm_ref;
-	wait_queue_head_t remove_sleep;
+	struct snd_refcount pcm_ref;
 
 	/* codec specific info */
 	void *spec;
@@ -338,6 +337,17 @@ snd_hda_codec_write(struct hda_codec *codec, hda_nid_t nid, int flags,
 	return snd_hdac_codec_write(&codec->core, nid, flags, verb, parm);
 }
 
+/* sync after write */
+static inline int
+snd_hda_codec_write_sync(struct hda_codec *codec, hda_nid_t nid, int flags,
+			 unsigned int verb, unsigned int parm)
+{
+	/* use snd_hda_codec_read() for writing;
+	 * the returned value is usually discarded
+	 */
+	return snd_hdac_codec_read(&codec->core, nid, flags, verb, parm);
+}
+
 #define snd_hda_param_read(codec, nid, param) \
 	snd_hdac_read_parm(&(codec)->core, nid, param)
 #define snd_hda_get_sub_nodes(codec, nid, start_nid) \
@@ -429,9 +439,12 @@ void snd_hda_codec_cleanup_for_unbind(struct hda_codec *codec);
 
 static inline void snd_hda_codec_pcm_get(struct hda_pcm *pcm)
 {
-	refcount_inc(&pcm->codec->pcm_ref);
+	snd_refcount_get(&pcm->codec->pcm_ref);
 }
-void snd_hda_codec_pcm_put(struct hda_pcm *pcm);
+static inline void snd_hda_codec_pcm_put(struct hda_pcm *pcm)
+{
+	snd_refcount_put(&pcm->codec->pcm_ref);
+}
 
 int snd_hda_codec_prepare(struct hda_codec *codec,
 			  struct hda_pcm_stream *hinfo,
@@ -471,6 +484,10 @@ int snd_hda_lock_devices(struct hda_bus *bus);
 void snd_hda_unlock_devices(struct hda_bus *bus);
 void snd_hda_bus_reset(struct hda_bus *bus);
 void snd_hda_bus_reset_codecs(struct hda_bus *bus);
+
+void snd_hda_codec_set_gpio(struct hda_codec *codec, unsigned int mask,
+			    unsigned int dir, unsigned int data,
+			    unsigned int delay);
 
 int snd_hda_codec_set_name(struct hda_codec *codec, const char *name);
 

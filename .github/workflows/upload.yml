@@ -1,4 +1,4 @@
-name: Upload kernel source to OBS
+name: Upload linux-7.3.4 source to OBS
 
 permissions:
   contents: read
@@ -12,43 +12,50 @@ on:
     branches: [main]
 
 concurrency:
-  group: kernel-source-${{ github.ref }}
+  group: linux-7.3.4-source-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  debian:
+  source:
     name: Build Debian source package
     runs-on: ubuntu-latest
     container: docker.io/library/debian:testing
-    env:
-      DEBIAN_FRONTEND: noninteractive
-      KDEB_SOURCENAME: linux
-      KDEB_CHANGELOG_DIST: lithium
-      KDEB_MAINTAINER: Lingmo OS Team <team@lingmo.org>
-      DEBFULLNAME: Lingmo OS Team
-      DEBEMAIL: team@lingmo.org
     steps:
       - name: Install dependencies
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            ca-certificates git curl build-essential bc bison flex \
-            libssl-dev libelf-dev libncurses-dev kmod cpio rsync \
-            python3 devscripts dpkg-dev debhelper xz-utils
+            ca-certificates git build-essential devscripts dpkg-dev \
+            debhelper quilt rsync python3 xz-utils fakeroot
 
       - name: Checkout source
         uses: actions/checkout@v4
         with:
           persist-credentials: false
 
-      - name: Configure kernel
+      - name: Prepare Debian source tree
         run: |
+          set -eu
+          test -d debian/debian
+          mv debian/debian /tmp/debian-metadata
+          rm -rf debian
+          mv /tmp/debian-metadata debian
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          cp CONFIGS/x86_64/config .config
-          make ARCH=x86 olddefconfig
+          test -f debian/source/format
+
+      - name: Apply Debian patches and generate control files
+        run: |
+          set -eu
+          mkdir -p ../orig
+          tar --exclude=./debian --exclude=./.git \
+            --sort=name --mtime='UTC 2026-11-17' --owner=0 --group=0 --numeric-owner \
+            -cJf ../linux_7.3.4.orig.tar.xz .
+          mkdir -p ../orig/linux-7.3.4
+          tar -xJf ../linux_7.3.4.orig.tar.xz -C ../orig/linux-7.3.4 --strip-components=0
+          make -f debian/rules orig
 
       - name: Build source package
-        run: make ARCH=x86 -j"$(nproc)" KDEB_SOURCE_COMPRESS=xz srcdeb-pkg
+        run: dpkg-buildpackage -S -us -uc -d
 
       - name: Collect source package
         run: |
@@ -60,7 +67,7 @@ jobs:
       - name: Save source package
         uses: actions/upload-artifact@v4
         with:
-          name: linux-source-${{ github.run_id }}-${{ github.run_attempt }}
+          name: linux-7.3.4-source-${{ github.run_id }}-${{ github.run_attempt }}
           path: src-tar-output/
           if-no-files-found: error
           compression-level: 0
@@ -70,7 +77,7 @@ jobs:
         uses: LingmoOS/action-upload-to-obs@0.0.4
         with:
           remove-old-sources: true
-          obs-package-name: linux
+          obs-package-name: linux-7.3.4
           obs-project-name: home:LingmoOS
           obs-user-name: ${{ secrets.OBS_USERNAME }}
           obs-password: ${{ secrets.OBS_TOKEN }}

@@ -114,9 +114,9 @@ static void rpcrdma_xprt_drain(struct rpcrdma_xprt *r_xprt)
 	rpcrdma_ep_put(ep);
 }
 
-/* Ensure xprt_force_disconnect() is invoked exactly once when a
- * connection is closed or lost. (The important thing is it needs
- * to be invoked "at least" once).
+/* Ensure xprt_force_disconnect() is invoked at most once for an
+ * unexpected endpoint failure. Local endpoint teardown closes this
+ * gate before it can generate CM events and flushed completions.
  */
 void rpcrdma_force_disconnect(struct rpcrdma_ep *ep)
 {
@@ -396,7 +396,7 @@ static int rpcrdma_ep_create(struct rpcrdma_xprt *r_xprt)
 	struct rpcrdma_ep *ep;
 	int rc;
 
-	ep = kzalloc(sizeof(*ep), XPRTRDMA_GFP_FLAGS);
+	ep = kzalloc_obj(*ep, XPRTRDMA_GFP_FLAGS);
 	if (!ep)
 		return -ENOTCONN;
 	ep->re_xprt = &r_xprt->rx_xprt;
@@ -465,7 +465,7 @@ static int rpcrdma_ep_create(struct rpcrdma_xprt *r_xprt)
 	/* Client offers RDMA Read but does not initiate */
 	ep->re_remote_cma.initiator_depth = 0;
 	ep->re_remote_cma.responder_resources =
-		min_t(int, U8_MAX, device->attrs.max_qp_rd_atom);
+		min(device->attrs.max_qp_rd_atom, U8_MAX);
 
 	/* Limit transport retries so client can detect server
 	 * GID changes quickly. RPC layer handles re-establishing
@@ -587,6 +587,9 @@ void rpcrdma_xprt_disconnect(struct rpcrdma_xprt *r_xprt)
 	if (!ep)
 		return;
 
+	/* Prevent teardown-generated events from requesting another close. */
+	atomic_xchg(&ep->re_force_disconnect, 1);
+
 	id = ep->re_id;
 	rc = rdma_disconnect(id);
 	trace_xprtrdma_disconnect(r_xprt, rc);
@@ -656,8 +659,8 @@ static struct rpcrdma_sendctx *rpcrdma_sendctx_create(struct rpcrdma_ep *ep)
 {
 	struct rpcrdma_sendctx *sc;
 
-	sc = kzalloc(struct_size(sc, sc_sges, ep->re_attr.cap.max_send_sge),
-		     XPRTRDMA_GFP_FLAGS);
+	sc = kzalloc_flex(*sc, sc_sges, ep->re_attr.cap.max_send_sge,
+			  XPRTRDMA_GFP_FLAGS);
 	if (!sc)
 		return NULL;
 
@@ -680,7 +683,7 @@ static int rpcrdma_sendctxs_create(struct rpcrdma_xprt *r_xprt)
 	 * Sends are posted.
 	 */
 	i = r_xprt->rx_ep->re_max_requests + RPCRDMA_MAX_BC_REQUESTS;
-	buf->rb_sc_ctxs = kcalloc(i, sizeof(sc), XPRTRDMA_GFP_FLAGS);
+	buf->rb_sc_ctxs = kzalloc_objs(sc, i, XPRTRDMA_GFP_FLAGS);
 	if (!buf->rb_sc_ctxs)
 		return -ENOMEM;
 
@@ -755,6 +758,18 @@ out_emptyq:
 	 */
 	xprt_wait_for_buffer_space(&r_xprt->rx_xprt);
 	r_xprt->rx_stats.empty_sendctx_q++;
+
+	/* Recheck: a Send completion between the ring-empty test
+	 * and the set_bit could cause its xprt_write_space() to
+	 * miss, leaving XPRT_WRITE_SPACE set with a non-full ring.
+	 * The smp_mb__after_atomic() pairs with smp_store_release()
+	 * in rpcrdma_sendctx_put_locked().
+	 */
+	smp_mb__after_atomic();
+	next_head = rpcrdma_sendctx_next(buf, buf->rb_sc_head);
+	if (next_head != READ_ONCE(buf->rb_sc_tail))
+		xprt_write_space(&r_xprt->rx_xprt);
+
 	return NULL;
 }
 
@@ -812,7 +827,10 @@ static void rpcrdma_sendctx_put_locked(struct rpcrdma_xprt *r_xprt,
 
 	} while (buf->rb_sc_ctxs[next_tail] != sc);
 
-	/* Paired with READ_ONCE */
+	/* Paired with READ_ONCE in rpcrdma_sendctx_get_locked():
+	 * both the fast-path ring-full test and the post-set_bit
+	 * recheck in the slow path depend on this store-release.
+	 */
 	smp_store_release(&buf->rb_sc_tail, next_tail);
 
 	xprt_write_space(&r_xprt->rx_xprt);
@@ -895,7 +913,7 @@ struct rpcrdma_req *rpcrdma_req_create(struct rpcrdma_xprt *r_xprt,
 	struct rpcrdma_buffer *buffer = &r_xprt->rx_buf;
 	struct rpcrdma_req *req;
 
-	req = kzalloc(sizeof(*req), XPRTRDMA_GFP_FLAGS);
+	req = kzalloc_obj(*req, XPRTRDMA_GFP_FLAGS);
 	if (req == NULL)
 		goto out1;
 
@@ -1025,7 +1043,7 @@ struct rpcrdma_rep *rpcrdma_rep_create(struct rpcrdma_xprt *r_xprt)
 	struct ib_device *device = ep->re_id->device;
 	struct rpcrdma_rep *rep;
 
-	rep = kzalloc(sizeof(*rep), XPRTRDMA_GFP_FLAGS);
+	rep = kzalloc_obj(*rep, XPRTRDMA_GFP_FLAGS);
 	if (rep == NULL)
 		goto out;
 
@@ -1157,7 +1175,7 @@ int rpcrdma_buffer_create(struct rpcrdma_xprt *r_xprt)
 	INIT_LIST_HEAD(&buf->rb_all_mrs);
 	INIT_WORK(&buf->rb_refresh_worker, rpcrdma_mr_refresh_worker);
 
-	INIT_LIST_HEAD(&buf->rb_send_bufs);
+	init_llist_head(&buf->rb_send_bufs);
 	INIT_LIST_HEAD(&buf->rb_allreqs);
 	INIT_LIST_HEAD(&buf->rb_all_reps);
 
@@ -1171,7 +1189,7 @@ int rpcrdma_buffer_create(struct rpcrdma_xprt *r_xprt)
 					 RPCRDMA_V1_DEF_INLINE_SIZE * 2);
 		if (!req)
 			goto out;
-		list_add(&req->rl_list, &buf->rb_send_bufs);
+		llist_add(&req->rl_node, &buf->rb_send_bufs);
 	}
 
 	init_llist_head(&buf->rb_free_reps);
@@ -1251,16 +1269,14 @@ static void rpcrdma_mrs_destroy(struct rpcrdma_xprt *r_xprt)
 void
 rpcrdma_buffer_destroy(struct rpcrdma_buffer *buf)
 {
+	struct rpcrdma_req *req, *next;
+	struct llist_node *node;
+
 	rpcrdma_reps_destroy(buf);
 
-	while (!list_empty(&buf->rb_send_bufs)) {
-		struct rpcrdma_req *req;
-
-		req = list_first_entry(&buf->rb_send_bufs,
-				       struct rpcrdma_req, rl_list);
-		list_del(&req->rl_list);
+	node = llist_del_all(&buf->rb_send_bufs);
+	llist_for_each_entry_safe(req, next, node, rl_node)
 		rpcrdma_req_destroy(req);
-	}
 }
 
 /**
@@ -1296,10 +1312,6 @@ void rpcrdma_reply_put(struct rpcrdma_buffer *buffers, struct rpcrdma_req *req)
 		req->rl_reply = NULL;
 		rpcrdma_rep_put(buffers, rep);
 	}
-	/* I2: rl_reply NULL after the put closes the
-	 * 'rep on rb_free_reps still referenced by req' window.
-	 */
-	WARN_ON_ONCE(req->rl_reply);
 }
 
 /**
@@ -1311,15 +1323,15 @@ void rpcrdma_reply_put(struct rpcrdma_buffer *buffers, struct rpcrdma_req *req)
 struct rpcrdma_req *
 rpcrdma_buffer_get(struct rpcrdma_buffer *buffers)
 {
-	struct rpcrdma_req *req;
+	struct llist_node *node;
 
+	/* Calls to llist_del_first are required to be serialized */
 	spin_lock(&buffers->rb_lock);
-	req = list_first_entry_or_null(&buffers->rb_send_bufs,
-				       struct rpcrdma_req, rl_list);
-	if (req)
-		list_del_init(&req->rl_list);
+	node = llist_del_first(&buffers->rb_send_bufs);
 	spin_unlock(&buffers->rb_lock);
-	return req;
+	if (!node)
+		return NULL;
+	return llist_entry(node, struct rpcrdma_req, rl_node);
 }
 
 /**
@@ -1332,9 +1344,7 @@ void rpcrdma_buffer_put(struct rpcrdma_buffer *buffers, struct rpcrdma_req *req)
 {
 	rpcrdma_reply_put(buffers, req);
 
-	spin_lock(&buffers->rb_lock);
-	list_add(&req->rl_list, &buffers->rb_send_bufs);
-	spin_unlock(&buffers->rb_lock);
+	llist_add(&req->rl_node, &buffers->rb_send_bufs);
 }
 
 /* Returns a pointer to a rpcrdma_regbuf object, or NULL.
@@ -1486,7 +1496,7 @@ void rpcrdma_post_recvs(struct rpcrdma_xprt *r_xprt, int needed)
 	if (likely(ep->re_receive_count > needed))
 		goto out;
 	needed -= ep->re_receive_count;
-	needed += RPCRDMA_MAX_RECV_BATCH;
+	needed += ep->re_recv_batch;
 
 	if (atomic_inc_return(&ep->re_receiving) > 1)
 		goto out_dec;

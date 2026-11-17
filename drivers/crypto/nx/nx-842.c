@@ -105,7 +105,7 @@ void *nx842_crypto_alloc_ctx(struct nx842_driver *driver)
 {
 	struct nx842_crypto_ctx *ctx;
 
-	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+	ctx = kzalloc_obj(*ctx);
 	if (!ctx)
 		return ERR_PTR(-ENOMEM);
 
@@ -421,6 +421,8 @@ usesw:
 
 	slen -= spadding;
 
+	if (ignore > dlen)
+		return -EINVAL;
 	dlen -= ignore;
 	if (ignore)
 		pr_debug("ignoring last %x bytes\n", ignore);

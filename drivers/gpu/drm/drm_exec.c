@@ -48,9 +48,6 @@
  * See struct dma_exec for more details.
  */
 
-/* Dummy value used to initially enter the retry loop */
-#define DRM_EXEC_DUMMY ((void *)~0)
-
 /* Unlock and put the prelocked obj */
 static void drm_exec_drop_prelocked(struct drm_exec *exec)
 {
@@ -91,7 +88,7 @@ void drm_exec_init(struct drm_exec *exec, u32 flags, unsigned nr)
 		nr = PAGE_SIZE / sizeof(void *);
 
 	exec->flags = flags;
-	exec->objects = kvmalloc_array(nr, sizeof(void *), GFP_KERNEL);
+	exec->objects = kvmalloc_objs(*exec->objects, nr);
 
 	/* If allocation here fails, just delay that till the first use */
 	exec->max_objects = exec->objects ? nr : 0;

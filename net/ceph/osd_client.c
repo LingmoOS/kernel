@@ -557,7 +557,7 @@ struct ceph_osd_request *ceph_osdc_alloc_request(struct ceph_osd_client *osdc,
 		req = kmem_cache_alloc(ceph_osd_request_cache, gfp_flags);
 	} else {
 		BUG_ON(num_ops > CEPH_OSD_MAX_OPS);
-		req = kmalloc(struct_size(req, r_ops, num_ops), gfp_flags);
+		req = kmalloc_flex(*req, r_ops, num_ops, gfp_flags);
 	}
 	if (unlikely(!req))
 		return NULL;
@@ -1108,7 +1108,9 @@ struct ceph_osd_request *ceph_osdc_new_request(struct ceph_osd_client *osdc,
 	req->r_base_oloc.pool = layout->pool_id;
 	req->r_base_oloc.pool_ns = ceph_try_get_string(layout->pool_ns);
 	ceph_oid_printf(&req->r_base_oid, "%llx.%08llx", vino.ino, objnum);
-	req->r_flags = flags | osdc->client->options->read_from_replica;
+	req->r_flags = flags;
+	if (flags & CEPH_OSD_FLAG_READ)
+		req->r_flags |= osdc->client->options->read_from_replica;
 
 	req->r_snapid = vino.snap;
 	if (flags & CEPH_OSD_FLAG_WRITE)
@@ -1154,9 +1156,8 @@ int __ceph_alloc_sparse_ext_map(struct ceph_osd_req_op *op, int cnt)
 	WARN_ON(op->op != CEPH_OSD_OP_SPARSE_READ);
 
 	op->extent.sparse_ext_cnt = cnt;
-	op->extent.sparse_ext = kmalloc_array(cnt,
-					      sizeof(*op->extent.sparse_ext),
-					      GFP_NOFS);
+	op->extent.sparse_ext = kmalloc_objs(*op->extent.sparse_ext, cnt,
+					     GFP_NOFS);
 	if (!op->extent.sparse_ext)
 		return -ENOMEM;
 	return 0;
@@ -1265,7 +1266,7 @@ static struct ceph_osd *create_osd(struct ceph_osd_client *osdc, int onum)
 
 	WARN_ON(onum == CEPH_HOMELESS_OSD);
 
-	osd = kzalloc(sizeof(*osd), GFP_NOIO | __GFP_NOFAIL);
+	osd = kzalloc_obj(*osd, GFP_NOIO | __GFP_NOFAIL);
 	osd_init(osd);
 	osd->o_osdc = osdc;
 	osd->o_osd = onum;
@@ -1281,8 +1282,7 @@ static struct ceph_osd *create_osd(struct ceph_osd_client *osdc, int onum)
 static struct ceph_osd *get_osd(struct ceph_osd *osd)
 {
 	if (refcount_inc_not_zero(&osd->o_ref)) {
-		dout("get_osd %p %d -> %d\n", osd, refcount_read(&osd->o_ref)-1,
-		     refcount_read(&osd->o_ref));
+		dout("get_osd %p -> %d\n", osd, refcount_read(&osd->o_ref));
 		return osd;
 	} else {
 		dout("get_osd %p FAIL\n", osd);
@@ -1292,8 +1292,7 @@ static struct ceph_osd *get_osd(struct ceph_osd *osd)
 
 static void put_osd(struct ceph_osd *osd)
 {
-	dout("put_osd %p %d -> %d\n", osd, refcount_read(&osd->o_ref),
-	     refcount_read(&osd->o_ref) - 1);
+	dout("put_osd %p -> %d\n", osd, refcount_read(&osd->o_ref) - 1);
 	if (refcount_dec_and_test(&osd->o_ref)) {
 		osd_cleanup(osd);
 		kfree(osd);
@@ -1721,7 +1720,7 @@ static struct ceph_spg_mapping *alloc_spg_mapping(void)
 {
 	struct ceph_spg_mapping *spg;
 
-	spg = kmalloc(sizeof(*spg), GFP_NOIO);
+	spg = kmalloc_obj(*spg, GFP_NOIO);
 	if (!spg)
 		return NULL;
 
@@ -1916,7 +1915,7 @@ static struct ceph_osd_backoff *alloc_backoff(void)
 {
 	struct ceph_osd_backoff *backoff;
 
-	backoff = kzalloc(sizeof(*backoff), GFP_NOIO);
+	backoff = kzalloc_obj(*backoff, GFP_NOIO);
 	if (!backoff)
 		return NULL;
 
@@ -2809,7 +2808,7 @@ linger_alloc(struct ceph_osd_client *osdc)
 {
 	struct ceph_osd_linger_request *lreq;
 
-	lreq = kzalloc(sizeof(*lreq), GFP_NOIO);
+	lreq = kzalloc_obj(*lreq, GFP_NOIO);
 	if (!lreq)
 		return NULL;
 
@@ -2951,7 +2950,7 @@ static struct linger_work *lwork_alloc(struct ceph_osd_linger_request *lreq,
 {
 	struct linger_work *lwork;
 
-	lwork = kzalloc(sizeof(*lwork), GFP_NOIO);
+	lwork = kzalloc_obj(*lwork, GFP_NOIO);
 	if (!lwork)
 		return NULL;
 
@@ -3568,6 +3567,7 @@ static int ceph_oloc_decode(void **p, void *end,
 	ceph_decode_need(p, end, len, e_inval);
 	struct_end = *p + len;
 
+	ceph_decode_need(p, end, 8 + 4 + 4, e_inval);
 	oloc->pool = ceph_decode_64(p);
 	*p += 4; /* skip preferred */
 
@@ -3580,7 +3580,7 @@ static int ceph_oloc_decode(void **p, void *end,
 	if (struct_v >= 5) {
 		bool changed = false;
 
-		len = ceph_decode_32(p);
+		ceph_decode_32_safe(p, end, len, e_inval);
 		if (len > 0) {
 			ceph_decode_need(p, end, len, e_inval);
 			if (!oloc->pool_ns ||
@@ -3599,7 +3599,9 @@ static int ceph_oloc_decode(void **p, void *end,
 	}
 
 	if (struct_v >= 6) {
-		s64 hash = ceph_decode_64(p);
+		s64 hash;
+
+		ceph_decode_64_safe(p, end, hash, e_inval);
 		if (hash != -1) {
 			pr_warn("ceph_object_locator::hash is set\n");
 			goto e_inval;
@@ -3640,7 +3642,7 @@ static int ceph_redirect_decode(void **p, void *end,
 	if (ret)
 		goto out;
 
-	len = ceph_decode_32(p);
+	ceph_decode_32_safe(p, end, len, e_inval);
 	if (len > 0) {
 		pr_warn("ceph_request_redirect::object_name is set\n");
 		goto e_inval;
@@ -4332,7 +4334,7 @@ static int decode_MOSDBackoff(const struct ceph_msg *msg, struct MOSDBackoff *m)
 	ceph_decode_8_safe(&p, end, m->op, e_inval);
 	ceph_decode_64_safe(&p, end, m->id, e_inval);
 
-	m->begin = kzalloc(sizeof(*m->begin), GFP_NOIO);
+	m->begin = kzalloc_obj(*m->begin, GFP_NOIO);
 	if (!m->begin)
 		return -ENOMEM;
 
@@ -4342,7 +4344,7 @@ static int decode_MOSDBackoff(const struct ceph_msg *msg, struct MOSDBackoff *m)
 		return ret;
 	}
 
-	m->end = kzalloc(sizeof(*m->end), GFP_NOIO);
+	m->end = kzalloc_obj(*m->end, GFP_NOIO);
 	if (!m->end) {
 		free_hoid(m->begin);
 		return -ENOMEM;
@@ -5035,7 +5037,7 @@ static int decode_watchers(void **p, void *end,
 		return ret;
 
 	ceph_decode_32_safe(p, end, *num_watchers, bad);
-	*watchers = kcalloc(*num_watchers, sizeof(**watchers), GFP_NOIO);
+	*watchers = kzalloc_objs(**watchers, *num_watchers, GFP_NOIO);
 	if (!*watchers)
 		return -ENOMEM;
 
@@ -5863,9 +5865,8 @@ next_op:
 			if (!sr->sr_extent || count > sr->sr_ext_len) {
 				/* no extent array provided, or too short */
 				kfree(sr->sr_extent);
-				sr->sr_extent = kmalloc_array(count,
-							      sizeof(*sr->sr_extent),
-							      GFP_NOIO);
+				sr->sr_extent = kmalloc_objs(*sr->sr_extent,
+							     count, GFP_NOIO);
 				if (!sr->sr_extent) {
 					pr_err("%s: failed to allocate %u extents\n",
 					       __func__, count);

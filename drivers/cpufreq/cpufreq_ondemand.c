@@ -18,10 +18,16 @@
 #include "cpufreq_ondemand.h"
 
 /* On-demand governor macros */
-#define DEF_FREQUENCY_UP_THRESHOLD		(63)
-#define DEF_SAMPLING_DOWN_FACTOR		(100)
+#if defined(CONFIG_ZEN_INTERACTIVE)
+#define DEF_FREQUENCY_UP_THRESHOLD		(55)
+#define MICRO_FREQUENCY_UP_THRESHOLD		(60)
+#define DEF_SAMPLING_DOWN_FACTOR		(5)
+#else
+#define DEF_FREQUENCY_UP_THRESHOLD		(80)
+#define MICRO_FREQUENCY_UP_THRESHOLD		(95)
+#define DEF_SAMPLING_DOWN_FACTOR		(1)
+#endif
 #define MAX_SAMPLING_DOWN_FACTOR		(100000)
-#define MICRO_FREQUENCY_UP_THRESHOLD		(70)
 #define MIN_FREQUENCY_UP_THRESHOLD		(1)
 #define MAX_FREQUENCY_UP_THRESHOLD		(100)
 
@@ -106,7 +112,7 @@ static void dbs_freq_increase(struct cpufreq_policy *policy, unsigned int freq)
 }
 
 /*
- * Every sampling_rate, we check, if current idle time is less than 37%
+ * Every sampling_rate, we check, if current idle time is less than 20%
  * (default), then we try to increase frequency. Else, we adjust the frequency
  * proportional to load.
  */
@@ -322,7 +328,7 @@ static struct policy_dbs_info *od_alloc(void)
 {
 	struct od_policy_dbs_info *dbs_info;
 
-	dbs_info = kzalloc(sizeof(*dbs_info), GFP_KERNEL);
+	dbs_info = kzalloc_obj(*dbs_info);
 	return dbs_info ? &dbs_info->policy_dbs : NULL;
 }
 
@@ -334,17 +340,12 @@ static void od_free(struct policy_dbs_info *policy_dbs)
 static int od_init(struct dbs_data *dbs_data)
 {
 	struct od_dbs_tuners *tuners;
-	u64 idle_time;
-	int cpu;
 
-	tuners = kzalloc(sizeof(*tuners), GFP_KERNEL);
+	tuners = kzalloc_obj(*tuners);
 	if (!tuners)
 		return -ENOMEM;
 
-	cpu = get_cpu();
-	idle_time = get_cpu_idle_time_us(cpu, NULL);
-	put_cpu();
-	if (idle_time != -1ULL) {
+	if (tick_nohz_is_active()) {
 		/* Idle micro accounting is supported. Use finer thresholds */
 		dbs_data->up_threshold = MICRO_FREQUENCY_UP_THRESHOLD;
 	} else {

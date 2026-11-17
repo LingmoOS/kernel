@@ -7,6 +7,7 @@
 #include <linux/iopoll.h>
 #include <linux/pci.h>
 #include <net/netdev_queues.h>
+#include <net/netdev_rx_queue.h>
 #include <net/page_pool/helpers.h>
 #include <net/tcp.h>
 #include <net/xdp.h>
@@ -39,7 +40,7 @@ struct fbnic_xmit_cb {
 
 #define FBNIC_XMIT_NOUNMAP	((void *)1)
 
-static u32 __iomem *fbnic_ring_csr_base(const struct fbnic_ring *ring)
+u32 __iomem *fbnic_ring_csr_base(const struct fbnic_ring *ring)
 {
 	unsigned long csr_base = (unsigned long)ring->doorbell;
 
@@ -677,7 +678,8 @@ static void fbnic_clean_twq1(struct fbnic_napi_vector *nv, bool pp_allow_direct,
 				 FBNIC_TWD_TYPE_AL;
 		total_bytes += FIELD_GET(FBNIC_TWD_LEN_MASK, twd);
 
-		page_pool_put_page(page->pp, page, -1, pp_allow_direct);
+		page_pool_put_page(pp_page_to_nmdesc(page)->pp, page, -1,
+				   pp_allow_direct);
 next_desc:
 		head++;
 		head &= ring->size_mask;
@@ -911,6 +913,7 @@ static void fbnic_bd_prep(struct fbnic_ring *bdq, u16 id, netmem_ref netmem)
 		*bdq_desc = cpu_to_le64(bd);
 		bd += FIELD_PREP(FBNIC_BD_DESC_ADDR_MASK, 1) |
 		      FIELD_PREP(FBNIC_BD_DESC_ID_MASK, 1);
+		bdq_desc++;
 	} while (--i);
 }
 
@@ -1662,7 +1665,7 @@ static int fbnic_alloc_napi_vector(struct fbnic_dev *fbd, struct fbnic_net *fbn,
 		return -EIO;
 
 	/* Allocate NAPI vector and queue triads */
-	nv = kzalloc(struct_size(nv, qt, qt_count), GFP_KERNEL);
+	nv = kzalloc_flex(*nv, qt, qt_count);
 	if (!nv)
 		return -ENOMEM;
 
@@ -1830,7 +1833,7 @@ int fbnic_alloc_napi_vectors(struct fbnic_net *fbn)
 free_vectors:
 	fbnic_free_napi_vectors(fbn);
 
-	return -ENOMEM;
+	return err;
 }
 
 static void fbnic_free_ring_resources(struct device *dev,
@@ -2275,6 +2278,22 @@ fbnic_nv_disable(struct fbnic_net *fbn, struct fbnic_napi_vector *nv)
 {
 	__fbnic_nv_disable(nv);
 	fbnic_wrfl(fbn->fbd);
+}
+
+void fbnic_dbg_down(struct fbnic_net *fbn)
+{
+	int i;
+
+	for (i = 0; i < fbn->num_napi; i++)
+		fbnic_dbg_nv_exit(fbn->napi[i]);
+}
+
+void fbnic_dbg_up(struct fbnic_net *fbn)
+{
+	int i;
+
+	for (i = 0; i < fbn->num_napi; i++)
+		fbnic_dbg_nv_init(fbn->napi[i]);
 }
 
 void fbnic_disable(struct fbnic_net *fbn)
@@ -2835,6 +2854,17 @@ void fbnic_napi_depletion_check(struct net_device *netdev)
 	fbnic_wrfl(fbd);
 }
 
+/* Returns the napi vector servicing an Rx queue, or NULL if the datapath
+ * is torn down.  The association is published by fbnic_set_netif_napi()
+ * and cleared by fbnic_reset_netif_napi(), both under the instance lock.
+ */
+static struct fbnic_napi_vector *fbnic_rxq_nv(struct net_device *dev, int idx)
+{
+	struct napi_struct *napi = __netif_get_rx_queue(dev, idx)->napi;
+
+	return napi ? container_of(napi, struct fbnic_napi_vector, napi) : NULL;
+}
+
 static int fbnic_queue_mem_alloc(struct net_device *dev,
 				 struct netdev_queue_config *qcfg,
 				 void *qmem, int idx)
@@ -2847,8 +2877,16 @@ static int fbnic_queue_mem_alloc(struct net_device *dev,
 	if (!netif_running(dev))
 		return fbnic_alloc_qt_page_pools(fbn, qt, idx);
 
+	/* A failed PCIe recovery or resume can leave the datapath torn down
+	 * while netif_running() is still true.  This ndo runs before
+	 * netdev_rx_queue_restart() checks netif_running(), so bail out
+	 * rather than touching rings and vectors that are already freed.
+	 */
+	nv = fbnic_rxq_nv(dev, idx);
+	if (!nv)
+		return -ENETDOWN;
+
 	real = container_of(fbn->rx[idx], struct fbnic_q_triad, cmpl);
-	nv = fbn->napi[idx % fbn->num_napi];
 
 	fbnic_ring_init(&qt->sub0, real->sub0.doorbell, real->sub0.q_idx,
 			real->sub0.flags);
@@ -2887,6 +2925,7 @@ static void __fbnic_nv_restart(struct fbnic_net *fbn,
 
 	for (i = 0; i < nv->txt_count; i++)
 		netif_wake_subqueue(fbn->netdev, nv->qt[i].sub0.q_idx);
+	fbnic_dbg_nv_init(nv);
 }
 
 static int fbnic_queue_start(struct net_device *dev,
@@ -2898,7 +2937,7 @@ static int fbnic_queue_start(struct net_device *dev,
 	struct fbnic_q_triad *real;
 
 	real = container_of(fbn->rx[idx], struct fbnic_q_triad, cmpl);
-	nv = fbn->napi[idx % fbn->num_napi];
+	nv = fbnic_rxq_nv(dev, idx);
 
 	fbnic_aggregate_ring_bdq_counters(fbn, &real->sub0);
 	fbnic_aggregate_ring_bdq_counters(fbn, &real->sub1);
@@ -2920,7 +2959,8 @@ static int fbnic_queue_stop(struct net_device *dev, void *qmem, int idx)
 	int err;
 
 	real = container_of(fbn->rx[idx], struct fbnic_q_triad, cmpl);
-	nv = fbn->napi[idx % fbn->num_napi];
+	nv = fbnic_rxq_nv(dev, idx);
+	fbnic_dbg_nv_exit(nv);
 
 	napi_disable_locked(&nv->napi);
 	fbnic_nv_irq_disable(nv);

@@ -62,8 +62,8 @@ MODULE_PARM_DESC(model, "Use the given board model.");
 
 /* Both VT1720 and VT1724 have the same PCI IDs */
 static const struct pci_device_id snd_vt1724_ids[] = {
-	{ PCI_VDEVICE(ICE, PCI_DEVICE_ID_VT1724), 0 },
-	{ 0, }
+	{ PCI_VDEVICE(ICE, PCI_DEVICE_ID_VT1724) },
+	{ }
 };
 
 MODULE_DEVICE_TABLE(pci, snd_vt1724_ids);
@@ -982,7 +982,7 @@ static int set_rate_constraints(struct snd_ice1712 *ice,
 					  ice->hw_rates);
 }
 
-/* if the card has the internal rate locked (is_pro_locked), limit runtime
+/* if the card has the internal rate locked (is_pro_rate_locked), limit runtime
    hw rates to the current internal rate only.
 */
 static void constrain_rate_if_locked(struct snd_pcm_substream *substream)

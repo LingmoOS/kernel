@@ -163,8 +163,8 @@ EXPORT_SYMBOL_GPL(aic3x_regmap);
 static int snd_soc_dapm_put_volsw_aic3x(struct snd_kcontrol *kcontrol,
 					struct snd_ctl_elem_value *ucontrol)
 {
-	struct snd_soc_component *component = snd_soc_dapm_kcontrol_component(kcontrol);
-	struct snd_soc_dapm_context *dapm = snd_soc_component_get_dapm(component);
+	struct snd_soc_component *component = snd_soc_dapm_kcontrol_to_component(kcontrol);
+	struct snd_soc_dapm_context *dapm = snd_soc_component_to_dapm(component);
 	struct soc_mixer_control *mc =
 		(struct soc_mixer_control *)kcontrol->private_value;
 	unsigned int reg = mc->reg;
@@ -1009,7 +1009,7 @@ static const struct snd_soc_dapm_route intercon_3007[] = {
 static int aic3x_add_widgets(struct snd_soc_component *component)
 {
 	struct aic3x_priv *aic3x = snd_soc_component_get_drvdata(component);
-	struct snd_soc_dapm_context *dapm = snd_soc_component_get_dapm(component);
+	struct snd_soc_dapm_context *dapm = snd_soc_component_to_dapm(component);
 
 	switch (aic3x->model) {
 	case AIC3X_MODEL_3X:
@@ -1462,13 +1462,14 @@ out:
 static int aic3x_set_bias_level(struct snd_soc_component *component,
 				enum snd_soc_bias_level level)
 {
+	struct snd_soc_dapm_context *dapm = snd_soc_component_to_dapm(component);
 	struct aic3x_priv *aic3x = snd_soc_component_get_drvdata(component);
 
 	switch (level) {
 	case SND_SOC_BIAS_ON:
 		break;
 	case SND_SOC_BIAS_PREPARE:
-		if (snd_soc_component_get_bias_level(component) == SND_SOC_BIAS_STANDBY &&
+		if (snd_soc_dapm_get_bias_level(dapm) == SND_SOC_BIAS_STANDBY &&
 		    aic3x->master) {
 			/* enable pll */
 			snd_soc_component_update_bits(component, AIC3X_PLL_PROGA_REG,
@@ -1478,7 +1479,7 @@ static int aic3x_set_bias_level(struct snd_soc_component *component,
 	case SND_SOC_BIAS_STANDBY:
 		if (!aic3x->power)
 			aic3x_set_power(component, 1);
-		if (snd_soc_component_get_bias_level(component) == SND_SOC_BIAS_PREPARE &&
+		if (snd_soc_dapm_get_bias_level(dapm) == SND_SOC_BIAS_PREPARE &&
 		    aic3x->master) {
 			/* disable pll */
 			snd_soc_component_update_bits(component, AIC3X_PLL_PROGA_REG,
@@ -1701,8 +1702,15 @@ static int aic3x_component_probe(struct snd_soc_component *component)
 	return 0;
 }
 
+static int aic3x_of_xlate_dai_id(struct snd_soc_component *component,
+				   struct device_node *endpoint)
+{
+	return 0;
+}
+
 static const struct snd_soc_component_driver soc_component_dev_aic3x = {
 	.set_bias_level		= aic3x_set_bias_level,
+	.of_xlate_dai_id	= aic3x_of_xlate_dai_id,
 	.probe			= aic3x_component_probe,
 	.controls		= aic3x_snd_controls,
 	.num_controls		= ARRAY_SIZE(aic3x_snd_controls),

@@ -1023,7 +1023,7 @@ void psi_account_irqtime(struct rq *rq, struct task_struct *curr, struct task_st
 
 	irq = irq_time_read(cpu);
 	delta = (s64)(irq - rq->psi_irq_time);
-	if (delta < 0)
+	if (delta <= 0)
 		return;
 	rq->psi_irq_time = irq;
 
@@ -1114,7 +1114,7 @@ int psi_cgroup_alloc(struct cgroup *cgroup)
 	if (!static_branch_likely(&psi_cgroups_enabled))
 		return 0;
 
-	cgroup->psi = kzalloc(sizeof(struct psi_group), GFP_KERNEL);
+	cgroup->psi = kzalloc_obj(struct psi_group);
 	if (!cgroup->psi)
 		return -ENOMEM;
 
@@ -1383,7 +1383,7 @@ struct psi_trigger *psi_trigger_create(struct psi_group *group, char *buf,
 	if (threshold_us == 0 || threshold_us > window_us)
 		return ERR_PTR(-EINVAL);
 
-	t = kmalloc(sizeof(*t), GFP_KERNEL);
+	t = kmalloc_obj(*t);
 	if (!t)
 		return ERR_PTR(-ENOMEM);
 

@@ -4,6 +4,7 @@
  * Copyright (c) 2015-2016 HGST, a Western Digital Company.
  */
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+#include <linux/hex.h>
 #include <linux/module.h>
 #include <linux/random.h>
 #include <linux/rculist.h>
@@ -42,7 +43,7 @@ EXPORT_SYMBOL_GPL(nvmet_aen_wq);
  *  - the nvmet_transports array
  *
  * When updating any of those lists/structures write lock should be obtained,
- * while when reading (popolating discovery log page or checking host-subsystem
+ * while when reading (populating discovery log page or checking host-subsystem
  * link) read lock is obtained to allow concurrent reads.
  */
 DECLARE_RWSEM(nvmet_config_sem);
@@ -195,7 +196,7 @@ void nvmet_add_async_event(struct nvmet_ctrl *ctrl, u8 event_type,
 {
 	struct nvmet_async_event *aen;
 
-	aen = kmalloc(sizeof(*aen), GFP_KERNEL);
+	aen = kmalloc_obj(*aen);
 	if (!aen)
 		return;
 
@@ -369,6 +370,14 @@ int nvmet_enable_port(struct nvmet_port *port)
 					       NVMET_MIN_QUEUE_SIZE,
 					       NVMET_MAX_QUEUE_SIZE);
 
+	/*
+	 * If the transport didn't set the mdts properly, then clamp it to the
+	 * target limits. Also set default values in case the transport didn't
+	 * set it at all.
+	 */
+	if (port->mdts < 0 || port->mdts > NVMET_MAX_MDTS)
+		port->mdts = 0;
+
 	port->enabled = true;
 	port->tr_ops = ops;
 	return 0;
@@ -437,20 +446,27 @@ u16 nvmet_req_find_ns(struct nvmet_req *req)
 {
 	u32 nsid = le32_to_cpu(req->cmd->common.nsid);
 	struct nvmet_subsys *subsys = nvmet_req_subsys(req);
+	u16 status = NVME_SC_SUCCESS;
 
+	rcu_read_lock();
 	req->ns = xa_load(&subsys->namespaces, nsid);
-	if (unlikely(!req->ns || !req->ns->enabled)) {
+	if (unlikely(!req->ns) ||
+	    !test_bit(NVMET_NS_IO_LIVE, &req->ns->flags) ||
+	    !percpu_ref_tryget_live_rcu(&req->ns->ref)) {
 		req->error_loc = offsetof(struct nvme_common_command, nsid);
-		if (!req->ns) /* ns doesn't exist! */
-			return NVME_SC_INVALID_NS | NVME_STATUS_DNR;
+		if (!req->ns) { /* ns doesn't exist! */
+			status = NVME_SC_INVALID_NS | NVME_STATUS_DNR;
+			goto unlock;
+		}
 
 		/* ns exists but it's disabled */
 		req->ns = NULL;
-		return NVME_SC_INTERNAL_PATH_ERROR;
+		status = NVME_SC_INTERNAL_PATH_ERROR;
 	}
+unlock:
+	rcu_read_unlock();
 
-	percpu_ref_get(&req->ns->ref);
-	return NVME_SC_SUCCESS;
+	return status;
 }
 
 static void nvmet_destroy_namespace(struct percpu_ref *ref)
@@ -549,7 +565,7 @@ static void nvmet_p2pmem_ns_add_p2p(struct nvmet_ctrl *ctrl,
 	if (ret < 0)
 		pci_dev_put(p2p_dev);
 
-	pr_info("using p2pmem on %s for nsid %d\n", pci_name(p2p_dev),
+	pr_info("using p2pmem on %s for nsid %u\n", pci_name(p2p_dev),
 		ns->nsid);
 }
 
@@ -582,6 +598,11 @@ int nvmet_ns_enable(struct nvmet_ns *ns)
 	if (ns->enabled)
 		goto out_unlock;
 
+	if (!ns->device_path) {
+		ret = -EINVAL;
+		goto out_unlock;
+	}
+
 	ret = nvmet_bdev_ns_enable(ns);
 	if (ret == -ENOTBLK)
 		ret = nvmet_file_ns_enable(ns);
@@ -608,6 +629,8 @@ int nvmet_ns_enable(struct nvmet_ns *ns)
 	nvmet_ns_changed(subsys, ns->nsid);
 	ns->enabled = true;
 	xa_set_mark(&subsys->namespaces, ns->nsid, NVMET_NS_ENABLED);
+	nvmet_debugfs_ns_setup(ns);
+	set_bit(NVMET_NS_IO_LIVE, &ns->flags);
 	ret = 0;
 out_unlock:
 	mutex_unlock(&subsys->lock);
@@ -628,12 +651,13 @@ void nvmet_ns_disable(struct nvmet_ns *ns)
 	struct nvmet_subsys *subsys = ns->subsys;
 	struct nvmet_ctrl *ctrl;
 
-	mutex_lock(&subsys->lock);
-	if (!ns->enabled)
-		goto out_unlock;
+	if (!test_and_clear_bit(NVMET_NS_IO_LIVE, &ns->flags))
+		return;
 
-	ns->enabled = false;
+	mutex_lock(&subsys->lock);
+
 	xa_clear_mark(&subsys->namespaces, ns->nsid, NVMET_NS_ENABLED);
+	nvmet_debugfs_ns_free(ns);
 
 	list_for_each_entry(ctrl, &subsys->ctrls, subsys_entry)
 		pci_dev_put(radix_tree_delete(&ctrl->p2p_ns_map, ns->nsid));
@@ -659,7 +683,7 @@ void nvmet_ns_disable(struct nvmet_ns *ns)
 	mutex_lock(&subsys->lock);
 	nvmet_ns_changed(subsys, ns->nsid);
 	nvmet_ns_dev_disable(ns);
-out_unlock:
+	ns->enabled = false;
 	mutex_unlock(&subsys->lock);
 }
 
@@ -695,7 +719,7 @@ struct nvmet_ns *nvmet_ns_alloc(struct nvmet_subsys *subsys, u32 nsid)
 	if (subsys->nr_namespaces == NVMET_MAX_NAMESPACES)
 		goto out_unlock;
 
-	ns = kzalloc(sizeof(*ns), GFP_KERNEL);
+	ns = kzalloc_obj(*ns);
 	if (!ns)
 		goto out_unlock;
 
@@ -1611,7 +1635,7 @@ struct nvmet_ctrl *nvmet_alloc_ctrl(struct nvmet_alloc_ctrl_args *args)
 	up_read(&nvmet_config_sem);
 
 	args->status = NVME_SC_INTERNAL;
-	ctrl = kzalloc(sizeof(*ctrl), GFP_KERNEL);
+	ctrl = kzalloc_obj(*ctrl);
 	if (!ctrl)
 		goto out_put_subsystem;
 	mutex_init(&ctrl->lock);
@@ -1631,7 +1655,6 @@ struct nvmet_ctrl *nvmet_alloc_ctrl(struct nvmet_alloc_ctrl_args *args)
 	INIT_WORK(&ctrl->fatal_err_work, nvmet_fatal_error_handler);
 	INIT_DELAYED_WORK(&ctrl->ka_work, nvmet_keep_alive_timer);
 
-	memcpy(ctrl->subsysnqn, args->subsysnqn, NVMF_NQN_SIZE);
 	memcpy(ctrl->hostnqn, args->hostnqn, NVMF_NQN_SIZE);
 	if (args->hostid)
 		uuid_copy(&ctrl->hostid, args->hostid);
@@ -1665,14 +1688,11 @@ struct nvmet_ctrl *nvmet_alloc_ctrl(struct nvmet_alloc_ctrl_args *args)
 
 	ctrl->max_qid = subsys->max_qid;
 
-	ctrl->sqs = kcalloc(ctrl->max_qid + 1,
-			sizeof(struct nvmet_sq *),
-			GFP_KERNEL);
+	ctrl->sqs = kzalloc_objs(struct nvmet_sq *, ctrl->max_qid + 1);
 	if (!ctrl->sqs)
 		goto out_free_changed_ns_list;
 
-	ctrl->cqs = kcalloc(ctrl->max_qid + 1, sizeof(struct nvmet_cq *),
-			   GFP_KERNEL);
+	ctrl->cqs = kzalloc_objs(struct nvmet_cq *, ctrl->max_qid + 1);
 	if (!ctrl->cqs)
 		goto out_free_sqs;
 
@@ -1836,7 +1856,7 @@ struct nvmet_subsys *nvmet_subsys_alloc(const char *subsysnqn,
 	char serial[NVMET_SN_MAX_SIZE / 2];
 	int ret;
 
-	subsys = kzalloc(sizeof(*subsys), GFP_KERNEL);
+	subsys = kzalloc_obj(*subsys);
 	if (!subsys)
 		return ERR_PTR(-ENOMEM);
 
@@ -1910,6 +1930,8 @@ static void nvmet_subsys_free(struct kref *ref)
 	struct nvmet_subsys *subsys =
 		container_of(ref, struct nvmet_subsys, ref);
 
+	WARN_ON_ONCE(!list_empty(&subsys->ctrls));
+	WARN_ON_ONCE(!list_empty(&subsys->hosts));
 	WARN_ON_ONCE(!xa_empty(&subsys->namespaces));
 
 	nvmet_debugfs_subsys_free(subsys);
@@ -1950,12 +1972,13 @@ static int __init nvmet_init(void)
 	if (!nvmet_bvec_cache)
 		return -ENOMEM;
 
-	zbd_wq = alloc_workqueue("nvmet-zbd-wq", WQ_MEM_RECLAIM, 0);
+	zbd_wq = alloc_workqueue("nvmet-zbd-wq", WQ_MEM_RECLAIM | WQ_PERCPU,
+				 0);
 	if (!zbd_wq)
 		goto out_destroy_bvec_cache;
 
 	buffered_io_wq = alloc_workqueue("nvmet-buffered-io-wq",
-			WQ_MEM_RECLAIM, 0);
+			WQ_MEM_RECLAIM | WQ_PERCPU, 0);
 	if (!buffered_io_wq)
 		goto out_free_zbd_work_queue;
 

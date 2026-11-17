@@ -342,7 +342,7 @@ static void qd_put(struct gfs2_quota_data *qd)
 	if (lockref_put_or_lock(&qd->qd_lockref))
 		return;
 
-	BUG_ON(__lockref_is_dead(&qd->qd_lockref));
+	BUG_ON(lockref_is_dead(&qd->qd_lockref));
 	sdp = qd->qd_sbd;
 	if (unlikely(!test_bit(SDF_JOURNAL_LIVE, &sdp->sd_flags))) {
 		lockref_mark_dead(&qd->qd_lockref);
@@ -486,7 +486,7 @@ static bool qd_grab_sync(struct gfs2_sbd *sdp, struct gfs2_quota_data *qd,
 	    qd->qd_sync_gen >= sync_gen)
 		goto out;
 
-	if (__lockref_is_dead(&qd->qd_lockref))
+	if (lockref_is_dead(&qd->qd_lockref))
 		goto out;
 	qd->qd_lockref.count++;
 
@@ -922,7 +922,7 @@ static int do_sync(unsigned int num_qd, struct gfs2_quota_data **qda,
 	gfs2_write_calc_reserv(ip, sizeof(struct gfs2_quota),
 			      &data_blocks, &ind_blocks);
 
-	ghs = kmalloc_array(num_qd, sizeof(struct gfs2_holder), GFP_NOFS);
+	ghs = kmalloc_objs(struct gfs2_holder, num_qd, GFP_NOFS);
 	if (!ghs)
 		return -ENOMEM;
 
@@ -993,7 +993,7 @@ out_dq:
 		gfs2_glock_dq_uninit(&ghs[qx]);
 	inode_unlock(&ip->i_inode);
 	kfree(ghs);
-	gfs2_log_flush(ip->i_gl->gl_name.ln_sbd, ip->i_gl,
+	gfs2_log_flush(glock_sbd(ip->i_gl), ip->i_gl,
 		       GFS2_LOG_HEAD_FLUSH_NORMAL | GFS2_LFC_DO_SYNC);
 	if (!error) {
 		for (x = 0; x < num_qd; x++) {
@@ -1042,7 +1042,7 @@ static int do_glock(struct gfs2_quota_data *qd, int force_refresh,
 	struct gfs2_holder i_gh;
 	int error;
 
-	gfs2_assert_warn(sdp, sdp == qd->qd_gl->gl_name.ln_sbd);
+	gfs2_assert_warn(sdp, sdp == glock_sbd(qd->qd_gl));
 restart:
 	error = gfs2_glock_nq_init(qd->qd_gl, LM_ST_SHARED, 0, q_gh);
 	if (error)
@@ -1332,7 +1332,7 @@ int gfs2_quota_sync(struct super_block *sb, int type)
 	if (sb_rdonly(sdp->sd_vfs))
 		return 0;
 
-	qda = kcalloc(max_qd, sizeof(struct gfs2_quota_data *), GFP_KERNEL);
+	qda = kzalloc_objs(struct gfs2_quota_data *, max_qd);
 	if (!qda)
 		return -ENOMEM;
 

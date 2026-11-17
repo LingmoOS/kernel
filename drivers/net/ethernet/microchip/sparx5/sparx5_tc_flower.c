@@ -1474,7 +1474,7 @@ static int sparx5_tc_flower_template_create(struct net_device *ndev,
 		return -EBUSY;
 	}
 
-	ftp = kzalloc(sizeof(*ftp), GFP_KERNEL);
+	ftp = kzalloc_obj(*ftp);
 	if (!ftp)
 		return -ENOMEM;
 

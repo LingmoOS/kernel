@@ -16,6 +16,7 @@
 #include <linux/smp.h>
 
 #include <asm/perf_event.h>
+#include <asm/cpuid/api.h>
 #include <asm/msr.h>
 
 #define NUM_COUNTERS_NB		4
@@ -352,7 +353,7 @@ static ssize_t amd_uncore_attr_show_cpumask(struct device *dev,
 	struct pmu *ptr = dev_get_drvdata(dev);
 	struct amd_uncore_pmu *pmu = container_of(ptr, struct amd_uncore_pmu, pmu);
 
-	return cpumap_print_to_pagebuf(true, buf, &pmu->active_mask);
+	return sysfs_emit(buf, "%*pbl\n", cpumask_pr_args(&pmu->active_mask));
 }
 static DEVICE_ATTR(cpumask, S_IRUGO, amd_uncore_attr_show_cpumask, NULL);
 
@@ -757,7 +758,7 @@ int amd_uncore_df_ctx_init(struct amd_uncore *uncore, unsigned int cpu)
 		goto done;
 
 	/* No grouping, single instance for a system */
-	uncore->pmus = kzalloc(sizeof(*uncore->pmus), GFP_KERNEL);
+	uncore->pmus = kzalloc_obj(*uncore->pmus);
 	if (!uncore->pmus)
 		goto done;
 
@@ -891,7 +892,7 @@ int amd_uncore_l3_ctx_init(struct amd_uncore *uncore, unsigned int cpu)
 		goto done;
 
 	/* No grouping, single instance for a system */
-	uncore->pmus = kzalloc(sizeof(*uncore->pmus), GFP_KERNEL);
+	uncore->pmus = kzalloc_obj(*uncore->pmus);
 	if (!uncore->pmus)
 		goto done;
 
@@ -997,7 +998,7 @@ static void amd_uncore_umc_read(struct perf_event *event)
 	 * UMC counters do not have RDPMC assignments. Read counts directly
 	 * from the corresponding PERF_CTR.
 	 */
-	rdmsrl(hwc->event_base, new);
+	rdmsrq(hwc->event_base, new);
 
 	/*
 	 * Unlike the other uncore counters, UMC counters saturate and set the
@@ -1006,7 +1007,7 @@ static void amd_uncore_umc_read(struct perf_event *event)
 	 * that the counter never gets a chance to saturate.
 	 */
 	if (new & BIT_ULL(63 - COUNTER_SHIFT)) {
-		wrmsrl(hwc->event_base, 0);
+		wrmsrq(hwc->event_base, 0);
 		local64_set(&hwc->prev_count, 0);
 	} else {
 		local64_set(&hwc->prev_count, new);

@@ -14,7 +14,6 @@
  */
 
 #define _GNU_SOURCE
-#include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -161,8 +160,12 @@ TEST_F(unix_sock, reset_closed_embryo)
 	char buf[16] = {};
 	ssize_t n;
 
-	if (variant->socket_type == SOCK_DGRAM)
-		SKIP(return, "This test only applies to SOCK_STREAM and SOCK_SEQPACKET");
+	if (variant->socket_type == SOCK_DGRAM) {
+		snprintf(_metadata->results->reason,
+			 sizeof(_metadata->results->reason),
+			 "Test only applies to SOCK_STREAM and SOCK_SEQPACKET");
+		exit(KSFT_XFAIL);
+	}
 
 	/* Close server without accept()ing */
 	close(self->server);

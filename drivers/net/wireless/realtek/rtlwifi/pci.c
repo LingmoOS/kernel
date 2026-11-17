@@ -31,6 +31,14 @@ static const u8 ac_to_hwq[] = {
 	BK_QUEUE
 };
 
+static const struct pci_device_id rtl_aspm_quirks[] = {
+	/* ASUSTek F441U/X555UQ */
+	{ PCI_DEVICE_SUB(PCI_VENDOR_ID_REALTEK, 0xb723, 0x11ad, 0x1723) },
+	/* Razer Blade 14 2017 */
+	{ PCI_DEVICE_SUB(PCI_VENDOR_ID_REALTEK, 0xb723, 0x17aa, 0xb736) },
+	{}
+};
+
 static u8 _rtl_mac_to_hwqueue(struct ieee80211_hw *hw, struct sk_buff *skb)
 {
 	struct rtl_hal *rtlhal = rtl_hal(rtl_priv(hw));
@@ -330,19 +338,15 @@ static void rtl_pci_init_aspm(struct ieee80211_hw *hw)
 {
 	struct rtl_pci *rtlpci = rtl_pcidev(rtl_pcipriv(hw));
 	struct rtl_ps_ctl *ppsc = rtl_psc(rtl_priv(hw));
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
 
 	_rtl_pci_update_default_setting(hw);
 
 	/*
-	 * RTL8723BE found on some ASUSTek laptops, such as F441U and
-	 * X555UQ with subsystem ID 11ad:1723 are known to output large
+	 * Certain pci devices are known to output large
 	 * amounts of PCIe AER errors during and after boot up, causing
 	 * heavy lags, poor network throughput, and occasional lock-ups.
 	 */
-	if (rtlpriv->rtlhal.hw_type == HARDWARE_TYPE_RTL8723BE &&
-	    (rtlpci->pdev->subsystem_vendor == 0x11ad &&
-	     rtlpci->pdev->subsystem_device == 0x1723)) {
+	if (pci_match_id(rtl_aspm_quirks, rtlpci->pdev)) {
 		__rtl_pci_disable_aspm(hw);
 		ppsc->support_aspm = false;
 	}
@@ -518,9 +522,10 @@ static void _rtl_pci_tx_isr(struct ieee80211_hw *hw, int prio)
 			}
 		}
 		if (ieee80211_is_action(fc)) {
-			struct ieee80211_mgmt *action_frame =
-				(struct ieee80211_mgmt *)skb->data;
-			if (action_frame->u.action.u.ht_smps.action ==
+			struct ieee80211_mgmt *action_frame = (void *)skb->data;
+
+			if (skb->len >= IEEE80211_MIN_ACTION_SIZE(action_code) &&
+			    action_frame->u.action.action_code ==
 			    WLAN_HT_ACTION_SMPS) {
 				dev_kfree_skb(skb);
 				goto tx_status_ok;

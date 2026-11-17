@@ -23,8 +23,7 @@
 #include <net/inet_ecn.h>
 #include <net/ip.h>
 #include <net/ipv6.h>
-
-#include "../core/sock_destructor.h"
+#include <net/xfrm.h>
 
 /* Use skb->cb to track consecutive/adjacent fragments coming at
  * the end of the queue. Nodes in the rb-tree queue will
@@ -188,7 +187,7 @@ static void fqdir_work_fn(struct work_struct *work)
 
 int fqdir_init(struct fqdir **fqdirp, struct inet_frags *f, struct net *net)
 {
-	struct fqdir *fqdir = kzalloc(sizeof(*fqdir), GFP_KERNEL);
+	struct fqdir *fqdir = kzalloc_obj(*fqdir);
 	int res;
 
 	if (!fqdir)
@@ -443,6 +442,10 @@ int inet_frag_queue_insert(struct inet_frag_queue *q, struct sk_buff *skb,
 {
 	struct sk_buff *last = q->fragments_tail;
 
+	/* The reassembled skb keeps the first fragment's secpath. */
+	if (last && !secpath_equal(last, skb))
+		return IPFRAG_MIXED_SECPATH;
+
 	/* An IP fragment is never a GSO packet, but an untrusted source
 	 * (virtio_net_hdr) may have attached GSO metadata to it. Do not let
 	 * that reach the reassembled skb, whose head keeps the first
@@ -537,7 +540,6 @@ void *inet_frag_reasm_prepare(struct inet_frag_queue *q, struct sk_buff *skb,
 			head = skb;
 			goto out_restore_sk;
 		}
-		FRAG_CB(fp)->next_frag = FRAG_CB(skb)->next_frag;
 		if (RB_EMPTY_NODE(&skb->rbnode))
 			FRAG_CB(parent)->next_frag = fp;
 		else
@@ -552,7 +554,6 @@ void *inet_frag_reasm_prepare(struct inet_frag_queue *q, struct sk_buff *skb,
 			skb->destructor = NULL;
 		}
 		skb_morph(skb, head);
-		FRAG_CB(skb)->next_frag = FRAG_CB(head)->next_frag;
 		rb_replace_node(&head->rbnode, &skb->rbnode,
 				&q->rb_fragments);
 		consume_skb(head);

@@ -138,12 +138,14 @@ void __check_limbo(struct rdt_l3_mon_domain *d, bool force_free)
 	bool rmid_dirty = true;
 	u32 idx, cur_idx = 1;
 	void *arch_mon_ctx;
+	void *arch_priv;
 	u64 val = 0;
 
+	arch_priv = mon_event_all[QOS_L3_OCCUP_EVENT_ID].arch_priv;
 	arch_mon_ctx = resctrl_arch_mon_ctx_alloc(r, QOS_L3_OCCUP_EVENT_ID);
 	if (IS_ERR(arch_mon_ctx)) {
-		pr_warn_ratelimited("Failed to allocate monitor context: %ld",
-				    PTR_ERR(arch_mon_ctx));
+		pr_warn_ratelimited("Failed to allocate monitor context: %pe",
+				    arch_mon_ctx);
 		return;
 	}
 
@@ -160,9 +162,9 @@ void __check_limbo(struct rdt_l3_mon_domain *d, bool force_free)
 
 		entry = __rmid_entry(idx);
 		if (!force_free) {
-			if (resctrl_arch_rmid_read(r, d, entry->closid,
+			if (resctrl_arch_rmid_read(r, &d->hdr, entry->closid,
 						   entry->rmid, QOS_L3_OCCUP_EVENT_ID,
-						   &val, arch_mon_ctx)) {
+						   arch_priv, &val, arch_mon_ctx)) {
 				rmid_dirty = true;
 			} else {
 				rmid_dirty = (val >= resctrl_rmid_realloc_threshold);
@@ -237,6 +239,8 @@ static struct rmid_entry *resctrl_find_free_rmid(u32 closid)
  *
  * When the CLOSID and RMID are independent numbers, the first free CLOSID will
  * be returned.
+ *
+ * Return: Free CLOSID on success, < 0 on failure.
  */
 int resctrl_find_cleanest_closid(void)
 {
@@ -305,7 +309,7 @@ static void add_rmid_to_limbo(struct rmid_entry *entry)
 	idx = resctrl_arch_rmid_idx_encode(entry->closid, entry->rmid);
 
 	entry->busy = 0;
-	list_for_each_entry(d, &r->mon_domains, hdr.list) {
+	list_for_each_entry_rcu(d, &r->mon_domains, hdr.list, lockdep_is_cpus_held()) {
 		/*
 		 * For the first limbo RMID in the domain,
 		 * setup up the limbo worker.
@@ -426,11 +430,16 @@ static int __l3_mon_event_count(struct rdtgroup *rdtgrp, struct rmid_read *rr)
 	struct rdt_l3_mon_domain *d;
 	int cntr_id = -ENOENT;
 	struct mbm_state *m;
-	int err, ret;
 	u64 tval = 0;
 
+	if (!domain_header_is_valid(rr->hdr, RESCTRL_MON_DOMAIN, RDT_RESOURCE_L3)) {
+		rr->err = -EIO;
+		return -EINVAL;
+	}
+	d = container_of(rr->hdr, struct rdt_l3_mon_domain, hdr);
+
 	if (rr->is_mbm_cntr) {
-		cntr_id = mbm_cntr_get(rr->r, rr->d, rdtgrp, rr->evtid);
+		cntr_id = mbm_cntr_get(rr->r, d, rdtgrp, rr->evt->evtid);
 		if (cntr_id < 0) {
 			rr->err = -ENOENT;
 			return -EINVAL;
@@ -439,36 +448,60 @@ static int __l3_mon_event_count(struct rdtgroup *rdtgrp, struct rmid_read *rr)
 
 	if (rr->first) {
 		if (rr->is_mbm_cntr)
-			resctrl_arch_reset_cntr(rr->r, rr->d, closid, rmid, cntr_id, rr->evtid);
+			resctrl_arch_reset_cntr(rr->r, d, closid, rmid, cntr_id, rr->evt->evtid);
 		else
-			resctrl_arch_reset_rmid(rr->r, rr->d, closid, rmid, rr->evtid);
-		m = get_mbm_state(rr->d, closid, rmid, rr->evtid);
+			resctrl_arch_reset_rmid(rr->r, d, closid, rmid, rr->evt->evtid);
+		m = get_mbm_state(d, closid, rmid, rr->evt->evtid);
 		if (m)
 			memset(m, 0, sizeof(struct mbm_state));
 		return 0;
 	}
 
-	if (rr->d) {
-		/* Reading a single domain, must be on a CPU in that domain. */
-		if (!cpumask_test_cpu(cpu, &rr->d->hdr.cpu_mask))
-			return -EINVAL;
-		if (rr->is_mbm_cntr)
-			rr->err = resctrl_arch_cntr_read(rr->r, rr->d, closid, rmid, cntr_id,
-							 rr->evtid, &tval);
-		else
-			rr->err = resctrl_arch_rmid_read(rr->r, rr->d, closid, rmid,
-							 rr->evtid, &tval, rr->arch_mon_ctx);
-		if (rr->err)
-			return rr->err;
+	/* Reading a single domain, must be on a CPU in that domain. */
+	if (!cpumask_test_cpu(cpu, &d->hdr.cpu_mask)) {
+		rr->err = -EIO;
+		return -EINVAL;
+	}
+	if (rr->is_mbm_cntr)
+		rr->err = resctrl_arch_cntr_read(rr->r, d, closid, rmid, cntr_id,
+						 rr->evt->evtid, &tval);
+	else
+		rr->err = resctrl_arch_rmid_read(rr->r, rr->hdr, closid, rmid,
+						 rr->evt->evtid, rr->evt->arch_priv,
+						 &tval, rr->arch_mon_ctx);
+	if (rr->err)
+		return rr->err;
 
-		rr->val += tval;
+	rr->val += tval;
 
-		return 0;
+	return 0;
+}
+
+static int __l3_mon_event_count_sum(struct rdtgroup *rdtgrp, struct rmid_read *rr)
+{
+	int cpu = smp_processor_id();
+	u32 closid = rdtgrp->closid;
+	u32 rmid = rdtgrp->mon.rmid;
+	struct rdt_l3_mon_domain *d;
+	u64 tval = 0;
+	int err, ret;
+
+	/*
+	 * Summing across domains is only done for systems that implement
+	 * Sub-NUMA Cluster. There is no overlap with systems that support
+	 * assignable counters.
+	 */
+	if (rr->is_mbm_cntr) {
+		pr_warn_once("Summing domains using assignable counters is not supported\n");
+		rr->err = -EINVAL;
+		return -EINVAL;
 	}
 
 	/* Summing domains that share a cache, must be on a CPU for that cache. */
-	if (!cpumask_test_cpu(cpu, &rr->ci->shared_cpu_map))
+	if (!cpumask_test_cpu(cpu, &rr->ci->shared_cpu_map)) {
+		rr->err = -EIO;
 		return -EINVAL;
+	}
 
 	/*
 	 * Legacy files must report the sum of an event across all
@@ -478,15 +511,17 @@ static int __l3_mon_event_count(struct rdtgroup *rdtgrp, struct rmid_read *rr)
 	 * all domains fail for any reason.
 	 */
 	ret = -EINVAL;
+	/*
+	 * RCU list being traversed with CPU hotplug lock held. lockdep
+	 * unable to help prove this here since this work is scheduled via
+	 * smp_call*(). Not called from MBM overflow handler.
+	 */
 	list_for_each_entry(d, &rr->r->mon_domains, hdr.list) {
 		if (d->ci_id != rr->ci->id)
 			continue;
-		if (rr->is_mbm_cntr)
-			err = resctrl_arch_cntr_read(rr->r, d, closid, rmid, cntr_id,
-						     rr->evtid, &tval);
-		else
-			err = resctrl_arch_rmid_read(rr->r, d, closid, rmid,
-						     rr->evtid, &tval, rr->arch_mon_ctx);
+		err = resctrl_arch_rmid_read(rr->r, &d->hdr, closid, rmid,
+					     rr->evt->evtid, rr->evt->arch_priv,
+					     &tval, rr->arch_mon_ctx);
 		if (!err) {
 			rr->val += tval;
 			ret = 0;
@@ -503,7 +538,25 @@ static int __mon_event_count(struct rdtgroup *rdtgrp, struct rmid_read *rr)
 {
 	switch (rr->r->rid) {
 	case RDT_RESOURCE_L3:
-		return __l3_mon_event_count(rdtgrp, rr);
+		WARN_ON_ONCE(rr->evt->any_cpu);
+		if (rr->hdr)
+			return __l3_mon_event_count(rdtgrp, rr);
+		else
+			return __l3_mon_event_count_sum(rdtgrp, rr);
+	case RDT_RESOURCE_PERF_PKG: {
+		u64 tval = 0;
+
+		rr->err = resctrl_arch_rmid_read(rr->r, rr->hdr, rdtgrp->closid,
+						 rdtgrp->mon.rmid, rr->evt->evtid,
+						 rr->evt->arch_priv,
+						 &tval, rr->arch_mon_ctx);
+		if (rr->err)
+			return rr->err;
+
+		rr->val += tval;
+
+		return 0;
+	}
 	default:
 		rr->err = -EINVAL;
 		return -EINVAL;
@@ -527,9 +580,13 @@ static void mbm_bw_count(struct rdtgroup *rdtgrp, struct rmid_read *rr)
 	u64 cur_bw, bytes, cur_bytes;
 	u32 closid = rdtgrp->closid;
 	u32 rmid = rdtgrp->mon.rmid;
+	struct rdt_l3_mon_domain *d;
 	struct mbm_state *m;
 
-	m = get_mbm_state(rr->d, closid, rmid, rr->evtid);
+	if (!domain_header_is_valid(rr->hdr, RESCTRL_MON_DOMAIN, RDT_RESOURCE_L3))
+		return;
+	d = container_of(rr->hdr, struct rdt_l3_mon_domain, hdr);
+	m = get_mbm_state(d, closid, rmid, rr->evt->evtid);
 	if (WARN_ON_ONCE(!m))
 		return;
 
@@ -711,15 +768,15 @@ static void mbm_update_one_event(struct rdt_resource *r, struct rdt_l3_mon_domai
 	struct rmid_read rr = {0};
 
 	rr.r = r;
-	rr.d = d;
-	rr.evtid = evtid;
+	rr.hdr = &d->hdr;
+	rr.evt = &mon_event_all[evtid];
 	if (resctrl_arch_mbm_cntr_assign_enabled(r)) {
 		rr.is_mbm_cntr = true;
 	} else {
-		rr.arch_mon_ctx = resctrl_arch_mon_ctx_alloc(rr.r, rr.evtid);
+		rr.arch_mon_ctx = resctrl_arch_mon_ctx_alloc(rr.r, evtid);
 		if (IS_ERR(rr.arch_mon_ctx)) {
-			pr_warn_ratelimited("Failed to allocate monitor context: %ld",
-					    PTR_ERR(rr.arch_mon_ctx));
+			pr_warn_ratelimited("Failed to allocate monitor context: %pe",
+					    rr.arch_mon_ctx);
 			return;
 		}
 	}
@@ -734,7 +791,7 @@ static void mbm_update_one_event(struct rdt_resource *r, struct rdt_l3_mon_domai
 		mbm_bw_count(rdtgrp, &rr);
 
 	if (rr.arch_mon_ctx)
-		resctrl_arch_mon_ctx_free(rr.r, rr.evtid, rr.arch_mon_ctx);
+		resctrl_arch_mon_ctx_free(rr.r, evtid, rr.arch_mon_ctx);
 }
 
 static void mbm_update(struct rdt_resource *r, struct rdt_l3_mon_domain *d,
@@ -922,7 +979,7 @@ int setup_rmid_lru_list(void)
 		return 0;
 
 	idx_limit = resctrl_arch_system_num_rmid_idx();
-	rmid_ptrs = kcalloc(idx_limit, sizeof(struct rmid_entry), GFP_KERNEL);
+	rmid_ptrs = kzalloc_objs(struct rmid_entry, idx_limit);
 	if (!rmid_ptrs)
 		return -ENOMEM;
 
@@ -958,39 +1015,55 @@ void free_rmid_lru_list(void)
 	mutex_unlock(&rdtgroup_mutex);
 }
 
+#define MON_EVENT(_eventid, _name, _res, _fp)	\
+	[_eventid] = {				\
+	.name			= _name,	\
+	.evtid			= _eventid,	\
+	.rid			= _res,		\
+	.is_floating_point	= _fp,		\
+}
+
 /*
  * All available events. Architecture code marks the ones that
  * are supported by a system using resctrl_enable_mon_event()
  * to set .enabled.
  */
 struct mon_evt mon_event_all[QOS_NUM_EVENTS] = {
-	[QOS_L3_OCCUP_EVENT_ID] = {
-		.name	= "llc_occupancy",
-		.evtid	= QOS_L3_OCCUP_EVENT_ID,
-		.rid	= RDT_RESOURCE_L3,
-	},
-	[QOS_L3_MBM_TOTAL_EVENT_ID] = {
-		.name	= "mbm_total_bytes",
-		.evtid	= QOS_L3_MBM_TOTAL_EVENT_ID,
-		.rid	= RDT_RESOURCE_L3,
-	},
-	[QOS_L3_MBM_LOCAL_EVENT_ID] = {
-		.name	= "mbm_local_bytes",
-		.evtid	= QOS_L3_MBM_LOCAL_EVENT_ID,
-		.rid	= RDT_RESOURCE_L3,
-	},
+	MON_EVENT(QOS_L3_OCCUP_EVENT_ID,		"llc_occupancy",	RDT_RESOURCE_L3,	false),
+	MON_EVENT(QOS_L3_MBM_TOTAL_EVENT_ID,		"mbm_total_bytes",	RDT_RESOURCE_L3,	false),
+	MON_EVENT(QOS_L3_MBM_LOCAL_EVENT_ID,		"mbm_local_bytes",	RDT_RESOURCE_L3,	false),
+	MON_EVENT(PMT_EVENT_ENERGY,			"core_energy",		RDT_RESOURCE_PERF_PKG,	true),
+	MON_EVENT(PMT_EVENT_ACTIVITY,			"activity",		RDT_RESOURCE_PERF_PKG,	true),
+	MON_EVENT(PMT_EVENT_STALLS_LLC_HIT,		"stalls_llc_hit",	RDT_RESOURCE_PERF_PKG,	false),
+	MON_EVENT(PMT_EVENT_C1_RES,			"c1_res",		RDT_RESOURCE_PERF_PKG,	false),
+	MON_EVENT(PMT_EVENT_UNHALTED_CORE_CYCLES,	"unhalted_core_cycles",	RDT_RESOURCE_PERF_PKG,	false),
+	MON_EVENT(PMT_EVENT_STALLS_LLC_MISS,		"stalls_llc_miss",	RDT_RESOURCE_PERF_PKG,	false),
+	MON_EVENT(PMT_EVENT_AUTO_C6_RES,		"c6_res",		RDT_RESOURCE_PERF_PKG,	false),
+	MON_EVENT(PMT_EVENT_UNHALTED_REF_CYCLES,	"unhalted_ref_cycles",	RDT_RESOURCE_PERF_PKG,	false),
+	MON_EVENT(PMT_EVENT_UOPS_RETIRED,		"uops_retired",		RDT_RESOURCE_PERF_PKG,	false),
 };
 
-void resctrl_enable_mon_event(enum resctrl_event_id eventid)
+bool resctrl_enable_mon_event(enum resctrl_event_id eventid, bool any_cpu,
+			      unsigned int binary_bits, void *arch_priv)
 {
-	if (WARN_ON_ONCE(eventid < QOS_FIRST_EVENT || eventid >= QOS_NUM_EVENTS))
-		return;
+	if (WARN_ON_ONCE(eventid < QOS_FIRST_EVENT || eventid >= QOS_NUM_EVENTS ||
+			 binary_bits > MAX_BINARY_BITS))
+		return false;
 	if (mon_event_all[eventid].enabled) {
 		pr_warn("Duplicate enable for event %d\n", eventid);
-		return;
+		return false;
+	}
+	if (binary_bits && !mon_event_all[eventid].is_floating_point) {
+		pr_warn("Event %d may not be floating point\n", eventid);
+		return false;
 	}
 
+	mon_event_all[eventid].any_cpu = any_cpu;
+	mon_event_all[eventid].binary_bits = binary_bits;
+	mon_event_all[eventid].arch_priv = arch_priv;
 	mon_event_all[eventid].enabled = true;
+
+	return true;
 }
 
 bool resctrl_is_mon_event_enabled(enum resctrl_event_id eventid)
@@ -1033,7 +1106,8 @@ int event_filter_show(struct kernfs_open_file *of, struct seq_file *seq, void *v
 	bool sep = false;
 	int ret = 0, i;
 
-	mutex_lock(&rdtgroup_mutex);
+	if (!info_kn_lock(of->kn))
+		return -ENOENT;
 	rdt_last_cmd_clear();
 
 	r = resctrl_arch_get_resource(mevt->rid);
@@ -1054,7 +1128,7 @@ int event_filter_show(struct kernfs_open_file *of, struct seq_file *seq, void *v
 	seq_putc(seq, '\n');
 
 out_unlock:
-	mutex_unlock(&rdtgroup_mutex);
+	info_kn_unlock(of->kn);
 
 	return ret;
 }
@@ -1065,7 +1139,8 @@ int resctrl_mbm_assign_on_mkdir_show(struct kernfs_open_file *of, struct seq_fil
 	struct rdt_resource *r = rdt_kn_parent_priv(of->kn);
 	int ret = 0;
 
-	mutex_lock(&rdtgroup_mutex);
+	if (!info_kn_lock(of->kn))
+		return -ENOENT;
 	rdt_last_cmd_clear();
 
 	if (!resctrl_arch_mbm_cntr_assign_enabled(r)) {
@@ -1077,7 +1152,7 @@ int resctrl_mbm_assign_on_mkdir_show(struct kernfs_open_file *of, struct seq_fil
 	seq_printf(s, "%u\n", r->mon.mbm_assign_on_mkdir);
 
 out_unlock:
-	mutex_unlock(&rdtgroup_mutex);
+	info_kn_unlock(of->kn);
 
 	return ret;
 }
@@ -1089,12 +1164,15 @@ ssize_t resctrl_mbm_assign_on_mkdir_write(struct kernfs_open_file *of, char *buf
 	bool value;
 	int ret;
 
-	ret = kstrtobool(buf, &value);
-	if (ret)
-		return ret;
-
-	mutex_lock(&rdtgroup_mutex);
+	if (!info_kn_lock(of->kn))
+		return -ENOENT;
 	rdt_last_cmd_clear();
+
+	ret = kstrtobool(buf, &value);
+	if (ret) {
+		rdt_last_cmd_puts("mbm_assign_on_mkdir: Invalid input\n");
+		goto out_unlock;
+	}
 
 	if (!resctrl_arch_mbm_cntr_assign_enabled(r)) {
 		rdt_last_cmd_puts("mbm_event counter assignment mode is not enabled\n");
@@ -1105,7 +1183,7 @@ ssize_t resctrl_mbm_assign_on_mkdir_write(struct kernfs_open_file *of, char *buf
 	r->mon.mbm_assign_on_mkdir = value;
 
 out_unlock:
-	mutex_unlock(&rdtgroup_mutex);
+	info_kn_unlock(of->kn);
 
 	return ret ?: nbytes;
 }
@@ -1192,9 +1270,10 @@ static int rdtgroup_alloc_assign_cntr(struct rdt_resource *r, struct rdt_l3_mon_
  * NULL; otherwise, assign the counter to the specified domain @d.
  *
  * If all counters in a domain are already in use, rdtgroup_alloc_assign_cntr()
- * will fail. The assignment process will abort at the first failure encountered
- * during domain traversal, which may result in the event being only partially
- * assigned.
+ * will fail. When attempting to assign counters to all domains, carry on trying
+ * to assign counters after a failure since only some domains may have counters
+ * and the goal is to assign counters where possible. If any counter assignment
+ * fails, return the error from the last failing assignment.
  *
  * Return:
  * 0 on success, < 0 on failure.
@@ -1206,10 +1285,12 @@ static int rdtgroup_assign_cntr_event(struct rdt_l3_mon_domain *d, struct rdtgro
 	int ret = 0;
 
 	if (!d) {
-		list_for_each_entry(d, &r->mon_domains, hdr.list) {
-			ret = rdtgroup_alloc_assign_cntr(r, d, rdtgrp, mevt);
-			if (ret)
-				return ret;
+		list_for_each_entry_rcu(d, &r->mon_domains, hdr.list, lockdep_is_cpus_held()) {
+			int err;
+
+			err = rdtgroup_alloc_assign_cntr(r, d, rdtgrp, mevt);
+			if (err)
+				ret = err;
 		}
 	} else {
 		ret = rdtgroup_alloc_assign_cntr(r, d, rdtgrp, mevt);
@@ -1276,7 +1357,7 @@ static void rdtgroup_unassign_cntr_event(struct rdt_l3_mon_domain *d, struct rdt
 	struct rdt_resource *r = resctrl_arch_get_resource(mevt->rid);
 
 	if (!d) {
-		list_for_each_entry(d, &r->mon_domains, hdr.list)
+		list_for_each_entry_rcu(d, &r->mon_domains, hdr.list, lockdep_is_cpus_held())
 			rdtgroup_free_unassign_cntr(r, d, rdtgrp, mevt);
 	} else {
 		rdtgroup_free_unassign_cntr(r, d, rdtgrp, mevt);
@@ -1348,7 +1429,7 @@ static void rdtgroup_update_cntr_event(struct rdt_resource *r, struct rdtgroup *
 	struct rdt_l3_mon_domain *d;
 	int cntr_id;
 
-	list_for_each_entry(d, &r->mon_domains, hdr.list) {
+	list_for_each_entry_rcu(d, &r->mon_domains, hdr.list, lockdep_is_cpus_held()) {
 		cntr_id = mbm_cntr_get(r, d, rdtgrp, evtid);
 		if (cntr_id >= 0)
 			rdtgroup_assign_cntr(r, d, evtid, rdtgrp->mon.rmid,
@@ -1386,21 +1467,29 @@ ssize_t event_filter_write(struct kernfs_open_file *of, char *buf, size_t nbytes
 	u32 evt_cfg = 0;
 	int ret = 0;
 
-	/* Valid input requires a trailing newline */
-	if (nbytes == 0 || buf[nbytes - 1] != '\n')
-		return -EINVAL;
-
-	buf[nbytes - 1] = '\0';
-
-	cpus_read_lock();
-	mutex_lock(&rdtgroup_mutex);
+	if (!info_kn_lock(of->kn))
+		return -ENOENT;
 
 	rdt_last_cmd_clear();
+
+	/* Valid input requires a trailing newline */
+	if (nbytes == 0 || buf[nbytes - 1] != '\n') {
+		rdt_last_cmd_puts("event_filter: Invalid input\n");
+		ret = -EINVAL;
+		goto out_unlock;
+	}
+
+	buf[nbytes - 1] = '\0';
 
 	r = resctrl_arch_get_resource(mevt->rid);
 	if (!resctrl_arch_mbm_cntr_assign_enabled(r)) {
 		rdt_last_cmd_puts("mbm_event counter assignment mode is not enabled\n");
 		ret = -EINVAL;
+		goto out_unlock;
+	}
+	if (!r->mon.mbm_cntr_configurable) {
+		rdt_last_cmd_puts("event_filter is not configurable\n");
+		ret = -EPERM;
 		goto out_unlock;
 	}
 
@@ -1411,8 +1500,7 @@ ssize_t event_filter_write(struct kernfs_open_file *of, char *buf, size_t nbytes
 	}
 
 out_unlock:
-	mutex_unlock(&rdtgroup_mutex);
-	cpus_read_unlock();
+	info_kn_unlock(of->kn);
 
 	return ret ?: nbytes;
 }
@@ -1423,7 +1511,8 @@ int resctrl_mbm_assign_mode_show(struct kernfs_open_file *of,
 	struct rdt_resource *r = rdt_kn_parent_priv(of->kn);
 	bool enabled;
 
-	mutex_lock(&rdtgroup_mutex);
+	if (!info_kn_lock(of->kn))
+		return -ENOENT;
 	enabled = resctrl_arch_mbm_cntr_assign_enabled(r);
 
 	if (r->mon.mbm_cntr_assignable) {
@@ -1432,7 +1521,7 @@ int resctrl_mbm_assign_mode_show(struct kernfs_open_file *of,
 		else
 			seq_puts(s, "[default]\n");
 
-		if (!IS_ENABLED(CONFIG_RESCTRL_ASSIGN_FIXED)) {
+		if (!r->mon.mbm_cntr_assign_fixed) {
 			if (enabled)
 				seq_puts(s, "default\n");
 			else
@@ -1442,7 +1531,7 @@ int resctrl_mbm_assign_mode_show(struct kernfs_open_file *of,
 		seq_puts(s, "[default]\n");
 	}
 
-	mutex_unlock(&rdtgroup_mutex);
+	info_kn_unlock(of->kn);
 
 	return 0;
 }
@@ -1455,16 +1544,19 @@ ssize_t resctrl_mbm_assign_mode_write(struct kernfs_open_file *of, char *buf,
 	int ret = 0;
 	bool enable;
 
-	/* Valid input requires a trailing newline */
-	if (nbytes == 0 || buf[nbytes - 1] != '\n')
-		return -EINVAL;
-
-	buf[nbytes - 1] = '\0';
-
-	cpus_read_lock();
-	mutex_lock(&rdtgroup_mutex);
+	if (!info_kn_lock(of->kn))
+		return -ENOENT;
 
 	rdt_last_cmd_clear();
+
+	/* Valid input requires a trailing newline */
+	if (nbytes == 0 || buf[nbytes - 1] != '\n') {
+		rdt_last_cmd_puts("mbm_assign_mode: Invalid input\n");
+		ret = -EINVAL;
+		goto out_unlock;
+	}
+
+	buf[nbytes - 1] = '\0';
 
 	if (!strcmp(buf, "default")) {
 		enable = 0;
@@ -1483,6 +1575,12 @@ ssize_t resctrl_mbm_assign_mode_write(struct kernfs_open_file *of, char *buf,
 	}
 
 	if (enable != resctrl_arch_mbm_cntr_assign_enabled(r)) {
+		if (r->mon.mbm_cntr_assign_fixed) {
+			ret = -EINVAL;
+			rdt_last_cmd_puts("Counter assignment mode is not configurable\n");
+			goto out_unlock;
+		}
+
 		ret = resctrl_arch_mbm_cntr_assign_set(r, enable);
 		if (ret)
 			goto out_unlock;
@@ -1507,15 +1605,14 @@ ssize_t resctrl_mbm_assign_mode_write(struct kernfs_open_file *of, char *buf,
 		/*
 		 * Reset all the non-achitectural RMID state and assignable counters.
 		 */
-		list_for_each_entry(d, &r->mon_domains, hdr.list) {
+		list_for_each_entry_rcu(d, &r->mon_domains, hdr.list, lockdep_is_cpus_held()) {
 			mbm_cntr_free_all(r, d);
 			resctrl_reset_rmid_all(r, d);
 		}
 	}
 
 out_unlock:
-	mutex_unlock(&rdtgroup_mutex);
-	cpus_read_unlock();
+	info_kn_unlock(of->kn);
 
 	return ret ?: nbytes;
 }
@@ -1527,10 +1624,10 @@ int resctrl_num_mbm_cntrs_show(struct kernfs_open_file *of,
 	struct rdt_l3_mon_domain *dom;
 	bool sep = false;
 
-	cpus_read_lock();
-	mutex_lock(&rdtgroup_mutex);
+	if (!info_kn_lock(of->kn))
+		return -ENOENT;
 
-	list_for_each_entry(dom, &r->mon_domains, hdr.list) {
+	list_for_each_entry_rcu(dom, &r->mon_domains, hdr.list, lockdep_is_cpus_held()) {
 		if (sep)
 			seq_putc(s, ';');
 
@@ -1539,8 +1636,7 @@ int resctrl_num_mbm_cntrs_show(struct kernfs_open_file *of,
 	}
 	seq_putc(s, '\n');
 
-	mutex_unlock(&rdtgroup_mutex);
-	cpus_read_unlock();
+	info_kn_unlock(of->kn);
 	return 0;
 }
 
@@ -1553,8 +1649,8 @@ int resctrl_available_mbm_cntrs_show(struct kernfs_open_file *of,
 	u32 cntrs, i;
 	int ret = 0;
 
-	cpus_read_lock();
-	mutex_lock(&rdtgroup_mutex);
+	if (!info_kn_lock(of->kn))
+		return -ENOENT;
 
 	rdt_last_cmd_clear();
 
@@ -1564,7 +1660,7 @@ int resctrl_available_mbm_cntrs_show(struct kernfs_open_file *of,
 		goto out_unlock;
 	}
 
-	list_for_each_entry(dom, &r->mon_domains, hdr.list) {
+	list_for_each_entry_rcu(dom, &r->mon_domains, hdr.list, lockdep_is_cpus_held()) {
 		if (sep)
 			seq_putc(s, ';');
 
@@ -1580,8 +1676,7 @@ int resctrl_available_mbm_cntrs_show(struct kernfs_open_file *of,
 	seq_putc(s, '\n');
 
 out_unlock:
-	mutex_unlock(&rdtgroup_mutex);
-	cpus_read_unlock();
+	info_kn_unlock(of->kn);
 
 	return ret;
 }
@@ -1601,7 +1696,6 @@ int mbm_L3_assignments_show(struct kernfs_open_file *of, struct seq_file *s, voi
 		goto out_unlock;
 	}
 
-	rdt_last_cmd_clear();
 	if (!resctrl_arch_mbm_cntr_assign_enabled(r)) {
 		rdt_last_cmd_puts("mbm_event counter assignment mode is not enabled\n");
 		ret = -EINVAL;
@@ -1614,7 +1708,7 @@ int mbm_L3_assignments_show(struct kernfs_open_file *of, struct seq_file *s, voi
 
 		sep = false;
 		seq_printf(s, "%s:", mevt->name);
-		list_for_each_entry(d, &r->mon_domains, hdr.list) {
+		list_for_each_entry_rcu(d, &r->mon_domains, hdr.list, lockdep_is_cpus_held()) {
 			if (sep)
 				seq_putc(s, ';');
 
@@ -1712,7 +1806,7 @@ next:
 	}
 
 	/* Verify if the dom_id is valid */
-	list_for_each_entry(d, &r->mon_domains, hdr.list) {
+	list_for_each_entry_rcu(d, &r->mon_domains, hdr.list, lockdep_is_cpus_held()) {
 		if (d->hdr.id == dom_id) {
 			ret = rdtgroup_modify_assign_state(dom_str, d, rdtgrp, mevt);
 			if (ret) {
@@ -1736,23 +1830,25 @@ ssize_t mbm_L3_assignments_write(struct kernfs_open_file *of, char *buf,
 	char *token, *event;
 	int ret = 0;
 
-	/* Valid input requires a trailing newline */
-	if (nbytes == 0 || buf[nbytes - 1] != '\n')
-		return -EINVAL;
-
-	buf[nbytes - 1] = '\0';
-
 	rdtgrp = rdtgroup_kn_lock_live(of->kn);
 	if (!rdtgrp) {
 		rdtgroup_kn_unlock(of->kn);
 		return -ENOENT;
 	}
-	rdt_last_cmd_clear();
+
+	/* Valid input requires a trailing newline */
+	if (nbytes == 0 || buf[nbytes - 1] != '\n') {
+		rdt_last_cmd_puts("mbm_L3_assignments: Invalid input\n");
+		ret = -EINVAL;
+		goto out_unlock;
+	}
+
+	buf[nbytes - 1] = '\0';
 
 	if (!resctrl_arch_mbm_cntr_assign_enabled(r)) {
 		rdt_last_cmd_puts("mbm_event mode is not enabled\n");
-		rdtgroup_kn_unlock(of->kn);
-		return -EINVAL;
+		ret = -EINVAL;
+		goto out_unlock;
 	}
 
 	while ((token = strsep(&buf, "\n")) != NULL) {
@@ -1768,6 +1864,7 @@ ssize_t mbm_L3_assignments_write(struct kernfs_open_file *of, char *buf,
 			break;
 	}
 
+out_unlock:
 	rdtgroup_kn_unlock(of->kn);
 
 	return ret ?: nbytes;
@@ -1867,6 +1964,8 @@ int resctrl_l3_mon_resource_init(void)
 		resctrl_file_fflags_init("available_mbm_cntrs",
 					 RFTYPE_MON_INFO | RFTYPE_RES_CACHE);
 		resctrl_file_fflags_init("event_filter", RFTYPE_ASSIGN_CONFIG);
+		if (r->mon.mbm_cntr_configurable)
+			resctrl_file_mode_init("event_filter", 0644);
 		resctrl_file_fflags_init("mbm_assign_on_mkdir", RFTYPE_MON_INFO |
 					 RFTYPE_RES_CACHE);
 		resctrl_file_fflags_init("mbm_L3_assignments", RFTYPE_MON_BASE);

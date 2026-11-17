@@ -155,8 +155,8 @@ bool amd_iommu_dump;
 bool amd_iommu_irq_remap __read_mostly;
 
 enum protection_domain_mode amd_iommu_pgtable = PD_MODE_V1;
-/* Host page table level */
-u8 amd_iommu_hpt_level;
+/* Virtual address size */
+u8 amd_iommu_hpt_vasize;
 /* Guest page table level */
 int amd_iommu_gpt_level = PAGE_MODE_4_LEVEL;
 
@@ -179,6 +179,9 @@ bool amd_iommu_hatdis;
 /* SNP is enabled on the system? */
 bool amd_iommu_snp_en;
 EXPORT_SYMBOL(amd_iommu_snp_en);
+
+/* SNP page mode 0 support */
+bool amd_iommu_snp_mode0_sup;
 
 LIST_HEAD(amd_iommu_pci_seg_list);	/* list of all PCI segments */
 LIST_HEAD(amd_iommu_list);		/* list of all AMD IOMMUs in the system */
@@ -355,28 +358,6 @@ static void iommu_write_l2(struct amd_iommu *iommu, u8 address, u32 val)
  *
  ****************************************************************************/
 
-/*
- * This function set the exclusion range in the IOMMU. DMA accesses to the
- * exclusion range are passed through untranslated
- */
-static void iommu_set_exclusion_range(struct amd_iommu *iommu)
-{
-	u64 start = iommu->exclusion_start & PAGE_MASK;
-	u64 limit = (start + iommu->exclusion_length - 1) & PAGE_MASK;
-	u64 entry;
-
-	if (!iommu->exclusion_start)
-		return;
-
-	entry = start | MMIO_EXCL_ENABLE_MASK;
-	memcpy_toio(iommu->mmio_base + MMIO_EXCL_BASE_OFFSET,
-			&entry, sizeof(entry));
-
-	entry = limit;
-	memcpy_toio(iommu->mmio_base + MMIO_EXCL_LIMIT_OFFSET,
-			&entry, sizeof(entry));
-}
-
 static void iommu_set_cwwb_range(struct amd_iommu *iommu)
 {
 	u64 start = iommu_virt_to_phys((void *)iommu->cmd_sem);
@@ -409,7 +390,13 @@ static void iommu_set_device_table(struct amd_iommu *iommu)
 
 	BUG_ON(iommu->mmio_base == NULL);
 
-	if (is_kdump_kernel())
+	/*
+	 * A kdump kernel that reuses the previous kernel's device table must
+	 * leave the base register alone. It already points at that table, and
+	 * with SNP enabled the register is locked. If reuse failed, program
+	 * the freshly allocated table like a normal boot.
+	 */
+	if (iommu->pci_seg->old_dev_tbl_cpy)
 		return;
 
 	entry = iommu_virt_to_phys(dev_table);
@@ -642,8 +629,19 @@ static int __init find_last_devid_acpi(struct acpi_table_header *table, u16 pci_
 /* Allocate per PCI segment device table */
 static inline int __init alloc_dev_table(struct amd_iommu_pci_seg *pci_seg)
 {
-	pci_seg->dev_table = iommu_alloc_pages_sz(GFP_KERNEL | GFP_DMA32,
-						  pci_seg->dev_table_size);
+	gfp_t gfp = GFP_KERNEL;
+
+	/*
+	 * Keep normal kernel device tables below 4G because a later kdump
+	 * kernel only trusts and reuses old tables below that limit. A kdump
+	 * kernel's new table is either discarded when reuse succeeds or
+	 * programmed after the IOMMU is disabled, so the table does not
+	 * need DMA32 memory (which the crashkernel may not have).
+	 */
+	if (!is_kdump_kernel())
+		gfp |= GFP_DMA32;
+
+	pci_seg->dev_table = iommu_alloc_pages_sz(gfp, pci_seg->dev_table_size);
 	if (!pci_seg->dev_table)
 		return -ENOMEM;
 
@@ -662,9 +660,8 @@ static inline void free_dev_table(struct amd_iommu_pci_seg *pci_seg)
 /* Allocate per PCI segment IOMMU rlookup table. */
 static inline int __init alloc_rlookup_table(struct amd_iommu_pci_seg *pci_seg)
 {
-	pci_seg->rlookup_table = kvcalloc(pci_seg->last_bdf + 1,
-					  sizeof(*pci_seg->rlookup_table),
-					  GFP_KERNEL);
+	pci_seg->rlookup_table = kvzalloc_objs(*pci_seg->rlookup_table,
+					       pci_seg->last_bdf + 1);
 	if (pci_seg->rlookup_table == NULL)
 		return -ENOMEM;
 
@@ -679,9 +676,8 @@ static inline void free_rlookup_table(struct amd_iommu_pci_seg *pci_seg)
 
 static inline int __init alloc_irq_lookup_table(struct amd_iommu_pci_seg *pci_seg)
 {
-	pci_seg->irq_lookup_table = kvcalloc(pci_seg->last_bdf + 1,
-					     sizeof(*pci_seg->irq_lookup_table),
-					     GFP_KERNEL);
+	pci_seg->irq_lookup_table = kvzalloc_objs(*pci_seg->irq_lookup_table,
+						  pci_seg->last_bdf + 1);
 	if (pci_seg->irq_lookup_table == NULL)
 		return -ENOMEM;
 
@@ -698,9 +694,8 @@ static int __init alloc_alias_table(struct amd_iommu_pci_seg *pci_seg)
 {
 	int i;
 
-	pci_seg->alias_table = kvmalloc_array(pci_seg->last_bdf + 1,
-					      sizeof(*pci_seg->alias_table),
-					      GFP_KERNEL);
+	pci_seg->alias_table = kvmalloc_objs(*pci_seg->alias_table,
+					     pci_seg->last_bdf + 1);
 	if (!pci_seg->alias_table)
 		return -ENOMEM;
 
@@ -977,8 +972,8 @@ static int iommu_init_ga_log(struct amd_iommu *iommu)
 {
 	int nid = iommu->dev ? dev_to_node(&iommu->dev->dev) : NUMA_NO_NODE;
 
-	if (!AMD_IOMMU_GUEST_IR_VAPIC(amd_iommu_guest_ir))
-		return 0;
+	if (WARN_ON_ONCE(!AMD_IOMMU_GUEST_IR_VAPIC(amd_iommu_guest_ir)))
+		return -EINVAL;
 
 	if (iommu->ga_log && iommu->ga_log_tail)
 		return 0;
@@ -1142,6 +1137,14 @@ static void iommu_enable_gt(struct amd_iommu *iommu)
 		return;
 
 	iommu_feature_enable(iommu, CONTROL_GT_EN);
+
+	/*
+	 * This feature needs to be enabled prior to a call
+	 * to iommu_snp_enable(). Since this function is called
+	 * in early_enable_iommu(), it is safe to enable here.
+	 */
+	if (check_feature2(FEATURE_GCR3TRPMODE))
+		iommu_feature_enable(iommu, CONTROL_GCR3TRPMODE);
 }
 
 /* sets a specific bit in the device table entry. */
@@ -1162,7 +1165,6 @@ static bool __reuse_device_table(struct amd_iommu *iommu)
 	u16 dom_id;
 	bool dte_v;
 	u64 entry;
-	int ret;
 
 	/* Each IOMMU use separate device table with the same size */
 	lo = readl(iommu->mmio_base + MMIO_DEV_TABLE_OFFSET);
@@ -1200,7 +1202,7 @@ static bool __reuse_device_table(struct amd_iommu *iommu)
 	for (devid = 0; devid <= pci_seg->last_bdf; devid++) {
 		old_dev_tbl_entry = &pci_seg->old_dev_tbl_cpy[devid];
 		dte_v = FIELD_GET(DTE_FLAG_V, old_dev_tbl_entry->data[0]);
-		dom_id = FIELD_GET(DEV_DOMID_MASK, old_dev_tbl_entry->data[1]);
+		dom_id = FIELD_GET(DTE_DOMID_MASK, old_dev_tbl_entry->data[1]);
 
 		if (!dte_v || !dom_id)
 			continue;
@@ -1209,8 +1211,7 @@ static bool __reuse_device_table(struct amd_iommu *iommu)
 		 * are multiple devices present in the same domain,
 		 * hence check only for -ENOMEM.
 		 */
-		ret = ida_alloc_range(&pdom_ids, dom_id, dom_id, GFP_KERNEL);
-		if (ret == -ENOMEM)
+		if (amd_iommu_pdom_id_reserve(dom_id, GFP_KERNEL) == -ENOMEM)
 			return false;
 	}
 
@@ -1299,7 +1300,7 @@ set_dev_entry_from_acpi_range(struct amd_iommu *iommu, u16 first, u16 last,
 		if (search_ivhd_dte_flags(iommu->pci_seg->id, first, last))
 			return;
 
-		d = kzalloc(sizeof(struct ivhd_dte_flags), GFP_KERNEL);
+		d = kzalloc_obj(struct ivhd_dte_flags);
 		if (!d)
 			return;
 
@@ -1371,7 +1372,7 @@ int __init add_special_device(u8 type, u8 id, u32 *devid, bool cmd_line)
 		return 0;
 	}
 
-	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+	entry = kzalloc_obj(*entry);
 	if (!entry)
 		return -ENOMEM;
 
@@ -1402,7 +1403,7 @@ static int __init add_acpi_hid_device(u8 *hid, u8 *uid, u32 *devid,
 		return 0;
 	}
 
-	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+	entry = kzalloc_obj(*entry);
 	if (!entry)
 		return -ENOMEM;
 
@@ -1735,7 +1736,7 @@ static struct amd_iommu_pci_seg *__init alloc_pci_segment(u16 id,
 	if (last_bdf < 0)
 		return NULL;
 
-	pci_seg = kzalloc(sizeof(struct amd_iommu_pci_seg), GFP_KERNEL);
+	pci_seg = kzalloc_obj(struct amd_iommu_pci_seg);
 	if (pci_seg == NULL)
 		return NULL;
 
@@ -2055,7 +2056,7 @@ static int __init init_iommu_all(struct acpi_table_header *table)
 			DUMP_printk("       mmio-addr: %016llx\n",
 				    h->mmio_phys);
 
-			iommu = kzalloc(sizeof(struct amd_iommu), GFP_KERNEL);
+			iommu = kzalloc_obj(struct amd_iommu);
 			if (iommu == NULL)
 				return -ENOMEM;
 
@@ -2301,6 +2302,9 @@ static void print_iommu_info(void)
 
 		if (check_feature(FEATURE_SNP))
 			pr_cont(" SNP");
+
+		if (check_feature2(FEATURE_SEVSNPIO_SUP))
+			pr_cont(" SEV-TIO");
 
 		pr_cont("\n");
 	}
@@ -2653,7 +2657,7 @@ static int __init init_unity_map_range(struct ivmd_header *m,
 	if (pci_seg == NULL)
 		return -ENOMEM;
 
-	e = kzalloc(sizeof(*e), GFP_KERNEL);
+	e = kzalloc_obj(*e);
 	if (e == NULL)
 		return -ENOMEM;
 
@@ -2904,7 +2908,6 @@ static void early_enable_iommu(struct amd_iommu *iommu)
 	iommu_init_flags(iommu);
 	iommu_set_device_table(iommu);
 	iommu_enable_command_buffer(iommu);
-	iommu_set_exclusion_range(iommu);
 	iommu_enable_gt(iommu);
 	iommu_enable_ga(iommu);
 	iommu_enable_xt(iommu);
@@ -3021,8 +3024,10 @@ static void enable_iommus_vapic(void)
 			return;
 	}
 
-	if (AMD_IOMMU_GUEST_IR_VAPIC(amd_iommu_guest_ir) &&
-	    !check_feature(FEATURE_GAM_VAPIC)) {
+	if (!AMD_IOMMU_GUEST_IR_VAPIC(amd_iommu_guest_ir))
+		return;
+
+	if (!check_feature(FEATURE_GAM_VAPIC)) {
 		amd_iommu_guest_ir = AMD_IOMMU_GUEST_IR_LEGACY_GA;
 		return;
 	}
@@ -3106,11 +3111,21 @@ static void __init free_iommu_resources(void)
 	free_pci_segments();
 }
 
-/* SB IOAPIC is always on this device in AMD systems */
-#define IOAPIC_SB_DEVID		((0x00 << 8) | PCI_DEVFN(0x14, 0))
+static bool __init check_sb_ioapic(int devid)
+{
+	u8 bus = PCI_BUS_NUM(devid);
+	u8 devfn = devid & 0xff;
+	u16 val;
 
-/* SB IOAPIC for Hygon family 18h model 4h is on the device 0xb */
-#define IOAPIC_SB_DEVID_FAM18H_M4H	((0x00 << 8) | PCI_DEVFN(0xb, 0))
+	val = read_pci_config_16(bus, PCI_SLOT(devfn), PCI_FUNC(devfn),
+				 PCI_CLASS_DEVICE);
+
+	/*
+	 * The SB IOAPIC is integrated into the FCH (Southbridge), which is
+	 * exposed as an SMBus or ISA bridge in PCI config space.
+	 */
+	return val == PCI_CLASS_SERIAL_SMBUS || val == PCI_CLASS_BRIDGE_ISA;
+}
 
 /*
  * The Southbridge IOAPIC is assigned a GSI Base of 0 (handling interrupts
@@ -3161,12 +3176,7 @@ static bool __init check_ioapic_information(void)
 			pr_err("%s: IOAPIC[%d] not in IVRS table\n",
 				fw_bug, id);
 			ret = false;
-		} else if (id == sb_apicid && (devid == IOAPIC_SB_DEVID ||
-			   (boot_cpu_data.x86_vendor == X86_VENDOR_HYGON &&
-			    boot_cpu_data.x86 == 0x18 &&
-			    boot_cpu_data.x86_model >= 0x4 &&
-			    boot_cpu_data.x86_model <= 0xf &&
-			    devid == IOAPIC_SB_DEVID_FAM18H_M4H))) {
+		} else if (id == sb_apicid && check_sb_ioapic(devid)) {
 			has_sb_ioapic = true;
 		}
 	}
@@ -3192,8 +3202,7 @@ out:
 
 static void __init free_dma_resources(void)
 {
-	ida_destroy(&pdom_ids);
-
+	amd_iommu_pdom_id_destroy();
 	free_unity_maps();
 }
 
@@ -3234,7 +3243,7 @@ static int __init early_amd_iommu_init(void)
 	struct acpi_table_header *ivrs_base;
 	int ret;
 	acpi_status status;
-	u8 efr_hats;
+	u8 efr_hats, max_vasize;
 
 	if (!amd_iommu_detected)
 		return -ENODEV;
@@ -3264,6 +3273,10 @@ static int __init early_amd_iommu_init(void)
 
 	ivinfo_init(ivrs_base);
 
+	max_vasize = FIELD_GET(IOMMU_IVINFO_VASIZE, amd_iommu_ivinfo);
+	if (!max_vasize)
+		max_vasize = 64;
+
 	amd_iommu_target_ivhd_type = get_highest_supported_ivhd_type(ivrs_base);
 	DUMP_printk("Using IVHD type %#x\n", amd_iommu_target_ivhd_type);
 
@@ -3286,7 +3299,8 @@ static int __init early_amd_iommu_init(void)
 		 * efr[HATS] bits specify the maximum host translation level
 		 * supported, with LEVEL 4 being initial max level.
 		 */
-		amd_iommu_hpt_level = efr_hats + PAGE_MODE_4_LEVEL;
+		amd_iommu_hpt_vasize = min_t(unsigned int, max_vasize,
+					 (efr_hats + PAGE_MODE_4_LEVEL - 1) * 9 + 21);
 	} else {
 		pr_warn_once(FW_BUG "Disable host address translation due to invalid translation level (%#x).\n",
 			     efr_hats);
@@ -3406,18 +3420,28 @@ static __init void iommu_snp_enable(void)
 #ifdef CONFIG_KVM_AMD_SEV
 	if (!cc_platform_has(CC_ATTR_HOST_SEV_SNP))
 		return;
-	/*
-	 * The SNP support requires that IOMMU must be enabled, and is
-	 * configured with V1 page table (DTE[Mode] = 0 is not supported).
-	 */
-	if (no_iommu || iommu_default_passthrough()) {
-		pr_warn("SNP: IOMMU disabled or configured in passthrough mode, SNP cannot be supported.\n");
+
+	/* SNP support required IOMMU to be ON */
+	if (no_iommu) {
+		pr_warn("SNP: IOMMU disabled, SNP cannot be supported.\n");
 		goto disable_snp;
 	}
 
-	if (amd_iommu_pgtable != PD_MODE_V1) {
-		pr_warn("SNP: IOMMU is configured with V2 page table mode, SNP cannot be supported.\n");
-		goto disable_snp;
+	amd_iommu_snp_mode0_sup = check_feature2(FEATURE_SNP_PAGE_MODE0_SUP);
+	/*
+	 * If SNP page mode 0 is not enabled, then SNP support requires that IOMMU
+	 * must be configured with V1 page table (DTE[Mode] != 0).
+	 */
+	if (!amd_iommu_snp_mode0_sup) {
+		if (iommu_default_passthrough()) {
+			pr_warn("SNP: IOMMU configured in passthrough mode, SNP cannot be supported.\n");
+			goto disable_snp;
+		}
+
+		if (amd_iommu_pgtable != PD_MODE_V1) {
+			pr_warn("SNP: IOMMU is configured with V2 page table mode, SNP cannot be supported.\n");
+			goto disable_snp;
+		}
 	}
 
 	amd_iommu_snp_en = check_feature(FEATURE_SNP);
@@ -3958,12 +3982,15 @@ bool amd_iommu_pasid_supported(void)
 	    amd_iommu_gpt_level != PAGE_MODE_5_LEVEL)
 		return false;
 
+	if (!amd_iommu_gt_ppr_supported())
+		return false;
+
 	/*
-	 * Since DTE[Mode]=0 is prohibited on SNP-enabled system
-	 * (i.e. EFR[SNPSup]=1), IOMMUv2 page table cannot be used without
-	 * setting up IOMMUv1 page table.
+	 * If SNP page mode 0 is not supported, then DTE[Mode]=0 is prohibited
+	 * on SNP-enabled system (i.e. EFR[SNPSup]=1). IOMMUv2 page table
+	 * cannot be used without setting up IOMMUv1 page table.
 	 */
-	return amd_iommu_gt_ppr_supported() && !amd_iommu_snp_en;
+	return (!amd_iommu_snp_en) || (amd_iommu_snp_en && amd_iommu_snp_mode0_sup);
 }
 
 struct amd_iommu *get_amd_iommu(unsigned int idx)
@@ -4144,4 +4171,10 @@ int amd_iommu_snp_disable(void)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(amd_iommu_snp_disable);
+
+bool amd_iommu_sev_tio_supported(void)
+{
+	return check_feature2(FEATURE_SEVSNPIO_SUP);
+}
+EXPORT_SYMBOL_GPL(amd_iommu_sev_tio_supported);
 #endif

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB
 /* Copyright (c) 2022, NVIDIA CORPORATION & AFFILIATES. */
 
+#include <linux/slab.h>
 #include <rdma/ib_umem_odp.h>
 #include <rdma/iter.h>
 #include "mlx5_ib.h"
@@ -147,7 +148,7 @@ int mlx5r_umr_resource_init(struct mlx5_ib_dev *dev)
 	 * UMR qp is set once, never changed until device unload.
 	 * Avoid taking the mutex if initialization is already done.
 	 */
-	if (dev->umrc.qp)
+	if (smp_load_acquire(&dev->umrc.qp))
 		return 0;
 
 	mutex_lock(&dev->umrc.init_lock);
@@ -185,7 +186,7 @@ int mlx5r_umr_resource_init(struct mlx5_ib_dev *dev)
 	sema_init(&dev->umrc.sem, MAX_UMR_WR);
 	mutex_init(&dev->umrc.lock);
 	dev->umrc.state = MLX5_UMR_STATE_ACTIVE;
-	dev->umrc.qp = qp;
+	smp_store_release(&dev->umrc.qp, qp);
 
 	mutex_unlock(&dev->umrc.init_lock);
 	return 0;
@@ -517,22 +518,20 @@ static void *mlx5r_umr_alloc_xlt(size_t *nents, size_t ent_size, gfp_t gfp_mask)
 	size = min_t(size_t, ent_size * ALIGN(*nents, xlt_chunk_align),
 		     MLX5_MAX_UMR_CHUNK);
 	*nents = size / ent_size;
-	res = (void *)__get_free_pages(gfp_mask | __GFP_NOWARN,
-				       get_order(size));
+	res = kmalloc(PAGE_ALIGN(size), gfp_mask | __GFP_NOWARN);
 	if (res)
 		return res;
 
 	if (size > MLX5_SPARE_UMR_CHUNK) {
 		size = MLX5_SPARE_UMR_CHUNK;
 		*nents = size / ent_size;
-		res = (void *)__get_free_pages(gfp_mask | __GFP_NOWARN,
-					       get_order(size));
+		res = kmalloc(size, gfp_mask | __GFP_NOWARN);
 		if (res)
 			return res;
 	}
 
 	*nents = PAGE_SIZE / ent_size;
-	res = (void *)__get_free_page(gfp_mask);
+	res = kmalloc(PAGE_SIZE, gfp_mask);
 	if (res)
 		return res;
 
@@ -548,7 +547,7 @@ static void mlx5r_umr_free_xlt(void *xlt, size_t length)
 		return;
 	}
 
-	free_pages((unsigned long)xlt, get_order(length));
+	kfree(xlt);
 }
 
 static void mlx5r_umr_unmap_free_xlt(struct mlx5_ib_dev *dev, void *xlt,
@@ -846,7 +845,7 @@ static bool umr_can_use_indirect_mkey(struct mlx5_ib_dev *dev)
 }
 
 int mlx5r_umr_update_xlt(struct mlx5_ib_mr *mr, u64 idx, int npages,
-			 int page_shift, int flags)
+			 int page_shift, int flags, u32 pdn)
 {
 	int desc_size = (flags & MLX5_IB_UPD_XLT_INDIRECT)
 			       ? sizeof(struct mlx5_klm)
@@ -862,7 +861,6 @@ int mlx5r_umr_update_xlt(struct mlx5_ib_mr *mr, u64 idx, int npages,
 	size_t orig_sg_length;
 	size_t pages_iter;
 	struct ib_sge sg;
-	u32 pdn = mlx5_mr_pdn(mr);
 	int err = 0;
 	void *xlt;
 
@@ -979,7 +977,7 @@ static inline int _mlx5r_dmabuf_umr_update_pas(struct mlx5_ib_mr *mr,
 						     start_block, nblocks);
 }
 
-/**
+/*
  * This function makes an mkey non-present by zapping the translation entries of
  * the mkey by zapping (zeroing out) the first N entries, where N is determined
  * by the largest page size supported by the device and the MR length.

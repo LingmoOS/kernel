@@ -286,13 +286,6 @@ TRACE_EVENT(tcp_rcvbuf_grow,
 		  __entry->sock_cookie)
 );
 
-DEFINE_EVENT(tcp_event_sk, tcp_collapse_max_bytes_exceeded,
-
-	TP_PROTO(struct sock *sk),
-
-	TP_ARGS(sk)
-);
-
 TRACE_EVENT(tcp_retransmit_synack,
 
 	TP_PROTO(const struct sock *sk, const struct request_sock *req),
@@ -312,7 +305,7 @@ TRACE_EVENT(tcp_retransmit_synack,
 	),
 
 	TP_fast_assign(
-		struct inet_request_sock *ireq = inet_rsk(req);
+		const struct inet_request_sock *ireq = inet_rsk(req);
 		__be32 *p32;
 
 		__entry->skaddr = sk;

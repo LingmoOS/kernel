@@ -7,10 +7,10 @@
  *          Mika Westerberg <mika.westerberg@linux.intel.com>
  */
 
+#include <linux/cleanup.h>
 #include <linux/device.h>
 #include <linux/err.h>
 #include <linux/export.h>
-#include <linux/kconfig.h>
 #include <linux/of.h>
 #include <linux/property.h>
 #include <linux/phy.h>
@@ -38,6 +38,8 @@ EXPORT_SYMBOL_GPL(__dev_fwnode_const);
  * @propname: Name of the property
  *
  * Check if property @propname is present in the device firmware description.
+ * This function is the unambiguous way to check that given property is present
+ * in the device firmware description.
  *
  * Return: true if property @propname is present. Otherwise, returns false.
  */
@@ -51,6 +53,10 @@ EXPORT_SYMBOL_GPL(device_property_present);
  * fwnode_property_present - check if a property of a firmware node is present
  * @fwnode: Firmware node whose property to check
  * @propname: Name of the property
+ *
+ * Check if property @propname is present in the firmware node description.
+ * This function is the unambiguous way to check that given property is present
+ * in the firmware node description.
  *
  * Return: true if property @propname is present. Otherwise, returns false.
  */
@@ -75,9 +81,9 @@ EXPORT_SYMBOL_GPL(fwnode_property_present);
  * @dev: Device whose property is being checked
  * @propname: Name of the property
  *
- * Return if property @propname is true or false in the device firmware description.
+ * Use device_property_present() to check for the property presence.
  *
- * Return: true if property @propname is present. Otherwise, returns false.
+ * Return: if property @propname is true or false in the device firmware description.
  */
 bool device_property_read_bool(const struct device *dev, const char *propname)
 {
@@ -90,7 +96,9 @@ EXPORT_SYMBOL_GPL(device_property_read_bool);
  * @fwnode: Firmware node whose property to check
  * @propname: Name of the property
  *
- * Return if property @propname is true or false in the firmware description.
+ * Use fwnode_property_present() to check for the property presence.
+ *
+ * Return: if property @propname is true or false in the firmware node description.
  */
 bool fwnode_property_read_bool(const struct fwnode_handle *fwnode,
 			     const char *propname)
@@ -509,7 +517,6 @@ EXPORT_SYMBOL_GPL(fwnode_property_read_string);
 int fwnode_property_match_string(const struct fwnode_handle *fwnode,
 	const char *propname, const char *string)
 {
-	const char **values;
 	int nval, ret;
 
 	nval = fwnode_property_string_array_count(fwnode, propname);
@@ -519,20 +526,18 @@ int fwnode_property_match_string(const struct fwnode_handle *fwnode,
 	if (nval == 0)
 		return -ENODATA;
 
-	values = kcalloc(nval, sizeof(*values), GFP_KERNEL);
+	const char **values __free(kfree) = kzalloc_objs(*values, nval);
 	if (!values)
 		return -ENOMEM;
 
 	ret = fwnode_property_read_string_array(fwnode, propname, values, nval);
 	if (ret < 0)
-		goto out_free;
+		return ret;
 
 	ret = match_string(values, nval, string);
 	if (ret < 0)
-		ret = -ENODATA;
+		return -ENODATA;
 
-out_free:
-	kfree(values);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(fwnode_property_match_string);
@@ -594,6 +599,8 @@ EXPORT_SYMBOL_GPL(fwnode_property_match_property_string);
  *	    %-ENOENT when the index is out of bounds, the index has an empty
  *		     reference or the property was not found
  *	    %-EINVAL on parse error
+ *	    %-ENOTCONN when the remote firmware node exists but has not been
+ *		       registered yet
  */
 int fwnode_property_get_reference_args(const struct fwnode_handle *fwnode,
 				       const char *prop, const char *nargs_prop,
@@ -1118,8 +1125,9 @@ struct fwnode_handle *
 fwnode_graph_get_next_endpoint(const struct fwnode_handle *fwnode,
 			       struct fwnode_handle *prev)
 {
-	struct fwnode_handle *ep, *port_parent = NULL;
 	const struct fwnode_handle *parent;
+	struct fwnode_handle *port_parent __free(fwnode_handle) = NULL;
+	struct fwnode_handle *ep;
 
 	/*
 	 * If this function is in a loop and the previous iteration returned
@@ -1137,13 +1145,9 @@ fwnode_graph_get_next_endpoint(const struct fwnode_handle *fwnode,
 
 	ep = fwnode_call_ptr_op(parent, graph_get_next_endpoint, prev);
 	if (ep)
-		goto out_put_port_parent;
+		return ep;
 
-	ep = fwnode_graph_get_next_endpoint(parent->secondary, NULL);
-
-out_put_port_parent:
-	fwnode_handle_put(port_parent);
-	return ep;
+	return fwnode_graph_get_next_endpoint(parent->secondary, NULL);
 }
 EXPORT_SYMBOL_GPL(fwnode_graph_get_next_endpoint);
 

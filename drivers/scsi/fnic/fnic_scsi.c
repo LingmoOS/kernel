@@ -96,7 +96,7 @@ static const char *fnic_ioreq_state_to_str(unsigned int state)
 	return fnic_ioreq_state_str[state];
 }
 
-static const char *fnic_fcpio_status_to_str(unsigned int status)
+const char *fnic_fcpio_status_to_str(unsigned int status)
 {
 	if (status >= ARRAY_SIZE(fcpio_status_str) || !fcpio_status_str[status])
 		return "unknown";
@@ -145,8 +145,9 @@ unsigned int fnic_count_ioreqs(struct fnic *fnic, u32 portid)
 {
 	unsigned int count = 0;
 
-	fnic_scsi_io_iter(fnic, fnic_count_portid_ioreqs_iter,
-				&portid, &count);
+	if (IS_FNIC_FCP_INITIATOR(fnic))
+		fnic_scsi_io_iter(fnic, fnic_count_portid_ioreqs_iter,
+					&portid, &count);
 
 	FNIC_SCSI_DBG(KERN_DEBUG, fnic,
 		      "portid = 0x%x count = %u\n", portid, count);
@@ -186,7 +187,7 @@ fnic_count_lun_ioreqs(struct fnic *fnic, struct scsi_device *scsi_device)
 }
 
 /* Free up Copy Wq descriptors. Called with copy_wq lock held */
-static int free_wq_copy_descs(struct fnic *fnic, struct vnic_wq_copy *wq, unsigned int hwq)
+int free_wq_copy_descs(struct fnic *fnic, struct vnic_wq_copy *wq, unsigned int hwq)
 {
 	/* if no Ack received from firmware, then nothing to clean */
 	if (!fnic->fw_ack_recd[hwq])
@@ -454,7 +455,8 @@ static inline int fnic_queue_wq_copy_desc(struct fnic *fnic,
 	return 0;
 }
 
-int fnic_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *sc)
+enum scsi_qc_status fnic_queuecommand(struct Scsi_Host *shost,
+				      struct scsi_cmnd *sc)
 {
 	struct request *const rq = scsi_cmd_to_rq(sc);
 	uint32_t mqtag = 0;
@@ -470,7 +472,6 @@ int fnic_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *sc)
 	int sg_count = 0;
 	unsigned long flags = 0;
 	unsigned long ptr;
-	int io_lock_acquired = 0;
 	uint16_t hwq = 0;
 	struct fnic_tport_s *tport = NULL;
 	struct rport_dd_data_s *rdd_data;
@@ -635,7 +636,6 @@ int fnic_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *sc)
 	spin_lock_irqsave(&fnic->wq_copy_lock[hwq], flags);
 
 	/* initialize rest of io_req */
-	io_lock_acquired = 1;
 	io_req->port_id = rport->port_id;
 	io_req->start_time = jiffies;
 	fnic_priv(sc)->state = FNIC_IOREQ_CMD_PENDING;
@@ -688,6 +688,9 @@ int fnic_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *sc)
 		/* REVISIT: Use per IO lock in the final code */
 		fnic_priv(sc)->flags |= FNIC_IO_ISSUED;
 	}
+
+	spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
+
 out:
 	cmd_trace = ((u64)sc->cmnd[0] << 56 | (u64)sc->cmnd[7] << 40 |
 			(u64)sc->cmnd[8] << 32 | (u64)sc->cmnd[2] << 24 |
@@ -697,10 +700,6 @@ out:
 	FNIC_TRACE(fnic_queuecommand, sc->device->host->host_no,
 		   mqtag, sc, io_req, sg_count, cmd_trace,
 		   fnic_flags_and_state(sc));
-
-	/* if only we issued IO, will we have the io lock */
-	if (io_lock_acquired)
-		spin_unlock_irqrestore(&fnic->wq_copy_lock[hwq], flags);
 
 	atomic_dec(&fnic->in_flight);
 	atomic_dec(&tport->in_flight);
@@ -734,7 +733,10 @@ static int fnic_fcpio_fw_reset_cmpl_handler(struct fnic *fnic,
 	atomic64_inc(&reset_stats->fw_reset_completions);
 
 	/* Clean up all outstanding io requests */
-	fnic_cleanup_io(fnic, SCSI_NO_TAG);
+	if (IS_FNIC_FCP_INITIATOR(fnic))
+		fnic_cleanup_io(fnic, SCSI_NO_TAG);
+	else if (IS_FNIC_NVME_INITIATOR(fnic))
+		nvfnic_cleanup_all_nvme_ios(fnic);
 
 	atomic64_set(&fnic->fnic_stats.fw_stats.active_fw_reqs, 0);
 	atomic64_set(&fnic->fnic_stats.io_stats.active_ios, 0);
@@ -776,7 +778,7 @@ static int fnic_fcpio_fw_reset_cmpl_handler(struct fnic *fnic,
 	 */
 	if (ret) {
 		spin_unlock_irqrestore(&fnic->fnic_lock, flags);
-		fnic_free_txq(&fnic->tx_queue);
+		fnic_free_txq(fnic);
 		goto reset_cmpl_handler_end;
 	}
 
@@ -896,7 +898,7 @@ static inline void fnic_fcpio_ack_handler(struct fnic *fnic,
 
 	spin_unlock_irqrestore(&fnic->wq_copy_lock[wq_index], flags);
 	FNIC_TRACE(fnic_fcpio_ack_handler,
-		  fnic->host->host_no, 0, 0, ox_id_tag[2], ox_id_tag[3],
+		  fnic->fnic_num, 0, 0, ox_id_tag[2], ox_id_tag[3],
 		  ox_id_tag[4], ox_id_tag[5]);
 }
 
@@ -1444,6 +1446,7 @@ static int fnic_fcpio_cmpl_handler(struct vnic_dev *vdev,
 	case FCPIO_FLOGI_REG_CMPL: /* fw completed flogi_reg */
 	case FCPIO_FLOGI_FIP_REG_CMPL: /* fw completed flogi_fip_reg */
 	case FCPIO_RESET_CMPL: /* fw completed reset */
+	case FCPIO_NVME_ERSP_HW_CMPL: /* fw completed NVMe ERSP */
 		atomic64_dec(&fnic->fnic_stats.fw_stats.active_fw_reqs);
 		break;
 	default:
@@ -1458,11 +1461,22 @@ static int fnic_fcpio_cmpl_handler(struct vnic_dev *vdev,
 		break;
 
 	case FCPIO_ICMND_CMPL: /* fw completed a command */
-		fnic_fcpio_icmnd_cmpl_handler(fnic, cq_index, desc);
+		if (IS_FNIC_FCP_INITIATOR(fnic))
+			fnic_fcpio_icmnd_cmpl_handler(fnic, cq_index, desc);
+		else if (IS_FNIC_NVME_INITIATOR(fnic))
+			nvfnic_fcpio_nvme_fast_cmpl_handler(fnic, desc);
+		break;
+
+	case FCPIO_NVME_ERSP_HW_CMPL: /* fw completed NVMe ERSP */
+		if (IS_FNIC_NVME_INITIATOR(fnic))
+			nvfnic_fcpio_ersp_cmpl_handler(fnic, desc, 1);
 		break;
 
 	case FCPIO_ITMF_CMPL: /* fw completed itmf (abort cmd, lun reset)*/
-		fnic_fcpio_itmf_cmpl_handler(fnic, cq_index, desc);
+		if (IS_FNIC_FCP_INITIATOR(fnic))
+			fnic_fcpio_itmf_cmpl_handler(fnic, cq_index, desc);
+		else if (IS_FNIC_NVME_INITIATOR(fnic))
+			nvfnic_fcpio_nvme_itmf_cmpl_handler(fnic, desc);
 		break;
 
 	case FCPIO_FLOGI_REG_CMPL: /* fw completed flogi_reg */
@@ -1650,6 +1664,15 @@ void fnic_wq_copy_cleanup_handler(struct vnic_wq_copy *wq,
 	unsigned long flags;
 	unsigned long start_time = 0;
 	uint16_t hwq;
+
+	/*
+	 * Clean up outstanding NVMe requests if firmware reset did not
+	 * complete them before WQ copy cleanup.
+	 */
+	if (IS_FNIC_NVME_INITIATOR(fnic)) {
+		nvfnic_cleanup_all_nvme_ios(fnic);
+		return;
+	}
 
 	/* get the tag reference */
 	fcpio_tag_id_dec(&desc->hdr.tag, &id);
@@ -1970,13 +1993,10 @@ void fnic_scsi_unload(struct fnic *fnic)
 	 */
 	spin_lock_irqsave(&fnic->fnic_lock, flags);
 	fnic->iport.state = FNIC_IPORT_STATE_LINK_WAIT;
-	spin_unlock_irqrestore(&fnic->fnic_lock, flags);
-
-	if (fdls_get_state(&fnic->iport.fabric) != FDLS_STATE_INIT)
-		fnic_fcpio_reset(fnic);
-	spin_lock_irqsave(&fnic->fnic_lock, flags);
 	fnic->in_remove = 1;
 	spin_unlock_irqrestore(&fnic->fnic_lock, flags);
+
+	fnic_fcpio_reset(fnic);
 
 	fnic_flush_tport_event_list(fnic);
 	fnic_delete_fcp_tports(fnic);

@@ -7,8 +7,7 @@
 #include "autogroup.h"
 #include "sched.h"
 
-unsigned int __read_mostly sysctl_sched_autogroup_enabled =
-		IS_ENABLED(CONFIG_SCHED_AUTOGROUP_DEFAULT_ENABLED) ? 1 : 0;
+unsigned int __read_mostly sysctl_sched_autogroup_enabled = 1;
 static struct autogroup autogroup_default;
 static atomic_t autogroup_seq_nr;
 
@@ -87,7 +86,7 @@ static inline struct autogroup *autogroup_task_get(struct task_struct *p)
 
 static inline struct autogroup *autogroup_create(void)
 {
-	struct autogroup *ag = kzalloc(sizeof(*ag), GFP_KERNEL);
+	struct autogroup *ag = kzalloc_obj(*ag);
 	struct task_group *tg;
 
 	if (!ag)
@@ -179,8 +178,8 @@ autogroup_move_group(struct task_struct *p, struct autogroup *ag)
 	 * this process can already run with task_group() == prev->tg or we can
 	 * race with cgroup code which can read autogroup = prev under rq->lock.
 	 * In the latter case for_each_thread() can not miss a migrating thread,
-	 * cpu_cgroup_attach() must not be possible after cgroup_exit() and it
-	 * can't be removed from thread list, we hold ->siglock.
+	 * cpu_cgroup_attach() must not be possible after cgroup_task_exit()
+	 * and it can't be removed from thread list, we hold ->siglock.
 	 *
 	 * If an exiting thread was already removed from thread list we rely on
 	 * sched_autogroup_exit_task().
@@ -223,13 +222,11 @@ void sched_autogroup_exit(struct signal_struct *sig)
 
 static int __init setup_autogroup(char *str)
 {
-	unsigned long enabled;
-	if (!kstrtoul(str, 0, &enabled))
-		sysctl_sched_autogroup_enabled = enabled ? 1 : 0;
+	sysctl_sched_autogroup_enabled = 0;
 
 	return 1;
 }
-__setup("autogroup=", setup_autogroup);
+__setup("noautogroup", setup_autogroup);
 
 #ifdef CONFIG_PROC_FS
 

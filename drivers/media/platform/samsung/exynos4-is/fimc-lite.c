@@ -1209,9 +1209,8 @@ static int fimc_lite_subdev_s_stream(struct v4l2_subdev *sd, int on)
 			spin_unlock_irqrestore(&fimc->slock, flags);
 		}
 	} else {
-		set_bit(ST_FLITE_OFF, &fimc->state);
-
 		spin_lock_irqsave(&fimc->slock, flags);
+		set_bit(ST_FLITE_OFF, &fimc->state);
 		flite_hw_capture_stop(fimc);
 		spin_unlock_irqrestore(&fimc->slock, flags);
 
@@ -1662,4 +1661,3 @@ static struct platform_driver fimc_lite_driver = {
 module_platform_driver(fimc_lite_driver);
 MODULE_DESCRIPTION("Samsung EXYNOS FIMC-LITE (camera host interface) driver");
 MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:" FIMC_LITE_DRV_NAME);

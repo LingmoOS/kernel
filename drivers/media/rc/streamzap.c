@@ -284,7 +284,7 @@ static int streamzap_probe(struct usb_interface *intf,
 	int pipe, maxp;
 
 	/* Allocate space for device driver specific data */
-	sz = kzalloc(sizeof(struct streamzap_ir), GFP_KERNEL);
+	sz = kzalloc_obj(struct streamzap_ir);
 	if (!sz)
 		return -ENOMEM;
 
@@ -365,6 +365,7 @@ static int streamzap_probe(struct usb_interface *intf,
 
 	return 0;
 rc_submit_fail:
+	rc_unregister_device(sz->rdev);
 	rc_free_device(sz->rdev);
 	usb_set_intfdata(intf, NULL);
 rc_dev_fail:

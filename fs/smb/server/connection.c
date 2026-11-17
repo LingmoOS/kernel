@@ -13,17 +13,154 @@
 #include "mgmt/ksmbd_ida.h"
 #include "mgmt/user_session.h"
 #include "connection.h"
+#include "vfs_cache.h"
+#include "compress.h"
 #include "transport_tcp.h"
 #include "transport_rdma.h"
+#include "misc.h"
 
 static DEFINE_MUTEX(init_lock);
 
 static struct ksmbd_conn_ops default_conn_ops;
+static struct delayed_work session_expiration_work;
+static bool stopping_session_expiration_work;
 
 DEFINE_HASHTABLE(conn_list, CONN_HASH_BITS);
 DECLARE_RWSEM(conn_list_lock);
 
+#ifdef CONFIG_PROC_FS
+static struct proc_dir_entry *proc_clients;
+
+static const char *ksmbd_conn_state_string(struct ksmbd_conn *conn)
+{
+	switch (READ_ONCE(conn->status)) {
+	case KSMBD_SESS_NEW:
+		return "new";
+	case KSMBD_SESS_GOOD:
+		return "good";
+	case KSMBD_SESS_EXITING:
+		return "exiting";
+	case KSMBD_SESS_NEED_RECONNECT:
+		return "reconnect";
+	case KSMBD_SESS_NEED_NEGOTIATE:
+		return "negotiate";
+	case KSMBD_SESS_NEED_SETUP:
+		return "setup";
+	case KSMBD_SESS_RELEASING:
+		return "releasing";
+	default:
+		return "unknown";
+	}
+}
+
+static const char *ksmbd_conn_transport_string(struct ksmbd_conn *conn)
+{
+	if (conn->transport->ops->rdma_read || conn->transport->ops->rdma_write)
+		return "smbdirect";
+	return "tcp";
+}
+
+static void proc_show_conn_feature(struct seq_file *m, bool *separator,
+				   bool enabled, const char *name)
+{
+	if (!enabled)
+		return;
+	seq_printf(m, "%s%s", *separator ? "," : "", name);
+	*separator = true;
+}
+
+static void proc_show_conn_features(struct seq_file *m,
+				    struct ksmbd_conn *conn)
+{
+	bool separator = false;
+
+	proc_show_conn_feature(m, &separator,
+			       conn->sign || conn->signing_negotiated, "sign");
+	proc_show_conn_feature(m, &separator, conn->cipher_type, "encrypt");
+	proc_show_conn_feature(m, &separator,
+			       conn->compress_algorithm != SMB3_COMPRESS_NONE,
+			       "compress");
+	proc_show_conn_feature(m, &separator, conn->rdma_transform_ids,
+			       "rdma-transform");
+	proc_show_conn_feature(m, &separator, conn->posix_ext_supported, "posix");
+	if (!separator)
+		seq_puts(m, "none");
+}
+
+static int proc_show_clients(struct seq_file *m, void *v)
+{
+	struct ksmbd_conn *conn;
+	struct timespec64 now, t;
+	int i;
+
+	down_read(&conn_list_lock);
+	hash_for_each(conn_list, i, conn, hlist) {
+		unsigned int outstanding_credits, total_credits;
+		unsigned long id;
+		void *entry;
+		unsigned int sessions = 0;
+
+		jiffies_to_timespec64(jiffies - conn->last_active, &t);
+		ktime_get_real_ts64(&now);
+		t = timespec64_sub(now, t);
+
+		spin_lock(&conn->credits_lock);
+		outstanding_credits = conn->outstanding_credits;
+		total_credits = conn->total_credits;
+		spin_unlock(&conn->credits_lock);
+
+		rcu_read_lock();
+		xa_for_each(&conn->sessions, id, entry)
+			sessions++;
+		rcu_read_unlock();
+#if IS_ENABLED(CONFIG_IPV6)
+		if (!conn->inet_addr)
+			seq_printf(m, "client:\t%pI6c\n", &conn->inet6_addr);
+		else
+#endif
+			seq_printf(m, "client:\t%pI4\n", &conn->inet_addr);
+		seq_printf(m, "transport:\t%s\n", ksmbd_conn_transport_string(conn));
+		seq_printf(m, "state:\t%s\n", ksmbd_conn_state_string(conn));
+		seq_printf(m, "dialect:\t0x%04x\n", conn->dialect);
+		seq_printf(m, "credits:\t%u/%u\n", outstanding_credits,
+			   total_credits);
+		seq_printf(m, "sessions:\t%u\n", sessions);
+		seq_printf(m, "open_files:\t%d\n",
+			   atomic_read(&conn->stats.open_files_count));
+		seq_printf(m, "requests:\t%lld\n",
+			   atomic64_read(&conn->stats.request_served));
+		seq_puts(m, "features:\t");
+		proc_show_conn_features(m, conn);
+		seq_printf(m, "\nlast_active:\t%ptT\n\n", &t);
+	}
+	up_read(&conn_list_lock);
+	return 0;
+}
+
+static int create_proc_clients(void)
+{
+	proc_clients = ksmbd_proc_create("clients",
+					 proc_show_clients, NULL);
+	if (!proc_clients)
+		return -ENOMEM;
+	return 0;
+}
+
+static void delete_proc_clients(void)
+{
+	if (proc_clients) {
+		proc_remove(proc_clients);
+		proc_clients = NULL;
+	}
+}
+#else
+static int create_proc_clients(void) { return 0; }
+static void delete_proc_clients(void) {}
+#endif
+
 static struct workqueue_struct *ksmbd_conn_wq;
+
+static void ksmbd_session_expiration_worker(struct work_struct *work);
 
 int ksmbd_conn_wq_init(void)
 {
@@ -31,12 +168,20 @@ int ksmbd_conn_wq_init(void)
 					WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
 	if (!ksmbd_conn_wq)
 		return -ENOMEM;
+
+	WRITE_ONCE(stopping_session_expiration_work, false);
+	INIT_DELAYED_WORK(&session_expiration_work,
+			  ksmbd_session_expiration_worker);
+	queue_delayed_work(ksmbd_conn_wq, &session_expiration_work,
+			   KSMBD_SESSION_EXPIRATION_INTERVAL);
 	return 0;
 }
 
 void ksmbd_conn_wq_destroy(void)
 {
 	if (ksmbd_conn_wq) {
+		WRITE_ONCE(stopping_session_expiration_work, true);
+		cancel_delayed_work_sync(&session_expiration_work);
 		destroy_workqueue(ksmbd_conn_wq);
 		ksmbd_conn_wq = NULL;
 	}
@@ -60,11 +205,13 @@ static void __ksmbd_conn_release_work(struct work_struct *work)
 
 	ida_destroy(&conn->async_ida);
 	conn->transport->ops->free_transport(conn->transport);
-	kfree(conn);
+	kfree_sensitive(conn);
 }
 
 /**
  * ksmbd_conn_get() - take a reference on @conn and return it.
+ *
+ * @conn: connection instance to get a reference to
  *
  * Returns @conn unchanged so callers can write
  * "fp->conn = ksmbd_conn_get(work->conn);" in one expression.  Returns NULL
@@ -82,6 +229,8 @@ struct ksmbd_conn *ksmbd_conn_get(struct ksmbd_conn *conn)
 /**
  * ksmbd_conn_put() - drop a reference and, if it was the last, queue the
  * release onto ksmbd_conn_wq so it runs from process context.
+ *
+ * @conn: connection instance to put a reference to
  *
  * Callable from any context including RCU softirq callbacks and non-sleeping
  * locks; the actual release is deferred to the workqueue.  ksmbd_conn_wq is
@@ -122,7 +271,7 @@ void ksmbd_conn_free(struct ksmbd_conn *conn)
 	 */
 	xa_destroy(&conn->sessions);
 	kvfree(conn->request_buf);
-	kfree(conn->preauth_info);
+	kfree_sensitive(conn->preauth_info);
 	kfree(conn->mechToken);
 	ksmbd_preauth_session_destroy(conn);
 	ksmbd_conn_put(conn);
@@ -137,11 +286,12 @@ struct ksmbd_conn *ksmbd_conn_alloc(void)
 {
 	struct ksmbd_conn *conn;
 
-	conn = kzalloc(sizeof(struct ksmbd_conn), KSMBD_DEFAULT_GFP);
+	conn = kzalloc_obj(struct ksmbd_conn, KSMBD_DEFAULT_GFP);
 	if (!conn)
 		return NULL;
 
 	conn->need_neg = true;
+	conn->creation_time = jiffies;
 	ksmbd_conn_set_new(conn);
 	conn->local_nls = load_nls("utf8");
 	if (!conn->local_nls)
@@ -156,8 +306,17 @@ struct ksmbd_conn *ksmbd_conn_alloc(void)
 	atomic_set(&conn->req_running, 0);
 	atomic_set(&conn->r_count, 0);
 	atomic_set(&conn->refcnt, 1);
+	atomic64_set(&conn->session_count, 0);
 	conn->total_credits = 1;
 	conn->outstanding_credits = 0;
+
+	/*
+	 * The command sequence window starts as the set { 0 } when the
+	 * connection is established.
+	 */
+	conn->seq_low = 0;
+	conn->seq_high = 1;
+	__set_bit(0, conn->seq_bitmap);
 
 	init_waitqueue_head(&conn->req_running_q);
 	init_waitqueue_head(&conn->r_count_q);
@@ -240,12 +399,12 @@ static void ksmbd_conn_cancel_async_requests(struct ksmbd_conn *conn)
 	spin_lock(&conn->request_lock);
 	list_for_each_entry_safe(work, tmp, &conn->async_requests,
 				 async_request_entry) {
-		if (work->state != KSMBD_WORK_ACTIVE)
+		if (cmpxchg(&work->state, KSMBD_WORK_ACTIVE,
+			    KSMBD_WORK_CANCELLED) != KSMBD_WORK_ACTIVE)
 			continue;
 
 		ksmbd_debug(CONN, "Cancel async request id %d\n",
 			    work->async_id);
-		work->state = KSMBD_WORK_CANCELLED;
 		if (work->cancel_fn)
 			work->cancel_fn(work->cancel_argv);
 	}
@@ -299,17 +458,13 @@ void ksmbd_all_conn_set_status(struct ksmbd_session *sess, u32 status)
 
 void ksmbd_conn_abort(struct ksmbd_conn *conn)
 {
-	bool shutdown = false;
-
 	spin_lock(&conn->request_lock);
-	if (!ksmbd_conn_exiting(conn) && !ksmbd_conn_releasing(conn)) {
+	if (!ksmbd_conn_exiting(conn) && !ksmbd_conn_releasing(conn))
 		ksmbd_conn_set_exiting(conn);
-		shutdown = true;
-	}
 	spin_unlock(&conn->request_lock);
 	wake_up_all(&conn->req_running_q);
 
-	if (shutdown && conn->transport->ops->shutdown)
+	if (conn->transport->ops->shutdown)
 		conn->transport->ops->shutdown(conn->transport);
 }
 
@@ -328,6 +483,9 @@ int ksmbd_conn_wait_idle_sess(struct ksmbd_conn *curr_conn,
 retry_idle:
 	if (retry_count >= max_timeout)
 		return -EIO;
+
+	/* A blocked byte-range lock cannot drain until teardown wakes it. */
+	ksmbd_wake_session_blocked_works(sess);
 
 	down_read(&conn_list_lock);
 	hash_for_each(conn_list, bkt, conn, hlist) {
@@ -350,7 +508,8 @@ retry_idle:
 	return 0;
 }
 
-int ksmbd_conn_write(struct ksmbd_work *work)
+static int __ksmbd_conn_write(struct ksmbd_work *work,
+			      struct ksmbd_transport_write *tx)
 {
 	struct ksmbd_conn *conn = work->conn;
 	int sent;
@@ -366,20 +525,59 @@ int ksmbd_conn_write(struct ksmbd_work *work)
 	if (!work->iov_idx)
 		return -EINVAL;
 
-	ksmbd_conn_lock(conn);
-	sent = conn->transport->ops->writev(conn->transport, work->iov,
-			work->iov_cnt,
-			get_rfc1002_len(work->iov[0].iov_base) + 4,
-			work->need_invalidate_rkey,
-			work->remote_key);
+	tx->iov = work->iov;
+	tx->iov_cnt = work->iov_cnt;
+	tx->size = get_rfc1002_len(work->iov[0].iov_base) + 4;
+	tx->need_invalidate_rkey = work->need_invalidate_rkey;
+	tx->remote_key = work->remote_key;
+
+	if (tx->tracking) {
+		/* A busy writer must not consume the break's retry budget. */
+		if (!mutex_trylock(&conn->srv_mutex))
+			return -EAGAIN;
+	} else {
+		ksmbd_conn_lock(conn);
+	}
+	sent = conn->transport->ops->writev(conn->transport, tx);
 	ksmbd_conn_unlock(conn);
 
 	if (sent < 0) {
-		pr_err("Failed to send message: %d\n", sent);
+		if (!tx->tracking || sent != -EAGAIN)
+			pr_err("Failed to send message: %d\n", sent);
 		return sent;
 	}
 
 	return 0;
+}
+
+int ksmbd_conn_write(struct ksmbd_work *work)
+{
+	struct ksmbd_transport_write tx = {};
+
+	return __ksmbd_conn_write(work, &tx);
+}
+
+int ksmbd_conn_write_tracked(struct ksmbd_work *work,
+			     struct ksmbd_tx_tracking *tracking)
+{
+	struct ksmbd_transport_write tx = {};
+
+	tracking->valid = false;
+	/* Transports without delivery tracking keep their synchronous send path. */
+	if (work->conn->transport->ops->is_acked) {
+		tx.msg_flags = MSG_DONTWAIT;
+		tx.tracking = tracking;
+	}
+	return __ksmbd_conn_write(work, &tx);
+}
+
+int ksmbd_conn_write_eor(struct ksmbd_work *work)
+{
+	struct ksmbd_transport_write tx = {
+		.msg_flags = MSG_EOR,
+	};
+
+	return __ksmbd_conn_write(work, &tx);
 }
 
 int ksmbd_conn_rdma_read(struct ksmbd_conn *conn,
@@ -421,6 +619,20 @@ bool ksmbd_conn_alive(struct ksmbd_conn *conn)
 	if (kthread_should_stop())
 		return false;
 
+	/*
+	 * Stale connections that have not completed NEGOTIATE and SESSION_SETUP
+	 * must be disconnected. Do not race a request that is currently
+	 * completing authentication.
+	 */
+	if (!atomic_read(&conn->req_running) &&
+	    time_after(jiffies, conn->creation_time +
+		       KSMBD_UNAUTHENTICATED_CONN_TIMEOUT) &&
+	    (READ_ONCE(conn->need_neg) ||
+	     !ksmbd_conn_has_valid_or_expired_session(conn))) {
+		ksmbd_debug(CONN, "Connection setup timed out\n");
+		return false;
+	}
+
 	if (atomic_read(&conn->stats.open_files_count) > 0)
 		return true;
 
@@ -436,6 +648,52 @@ bool ksmbd_conn_alive(struct ksmbd_conn *conn)
 		return false;
 	}
 	return true;
+}
+
+static void ksmbd_session_expiration_worker(struct work_struct *work)
+{
+	struct ksmbd_conn *conn, *target;
+	int bkt;
+
+	if (!ksmbd_server_running())
+		goto reschedule;
+
+	ksmbd_expire_sessions();
+	ksmbd_reclaim_ended_sessions();
+
+	/*
+	 * An old connection without a Valid or Expired session must be
+	 * disconnected. Process one connection at a time without holding
+	 * conn_list_lock across transport shutdown.
+	 */
+again:
+	target = NULL;
+	down_read(&conn_list_lock);
+	hash_for_each(conn_list, bkt, conn, hlist) {
+		if (ksmbd_conn_exiting(conn) || ksmbd_conn_releasing(conn) ||
+		    atomic_read(&conn->req_running) ||
+		    time_before_eq(jiffies, conn->creation_time +
+				   KSMBD_UNAUTHENTICATED_CONN_TIMEOUT) ||
+		    (!READ_ONCE(conn->need_neg) &&
+		     ksmbd_conn_has_valid_or_expired_session(conn)))
+			continue;
+
+		target = ksmbd_conn_get(conn);
+		break;
+	}
+	up_read(&conn_list_lock);
+
+	if (target) {
+		ksmbd_debug(CONN, "Connection setup timed out\n");
+		ksmbd_conn_abort(target);
+		ksmbd_conn_put(target);
+		goto again;
+	}
+
+reschedule:
+	if (!READ_ONCE(stopping_session_expiration_work))
+		queue_delayed_work(ksmbd_conn_wq, &session_expiration_work,
+				   KSMBD_SESSION_EXPIRATION_INTERVAL);
 }
 
 /* "+2" for BCC field (ByteCount, 2 bytes) */
@@ -464,9 +722,6 @@ int ksmbd_conn_handler_loop(void *p)
 	mutex_init(&conn->srv_mutex);
 	__module_get(THIS_MODULE);
 
-	if (t->ops->prepare && t->ops->prepare(t))
-		goto out;
-
 	max_req = server_conf.max_inflight_req;
 	conn->last_active = jiffies;
 	set_freezable();
@@ -491,11 +746,7 @@ recheck:
 		pdu_size = get_rfc1002_len(hdr_buf);
 		ksmbd_debug(CONN, "RFC1002 header %u bytes\n", pdu_size);
 
-		if (ksmbd_conn_good(conn))
-			max_allowed_pdu_size =
-				SMB3_MAX_MSGSIZE + conn->vals->max_write_size;
-		else
-			max_allowed_pdu_size = SMB3_MAX_MSGSIZE;
+		max_allowed_pdu_size = ksmbd_max_allowed_pdu_size(conn);
 
 		if (pdu_size > max_allowed_pdu_size) {
 			pr_err_ratelimited("PDU length(%u) exceeded maximum allowed pdu size(%u) on connection(%d)\n",
@@ -539,6 +790,17 @@ recheck:
 			continue;
 		}
 
+		if (((struct smb2_hdr *)smb_get_msg(conn->request_buf))->ProtocolId ==
+		    SMB2_COMPRESSION_TRANSFORM_ID) {
+			/*
+			 * Convert the transform into a normal RFC1002-framed SMB2
+			 * request before protocol validation and work allocation.
+			 */
+			if (ksmbd_decompress_request(conn))
+				break;
+			pdu_size = get_rfc1002_len(conn->request_buf);
+		}
+
 		if (!ksmbd_smb_request(conn))
 			break;
 
@@ -562,8 +824,12 @@ recheck:
 		}
 	}
 
-out:
+	/* Exclude new break senders before draining their work references. */
+	spin_lock(&conn->request_lock);
 	ksmbd_conn_set_releasing(conn);
+	spin_unlock(&conn->request_lock);
+	/* TCP writers waiting for queue space must release their work references. */
+	wake_up_all(&conn->req_running_q);
 	ksmbd_conn_cancel_async_requests(conn);
 	/* Wait till all reference dropped to the Server object*/
 	ksmbd_debug(CONN, "Wait for all pending requests(%d)\n", atomic_read(&conn->r_count));
@@ -588,6 +854,20 @@ void ksmbd_conn_init_server_callbacks(struct ksmbd_conn_ops *ops)
 void ksmbd_conn_r_count_inc(struct ksmbd_conn *conn)
 {
 	atomic_inc(&conn->r_count);
+}
+
+/* The caller already owns a connection reference. */
+bool ksmbd_conn_r_count_inc_if_good(struct ksmbd_conn *conn)
+{
+	bool ret = false;
+
+	spin_lock(&conn->request_lock);
+	if (ksmbd_conn_good(conn)) {
+		atomic_inc(&conn->r_count);
+		ret = true;
+	}
+	spin_unlock(&conn->request_lock);
+	return ret;
 }
 
 void ksmbd_conn_r_count_dec(struct ksmbd_conn *conn)
@@ -622,6 +902,8 @@ int ksmbd_conn_transport_init(void)
 	}
 out:
 	mutex_unlock(&init_lock);
+	if (create_proc_clients())
+		pr_warn("Unable to create clients procfs entry\n");
 	return ret;
 }
 
@@ -671,7 +953,7 @@ again:
 		if (atomic_dec_and_test(&target->refcnt)) {
 			ida_destroy(&target->async_ida);
 			t->ops->free_transport(t);
-			kfree(target);
+			kfree_sensitive(target);
 		}
 		goto again;
 	}
@@ -684,10 +966,10 @@ again:
 
 void ksmbd_conn_transport_destroy(void)
 {
+	delete_proc_clients();
 	mutex_lock(&init_lock);
 	ksmbd_tcp_destroy();
 	ksmbd_rdma_stop_listening();
 	stop_sessions();
-	ksmbd_rdma_destroy();
 	mutex_unlock(&init_lock);
 }

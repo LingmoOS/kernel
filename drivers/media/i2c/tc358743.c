@@ -1373,7 +1373,8 @@ static int tc358743_log_status(struct v4l2_subdev *sd)
 	static const char * const input_color_space[] = {
 		"RGB", "YCbCr 601", "opRGB", "YCbCr 709", "NA (4)",
 		"xvYCC 601", "NA(6)", "xvYCC 709", "NA(8)", "sYCC601",
-		"NA(10)", "NA(11)", "NA(12)", "opYCC 601"};
+		"NA(10)", "NA(11)", "NA(12)", "opYCC 601", "NA(14)",
+		"NA(15)"};
 
 	v4l2_info(sd, "-----Chip status-----\n");
 	v4l2_info(sd, "Chip ID: 0x%02x\n",
@@ -2358,8 +2359,8 @@ static void tc358743_remove(struct i2c_client *client)
 }
 
 static const struct i2c_device_id tc358743_id[] = {
-	{ "tc358743" },
-	{}
+	{ .name = "tc358743" },
+	{ }
 };
 
 MODULE_DEVICE_TABLE(i2c, tc358743_id);

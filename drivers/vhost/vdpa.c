@@ -120,7 +120,7 @@ static struct vhost_vdpa_as *vhost_vdpa_alloc_as(struct vhost_vdpa *v, u32 asid)
 	if (max_iotlb_entries <= 0)
 		return NULL;
 
-	as = kmalloc(sizeof(*as), GFP_KERNEL);
+	as = kmalloc_obj(*as);
 	if (!as)
 		return NULL;
 
@@ -735,6 +735,8 @@ static long vhost_vdpa_vring_ioctl(struct vhost_vdpa *v, unsigned int cmd,
 			return -EFAULT;
 		if (idx >= vdpa->ngroups || s.num >= vdpa->nas)
 			return -EINVAL;
+		if (ops->get_status(vdpa) & VIRTIO_CONFIG_S_DRIVER_OK)
+			return -EBUSY;
 		if (!ops->set_group_asid)
 			return -EOPNOTSUPP;
 		return ops->set_group_asid(vdpa, idx, s.num);
@@ -1112,7 +1114,7 @@ static int vhost_vdpa_va_map(struct vhost_vdpa *v,
 			!(vma->vm_flags & (VM_IO | VM_PFNMAP))))
 			goto next;
 
-		map_file = kzalloc(sizeof(*map_file), GFP_KERNEL);
+		map_file = kzalloc_obj(*map_file);
 		if (!map_file) {
 			ret = -ENOMEM;
 			break;
@@ -1475,7 +1477,7 @@ static int vhost_vdpa_open(struct inode *inode, struct file *filep)
 	if (r)
 		goto err;
 
-	vqs = kmalloc_array(nvqs, sizeof(*vqs), GFP_KERNEL);
+	vqs = kmalloc_objs(*vqs, nvqs);
 	if (!vqs) {
 		r = -ENOMEM;
 		goto err;
@@ -1642,7 +1644,7 @@ static int vhost_vdpa_probe(struct vdpa_device *vdpa)
 	    (vdpa->ngroups > 1 || vdpa->nas > 1))
 		return -EOPNOTSUPP;
 
-	v = kzalloc(sizeof(*v), GFP_KERNEL | __GFP_RETRY_MAYFAIL);
+	v = kzalloc_obj(*v, GFP_KERNEL | __GFP_RETRY_MAYFAIL);
 	if (!v)
 		return -ENOMEM;
 
@@ -1664,8 +1666,7 @@ static int vhost_vdpa_probe(struct vdpa_device *vdpa)
 	v->dev.release = vhost_vdpa_release_dev;
 	v->dev.parent = &vdpa->dev;
 	v->dev.devt = MKDEV(MAJOR(vhost_vdpa_major), minor);
-	v->vqs = kmalloc_array(v->nvqs, sizeof(struct vhost_virtqueue),
-			       GFP_KERNEL);
+	v->vqs = kmalloc_objs(struct vhost_virtqueue, v->nvqs);
 	if (!v->vqs) {
 		r = -ENOMEM;
 		goto err;

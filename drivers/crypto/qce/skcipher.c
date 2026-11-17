@@ -7,6 +7,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
 #include <linux/moduleparam.h>
+#include <linux/string.h>
 #include <linux/types.h>
 #include <linux/errno.h>
 #include <crypto/aes.h>
@@ -215,7 +216,6 @@ static int qce_skcipher_crypt(struct skcipher_request *req, int encrypt)
 	struct qce_alg_template *tmpl = to_cipher_tmpl(tfm);
 	unsigned int blocksize = crypto_skcipher_blocksize(tfm);
 	int keylen;
-	int ret;
 
 	rctx->flags = tmpl->alg_flags;
 	rctx->flags |= encrypt ? QCE_ENCRYPT : QCE_DECRYPT;
@@ -253,9 +253,8 @@ static int qce_skcipher_crypt(struct skcipher_request *req, int encrypt)
 					      req->base.data);
 		skcipher_request_set_crypt(&rctx->fallback_req, req->src,
 					   req->dst, req->cryptlen, req->iv);
-		ret = encrypt ? crypto_skcipher_encrypt(&rctx->fallback_req) :
-				crypto_skcipher_decrypt(&rctx->fallback_req);
-		return ret;
+		return encrypt ? crypto_skcipher_encrypt(&rctx->fallback_req) :
+				 crypto_skcipher_decrypt(&rctx->fallback_req);
 	}
 
 	return tmpl->qce->async_req_enqueue(tmpl->qce, &req->base);
@@ -349,15 +348,14 @@ static int qce_skcipher_register_one(const struct qce_skcipher_def *def,
 	struct skcipher_alg *alg;
 	int ret;
 
-	tmpl = kzalloc(sizeof(*tmpl), GFP_KERNEL);
+	tmpl = kzalloc_obj(*tmpl);
 	if (!tmpl)
 		return -ENOMEM;
 
 	alg = &tmpl->alg.skcipher;
 
-	snprintf(alg->base.cra_name, CRYPTO_MAX_ALG_NAME, "%s", def->name);
-	snprintf(alg->base.cra_driver_name, CRYPTO_MAX_ALG_NAME, "%s",
-		 def->drv_name);
+	strscpy(alg->base.cra_name, def->name);
+	strscpy(alg->base.cra_driver_name, def->drv_name);
 
 	alg->base.cra_blocksize		= def->blocksize;
 	alg->chunksize			= def->chunksize;

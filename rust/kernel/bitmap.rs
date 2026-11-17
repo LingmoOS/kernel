@@ -257,6 +257,16 @@ impl BitmapVec {
     /// The maximum length that uses the inline representation.
     pub const MAX_INLINE_LEN: usize = usize::BITS as usize;
 
+    /// Construct a longest possible inline [`BitmapVec`].
+    #[inline]
+    pub fn new_inline() -> Self {
+        // INVARIANT: `nbits <= MAX_INLINE_LEN`, so an inline bitmap is the right repr.
+        BitmapVec {
+            repr: BitmapRepr { bitmap: 0 },
+            nbits: BitmapVec::MAX_INLINE_LEN,
+        }
+    }
+
     /// Constructs a new [`BitmapVec`].
     ///
     /// Fails with [`AllocError`] when the [`BitmapVec`] could not be allocated. This
@@ -517,9 +527,8 @@ impl Bitmap {
     }
 }
 
-use macros::kunit_tests;
-
-#[kunit_tests(rust_kernel_bitmap)]
+#[cfg(CONFIG_RUST_BITMAP_KUNIT_TEST)]
+#[macros::kunit_tests(rust_kernel_bitmap)]
 mod tests {
     use super::*;
     use kernel::alloc::flags::GFP_KERNEL;

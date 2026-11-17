@@ -136,7 +136,9 @@ static int psp_v11_0_init_microcode(struct psp_context *psp)
 		err = psp_init_toc_microcode(psp, ucode_prefix);
 		break;
 	default:
-		BUG();
+		dev_warn(adev->dev, "Unsupported MP0 version 0x%08x\n",
+			 amdgpu_ip_version(adev, MP0_HWIP, 0));
+		return -EINVAL;
 	}
 
 	return err;
@@ -417,7 +419,7 @@ static int psp_v11_0_mode1_reset(struct psp_context *psp)
 			   MBOX_TOS_READY_MASK, 0);
 
 	if (ret) {
-		DRM_INFO("psp is not working correctly before mode1 reset!\n");
+		drm_info(adev_to_drm(adev), "psp is not working correctly before mode1 reset!\n");
 		return -EINVAL;
 	}
 

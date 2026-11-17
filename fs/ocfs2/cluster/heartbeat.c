@@ -284,6 +284,9 @@ struct o2hb_bio_wait_ctxt {
 	atomic_t          wc_num_reqs;
 	struct completion wc_io_complete;
 	int               wc_error;
+	/* On-stack bio used by the synchronous write path only. */
+	struct bio        wc_write_bio;
+	struct bio_vec    wc_write_bvec;
 };
 
 #define O2HB_NEGO_TIMEOUT_MS (O2HB_MAX_WRITE_TIMEOUT_MS/2)
@@ -548,6 +551,23 @@ static void o2hb_bio_end_io(struct bio *bio)
 	bio_put(bio);
 }
 
+/*
+ * End I/O for the synchronous write path. The write bio is embedded in
+ * the wait ctxt rather than allocated, so it must not be freed here; it
+ * is torn down with bio_uninit() once the caller has waited on it.
+ */
+static void o2hb_write_bio_end_io(struct bio *bio)
+{
+	struct o2hb_bio_wait_ctxt *wc = bio->bi_private;
+
+	if (bio->bi_status) {
+		mlog(ML_ERROR, "IO Error %d\n", bio->bi_status);
+		wc->wc_error = blk_status_to_errno(bio->bi_status);
+	}
+
+	o2hb_bio_wait_dec(wc, 1);
+}
+
 /* Setup a Bio to cover I/O against num_slots slots starting at
  * start_slot. */
 static struct bio *o2hb_setup_one_bio(struct o2hb_region *reg,
@@ -563,16 +583,12 @@ static struct bio *o2hb_setup_one_bio(struct o2hb_region *reg,
 	struct bio *bio;
 	struct page *page;
 
-	/* Testing has shown this allocation to take long enough under
-	 * GFP_KERNEL that the local node can get fenced. It would be
-	 * nicest if we could pre-allocate these bios and avoid this
-	 * all together. */
-	bio = bio_alloc(reg_bdev(reg), 16, opf, GFP_ATOMIC);
-	if (!bio) {
-		mlog(ML_ERROR, "Could not alloc slots BIO!\n");
-		bio = ERR_PTR(-ENOMEM);
-		goto bail;
-	}
+	/*
+	 * The heartbeat runs in process context and can sleep, so use
+	 * GFP_NOFS. It is backed by the fs_bio_set mempool and thus cannot
+	 * fail, while avoiding recursion back into the filesystem.
+	 */
+	bio = bio_alloc(reg_bdev(reg), 16, opf, GFP_NOFS);
 
 	/* Must put everything in 512 byte sectors for the bio... */
 	bio->bi_iter.bi_sector = (reg->hr_start_block + cs) << (bits - 9);
@@ -597,7 +613,6 @@ static struct bio *o2hb_setup_one_bio(struct o2hb_region *reg,
 		vec_start = 0;
 	}
 
-bail:
 	*current_slot = cs;
 	return bio;
 }
@@ -607,7 +622,6 @@ static int o2hb_read_slots(struct o2hb_region *reg,
 			   unsigned int max_slots)
 {
 	unsigned int current_slot = begin_slot;
-	int status;
 	struct o2hb_bio_wait_ctxt wc;
 	struct bio *bio;
 
@@ -616,32 +630,24 @@ static int o2hb_read_slots(struct o2hb_region *reg,
 	while(current_slot < max_slots) {
 		bio = o2hb_setup_one_bio(reg, &wc, &current_slot, max_slots,
 					 REQ_OP_READ);
-		if (IS_ERR(bio)) {
-			status = PTR_ERR(bio);
-			mlog_errno(status);
-			goto bail_and_wait;
-		}
-
 		atomic_inc(&wc.wc_num_reqs);
 		submit_bio(bio);
 	}
 
-	status = 0;
-
-bail_and_wait:
 	o2hb_wait_on_io(&wc);
-	if (wc.wc_error && !status)
-		status = wc.wc_error;
 
-	return status;
+	return wc.wc_error;
 }
 
 static int o2hb_issue_node_write(struct o2hb_region *reg,
 				 struct o2hb_bio_wait_ctxt *write_wc)
 {
-	int status;
 	unsigned int slot;
-	struct bio *bio;
+	unsigned int bits = reg->hr_block_bits;
+	unsigned int spp = reg->hr_slots_per_page;
+	unsigned int vec_start, vec_len;
+	struct page *page;
+	struct bio *bio = &write_wc->wc_write_bio;
 
 	o2hb_bio_wait_init(write_wc);
 
@@ -649,20 +655,26 @@ static int o2hb_issue_node_write(struct o2hb_region *reg,
 	if (slot >= O2NM_MAX_NODES)
 		return -EINVAL;
 
-	bio = o2hb_setup_one_bio(reg, write_wc, &slot, slot+1,
-				 REQ_OP_WRITE | REQ_SYNC);
-	if (IS_ERR(bio)) {
-		status = PTR_ERR(bio);
-		mlog_errno(status);
-		goto bail;
-	}
+	/*
+	 * The heartbeat write always covers our own single slot, i.e. one
+	 * block that lives within a single page. Use an on-stack bio (embedded
+	 * in write_wc) so this fence-critical path never has to allocate.
+	 */
+	bio_init(bio, reg_bdev(reg), &write_wc->wc_write_bvec, 1,
+		 REQ_OP_WRITE | REQ_SYNC);
+	bio->bi_iter.bi_sector = (reg->hr_start_block + slot) << (bits - 9);
+	bio->bi_private = write_wc;
+	bio->bi_end_io = o2hb_write_bio_end_io;
+
+	page = reg->hr_slot_data[slot / spp];
+	vec_start = (slot << bits) % PAGE_SIZE;
+	vec_len = PAGE_SIZE / spp;
+	__bio_add_page(bio, page, vec_len, vec_start);
 
 	atomic_inc(&write_wc->wc_num_reqs);
 	submit_bio(bio);
 
-	status = 0;
-bail:
-	return status;
+	return 0;
 }
 
 static u32 o2hb_compute_block_crc_le(struct o2hb_region *reg,
@@ -1203,6 +1215,7 @@ static int o2hb_do_disk_heartbeat(struct o2hb_region *reg)
 	 * people we find in our steady state have seen us.
 	 */
 	o2hb_wait_on_io(&write_wc);
+	bio_uninit(&write_wc.wc_write_bio);
 	if (write_wc.wc_error) {
 		/* Do not re-arm the write timeout on I/O error - we
 		 * can't be sure that the new block ever made it to
@@ -1315,10 +1328,12 @@ static int o2hb_thread(void *data)
 	if (!reg->hr_unclean_stop && !reg->hr_aborted_start) {
 		o2hb_prepare_block(reg, 0);
 		ret = o2hb_issue_node_write(reg, &write_wc);
-		if (ret == 0)
+		if (ret == 0) {
 			o2hb_wait_on_io(&write_wc);
-		else
+			bio_uninit(&write_wc.wc_write_bio);
+		} else {
 			mlog_errno(ret);
+		}
 	}
 
 	/* Unpin node */
@@ -1773,8 +1788,7 @@ static int o2hb_map_slot_data(struct o2hb_region *reg)
 	if (!reg->hr_tmp_block)
 		goto out;
 
-	reg->hr_slots = kcalloc(reg->hr_blocks,
-				sizeof(struct o2hb_disk_slot), GFP_KERNEL);
+	reg->hr_slots = kzalloc_objs(struct o2hb_disk_slot, reg->hr_blocks);
 	if (!reg->hr_slots)
 		goto out;
 
@@ -1790,8 +1804,7 @@ static int o2hb_map_slot_data(struct o2hb_region *reg)
 			   "at %u blocks per page\n",
 	     reg->hr_num_pages, reg->hr_blocks, spp);
 
-	reg->hr_slot_data = kcalloc(reg->hr_num_pages, sizeof(struct page *),
-				    GFP_KERNEL);
+	reg->hr_slot_data = kzalloc_objs(struct page *, reg->hr_num_pages);
 	if (!reg->hr_slot_data)
 		goto out;
 
@@ -2055,7 +2068,7 @@ static struct configfs_attribute *o2hb_region_attrs[] = {
 	NULL,
 };
 
-static struct configfs_item_operations o2hb_region_item_ops = {
+static const struct configfs_item_operations o2hb_region_item_ops = {
 	.release		= o2hb_region_release,
 };
 
@@ -2114,7 +2127,7 @@ static struct config_item *o2hb_heartbeat_group_make_item(struct config_group *g
 	struct o2hb_region *reg = NULL;
 	int ret;
 
-	reg = kzalloc(sizeof(struct o2hb_region), GFP_KERNEL);
+	reg = kzalloc_obj(struct o2hb_region);
 	if (reg == NULL)
 		return ERR_PTR(-ENOMEM);
 
@@ -2124,6 +2137,18 @@ static struct config_item *o2hb_heartbeat_group_make_item(struct config_group *g
 	}
 	reg->hr_node_num = O2NM_MAX_NODES;
 
+	INIT_LIST_HEAD(&reg->hr_all_item);
+	mutex_init(&reg->hr_arming_mutex);
+	reg->hr_stopping = true;
+	INIT_DELAYED_WORK(&reg->hr_write_timeout_work, o2hb_write_timeout);
+	INIT_DELAYED_WORK(&reg->hr_nego_timeout_work, o2hb_nego_timeout);
+	INIT_LIST_HEAD(&reg->hr_handler_list);
+	config_item_init_type_name(&reg->hr_item, name, &o2hb_region_type);
+	if (!config_item_name(&reg->hr_item)) {
+		ret = -ENOMEM;
+		goto put_item;
+	}
+
 	spin_lock(&o2hb_live_lock);
 	reg->hr_region_num = 0;
 	if (o2hb_global_heartbeat_active()) {
@@ -2132,14 +2157,12 @@ static struct config_item *o2hb_heartbeat_group_make_item(struct config_group *g
 		if (reg->hr_region_num >= O2NM_MAX_REGIONS) {
 			spin_unlock(&o2hb_live_lock);
 			ret = -EFBIG;
-			goto free;
+			goto put_item;
 		}
 		set_bit(reg->hr_region_num, o2hb_region_bitmap);
 	}
 	list_add_tail(&reg->hr_all_item, &o2hb_all_regions);
 	spin_unlock(&o2hb_live_lock);
-
-	config_item_init_type_name(&reg->hr_item, name, &o2hb_region_type);
 
 	/* this is the same way to generate msg key as dlm, for local heartbeat,
 	 * name is also the same, so make initial crc value different to avoid
@@ -2147,11 +2170,6 @@ static struct config_item *o2hb_heartbeat_group_make_item(struct config_group *g
 	 */
 	reg->hr_key = crc32_le(reg->hr_region_num + O2NM_MAX_REGIONS,
 		name, strlen(name));
-	mutex_init(&reg->hr_arming_mutex);
-	reg->hr_stopping = true;
-	INIT_DELAYED_WORK(&reg->hr_write_timeout_work, o2hb_write_timeout);
-	INIT_DELAYED_WORK(&reg->hr_nego_timeout_work, o2hb_nego_timeout);
-	INIT_LIST_HEAD(&reg->hr_handler_list);
 	ret = o2net_register_handler(O2HB_NEGO_TIMEOUT_MSG, reg->hr_key,
 			sizeof(struct o2hb_nego_msg),
 			o2hb_nego_timeout_handler,
@@ -2174,10 +2192,13 @@ unregister_handler:
 	o2net_unregister_and_flush_handler_list(&reg->hr_handler_list);
 remove_item:
 	spin_lock(&o2hb_live_lock);
-	list_del(&reg->hr_all_item);
+	list_del_init(&reg->hr_all_item);
 	if (o2hb_global_heartbeat_active())
 		clear_bit(reg->hr_region_num, o2hb_region_bitmap);
 	spin_unlock(&o2hb_live_lock);
+put_item:
+	config_item_put(&reg->hr_item);
+	return ERR_PTR(ret);
 free:
 	kfree(reg);
 	return ERR_PTR(ret);
@@ -2315,7 +2336,7 @@ static struct configfs_attribute *o2hb_heartbeat_group_attrs[] = {
 	NULL,
 };
 
-static struct configfs_group_operations o2hb_heartbeat_group_group_ops = {
+static const struct configfs_group_operations o2hb_heartbeat_group_group_ops = {
 	.make_item	= o2hb_heartbeat_group_make_item,
 	.drop_item	= o2hb_heartbeat_group_drop_item,
 };
@@ -2333,7 +2354,7 @@ struct config_group *o2hb_alloc_hb_set(void)
 	struct o2hb_heartbeat_group *hs = NULL;
 	struct config_group *ret = NULL;
 
-	hs = kzalloc(sizeof(struct o2hb_heartbeat_group), GFP_KERNEL);
+	hs = kzalloc_obj(struct o2hb_heartbeat_group);
 	if (hs == NULL)
 		goto out;
 

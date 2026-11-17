@@ -185,14 +185,18 @@ mt7530_mii_read(struct mt7530_priv *priv, u32 reg)
 	return val;
 }
 
-static void
+static int
 mt7530_write(struct mt7530_priv *priv, u32 reg, u32 val)
 {
+	int ret;
+
 	mt7530_mutex_lock(priv);
 
-	mt7530_mii_write(priv, reg, val);
+	ret = mt7530_mii_write(priv, reg, val);
 
 	mt7530_mutex_unlock(priv);
+
+	return ret;
 }
 
 static u32
@@ -246,15 +250,22 @@ mt7530_fdb_cmd(struct mt7530_priv *priv, enum mt7530_fdb_cmd cmd, u32 *rsp)
 {
 	u32 val;
 	int ret;
-	struct mt7530_dummy_poll p;
 
 	/* Set the command operating upon the MAC address entries */
 	val = ATC_BUSY | ATC_MAT(0) | cmd;
-	mt7530_write(priv, MT7530_ATC, val);
+	ret = mt7530_write(priv, MT7530_ATC, val);
+	if (ret)
+		return ret;
 
-	INIT_MT7530_DUMMY_POLL(&p, priv, MT7530_ATC);
-	ret = readx_poll_timeout(_mt7530_read, &p, val,
-				 !(val & ATC_BUSY), 20, 20000);
+	mt7530_mutex_lock(priv);
+
+	ret = regmap_read_poll_timeout(priv->regmap, MT7530_ATC, val,
+				       !(val & ATC_BUSY), 20, 20000);
+	if (!ret)
+		ret = regmap_read(priv->regmap, MT7530_ATC, &val);
+
+	mt7530_mutex_unlock(priv);
+
 	if (ret < 0) {
 		dev_err(priv->dev, "reset timeout\n");
 		return ret;
@@ -263,7 +274,6 @@ mt7530_fdb_cmd(struct mt7530_priv *priv, enum mt7530_fdb_cmd cmd, u32 *rsp)
 	/* Additional sanity for read command if the specified
 	 * entry is invalid
 	 */
-	val = mt7530_read(priv, MT7530_ATC);
 	if ((cmd == MT7530_FDB_READ) && (val & ATC_INVALID))
 		return -EINVAL;
 
@@ -1621,6 +1631,55 @@ mt7530_port_bridge_join(struct dsa_switch *ds, int port,
 	return 0;
 }
 
+static int
+mt7530_vlan_cmd(struct mt7530_priv *priv, enum mt7530_vlan_cmd cmd, u16 vid)
+{
+	u32 val;
+	int ret;
+
+	val = VTCR_BUSY | VTCR_FUNC(cmd) | vid;
+	ret = mt7530_write(priv, MT7530_VTCR, val);
+	if (ret)
+		return ret;
+
+	mt7530_mutex_lock(priv);
+
+	ret = regmap_read_poll_timeout(priv->regmap, MT7530_VTCR, val,
+				       !(val & VTCR_BUSY), 20, 20000);
+	if (!ret)
+		ret = regmap_read(priv->regmap, MT7530_VTCR, &val);
+
+	mt7530_mutex_unlock(priv);
+
+	if (ret < 0) {
+		dev_err(priv->dev, "poll timeout\n");
+		return ret;
+	}
+
+	if (val & VTCR_INVALID) {
+		dev_err(priv->dev, "read VTCR invalid\n");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int
+mt7530_setup_vlan0(struct mt7530_priv *priv)
+{
+	u32 val;
+
+	/* Validate the entry with independent learning, keep the original
+	 * ingress tag attribute.
+	 */
+	val = IVL_MAC | EG_CON | PORT_MEM(MT7530_ALL_MEMBERS) | FID(FID_BRIDGED) |
+	      VLAN_VALID;
+	mt7530_write(priv, MT7530_VAWD1, val);
+	mt7530_write(priv, MT7530_VAWD2, 0);
+
+	return mt7530_vlan_cmd(priv, MT7530_VTCR_WR_VID, 0);
+}
+
 static void
 mt7530_port_set_vlan_unaware(struct dsa_switch *ds, int port)
 {
@@ -1646,6 +1705,8 @@ mt7530_port_set_vlan_unaware(struct dsa_switch *ds, int port)
 		   G0_PORT_VID_DEF);
 
 	for (i = 0; i < priv->ds->num_ports; i++) {
+		if (i == port)
+			continue;
 		if (dsa_is_user_port(ds, i) &&
 		    dsa_port_is_vlan_filtering(dsa_to_port(ds, i))) {
 			all_user_ports_removed = false;
@@ -1657,13 +1718,9 @@ mt7530_port_set_vlan_unaware(struct dsa_switch *ds, int port)
 	 * the CPU port get out of VLAN filtering mode.
 	 */
 	if (all_user_ports_removed) {
-		struct dsa_port *dp = dsa_to_port(ds, port);
-		struct dsa_port *cpu_dp = dp->cpu_dp;
-
-		mt7530_write(priv, MT7530_PCR_P(cpu_dp->index),
-			     PCR_MATRIX(dsa_user_ports(priv->ds)));
-		mt7530_write(priv, MT7530_PVC_P(cpu_dp->index), PORT_SPEC_TAG
-			     | PVC_EG_TAG(MT7530_VLAN_EG_CONSISTENT));
+		mutex_lock(&priv->reg_mutex);
+		mt7530_setup_vlan0(priv);
+		mutex_unlock(&priv->reg_mutex);
 	}
 }
 
@@ -1852,33 +1909,6 @@ mt7530_port_mdb_del(struct dsa_switch *ds, int port,
 }
 
 static int
-mt7530_vlan_cmd(struct mt7530_priv *priv, enum mt7530_vlan_cmd cmd, u16 vid)
-{
-	struct mt7530_dummy_poll p;
-	u32 val;
-	int ret;
-
-	val = VTCR_BUSY | VTCR_FUNC(cmd) | vid;
-	mt7530_write(priv, MT7530_VTCR, val);
-
-	INIT_MT7530_DUMMY_POLL(&p, priv, MT7530_VTCR);
-	ret = readx_poll_timeout(_mt7530_read, &p, val,
-				 !(val & VTCR_BUSY), 20, 20000);
-	if (ret < 0) {
-		dev_err(priv->dev, "poll timeout\n");
-		return ret;
-	}
-
-	val = mt7530_read(priv, MT7530_VTCR);
-	if (val & VTCR_INVALID) {
-		dev_err(priv->dev, "read VTCR invalid\n");
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
-static int
 mt7530_port_vlan_filtering(struct dsa_switch *ds, int port, bool vlan_filtering,
 			   struct netlink_ext_ack *extack)
 {
@@ -1983,21 +2013,6 @@ mt7530_hw_vlan_update(struct mt7530_priv *priv, u16 vid,
 }
 
 static int
-mt7530_setup_vlan0(struct mt7530_priv *priv)
-{
-	u32 val;
-
-	/* Validate the entry with independent learning, keep the original
-	 * ingress tag attribute.
-	 */
-	val = IVL_MAC | EG_CON | PORT_MEM(MT7530_ALL_MEMBERS) | FID(FID_BRIDGED) |
-	      VLAN_VALID;
-	mt7530_write(priv, MT7530_VAWD1, val);
-
-	return mt7530_vlan_cmd(priv, MT7530_VTCR_WR_VID, 0);
-}
-
-static int
 mt7530_port_vlan_add(struct dsa_switch *ds, int port,
 		     const struct switchdev_obj_port_vlan *vlan,
 		     struct netlink_ext_ack *extack)
@@ -2009,8 +2024,17 @@ mt7530_port_vlan_add(struct dsa_switch *ds, int port,
 
 	mutex_lock(&priv->reg_mutex);
 
+	/* VID 0 is managed exclusively by mt7530_setup_vlan0() for
+	 * VLAN-unaware bridge operation. Don't let the bridge overwrite
+	 * its EG_CON flag with VTAG_EN and corrupt PORT_MEM.
+	 */
+	if (vlan->vid == 0)
+		goto skip_vlan_table;
+
 	mt7530_hw_vlan_entry_init(&new_entry, port, untagged);
 	mt7530_hw_vlan_update(priv, vlan->vid, &new_entry, mt7530_hw_vlan_add);
+
+skip_vlan_table:
 
 	if (pvid) {
 		priv->ports[port].pvid = vlan->vid;
@@ -2051,10 +2075,15 @@ mt7530_port_vlan_del(struct dsa_switch *ds, int port,
 
 	mutex_lock(&priv->reg_mutex);
 
+	/* VID 0 is managed exclusively by mt7530_setup_vlan0(). */
+	if (vlan->vid == 0)
+		goto skip_vlan_table;
+
 	mt7530_hw_vlan_entry_init(&target_entry, port, 0);
 	mt7530_hw_vlan_update(priv, vlan->vid, &target_entry,
 			      mt7530_hw_vlan_del);
 
+skip_vlan_table:
 	/* PVID is being restored to the default whenever the PVID port
 	 * is being removed from the VLAN.
 	 */
@@ -2290,6 +2319,21 @@ static const struct regmap_irq mt7530_irqs[] = {
 	REGMAP_IRQ_REG_LINE(31, 32), /* ACL */
 };
 
+/* Serialize regmap-irq's mask sync like every other regmap user */
+static int mt7530_irq_mask_sync(int index, unsigned int mask_buf_def,
+				unsigned int mask_buf, void *irq_drv_data)
+{
+	struct mt7530_priv *priv = irq_drv_data;
+	int ret;
+
+	mt7530_mutex_lock(priv);
+	ret = regmap_update_bits(priv->regmap, MT7530_SYS_INT_EN,
+				 mask_buf_def, ~mask_buf);
+	mt7530_mutex_unlock(priv);
+
+	return ret;
+}
+
 static const struct regmap_irq_chip mt7530_regmap_irq_chip = {
 	.name = KBUILD_MODNAME,
 	.status_base = MT7530_SYS_INT_STS,
@@ -2299,12 +2343,14 @@ static const struct regmap_irq_chip mt7530_regmap_irq_chip = {
 	.irqs = mt7530_irqs,
 	.num_irqs = ARRAY_SIZE(mt7530_irqs),
 	.num_regs = 1,
+	.handle_mask_sync = mt7530_irq_mask_sync,
 };
 
 static int
 mt7530_setup_irq(struct mt7530_priv *priv)
 {
 	struct regmap_irq_chip_data *irq_data;
+	struct regmap_irq_chip *chip;
 	struct device *dev = priv->dev;
 	struct device_node *np = dev->of_node;
 	int irq, ret;
@@ -2324,10 +2370,17 @@ mt7530_setup_irq(struct mt7530_priv *priv)
 	if (priv->id == ID_MT7530 || priv->id == ID_MT7621)
 		mt7530_set(priv, MT7530_TOP_SIG_CTRL, TOP_SIG_CTRL_NORMAL);
 
+	chip = devm_kmemdup(dev, &mt7530_regmap_irq_chip, sizeof(*chip),
+			    GFP_KERNEL);
+	if (!chip)
+		return -ENOMEM;
+
+	chip->irq_drv_data = priv;
+
 	ret = devm_regmap_add_irq_chip_fwnode(dev, dev_fwnode(dev),
 					      priv->regmap, irq,
 					      IRQF_ONESHOT,
-					      0, &mt7530_regmap_irq_chip,
+					      0, chip,
 					      &irq_data);
 	if (ret)
 		return ret;
@@ -2432,6 +2485,7 @@ mt7530_setup(struct dsa_switch *ds)
 	}
 
 	ds->assisted_learning_on_cpu_port = true;
+	ds->untag_vlan_aware_bridge_pvid = true;
 	ds->mtu_enforcement_ingress = true;
 	ds->ageing_time_min = 2 * 1000;
 	ds->ageing_time_max = (AGE_CNT_MAX + 1) * (AGE_UNIT_MAX + 1) * 1000;
@@ -2623,6 +2677,7 @@ mt7531_setup_common(struct dsa_switch *ds)
 	int ret, i;
 
 	ds->assisted_learning_on_cpu_port = true;
+	ds->untag_vlan_aware_bridge_pvid = true;
 	ds->mtu_enforcement_ingress = true;
 	ds->ageing_time_min = 2 * 1000;
 	ds->ageing_time_max = (AGE_CNT_MAX + 1) * (AGE_UNIT_MAX + 1) * 1000;
@@ -3374,7 +3429,7 @@ static int mt7988_setup(struct dsa_switch *ds)
 	return mt7531_setup_common(ds);
 }
 
-const struct dsa_switch_ops mt7530_switch_ops = {
+static const struct dsa_switch_ops mt7530_switch_ops = {
 	.get_tag_protocol	= mtk_get_tag_protocol,
 	.setup			= mt753x_setup,
 	.teardown		= mt753x_teardown,
@@ -3411,8 +3466,9 @@ const struct dsa_switch_ops mt7530_switch_ops = {
 	.set_mac_eee		= mt753x_set_mac_eee,
 	.conduit_state_change	= mt753x_conduit_state_change,
 	.port_setup_tc		= mt753x_setup_tc,
+	.port_hsr_join		= dsa_port_simple_hsr_join,
+	.port_hsr_leave		= dsa_port_simple_hsr_leave,
 };
-EXPORT_SYMBOL_GPL(mt7530_switch_ops);
 
 static const struct phylink_mac_ops mt753x_phylink_mac_ops = {
 	.mac_select_pcs	= mt753x_phylink_mac_select_pcs,

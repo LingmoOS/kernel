@@ -77,6 +77,7 @@ struct veth_priv {
 	struct bpf_prog		*_xdp_prog;
 	struct veth_rq		*rq;
 	unsigned int		requested_headroom;
+	netdevice_tracker	peer_tracker;
 };
 
 struct veth_xdp_tx_bq {
@@ -1339,7 +1340,7 @@ static int veth_set_channels(struct net_device *dev,
 		if (peer)
 			netif_carrier_off(peer);
 
-		/* try to allocate new resurces, as needed*/
+		/* try to allocate new resources, as needed*/
 		err = veth_enable_range_safe(dev, old_rx_count, new_rx_count);
 		if (err)
 			goto out;
@@ -1446,8 +1447,8 @@ static int veth_alloc_queues(struct net_device *dev)
 	struct veth_priv *priv = netdev_priv(dev);
 	int i;
 
-	priv->rq = kvcalloc(dev->num_rx_queues, sizeof(*priv->rq),
-			    GFP_KERNEL_ACCOUNT | __GFP_RETRY_MAYFAIL);
+	priv->rq = kvzalloc_objs(*priv->rq, dev->num_rx_queues,
+				 GFP_KERNEL_ACCOUNT | __GFP_RETRY_MAYFAIL);
 	if (!priv->rq)
 		return -ENOMEM;
 
@@ -1621,10 +1622,9 @@ static int veth_xdp_set(struct net_device *dev, struct bpf_prog *prog,
 			}
 		}
 
-		if (!old_prog) {
+		if (!old_prog)
 			peer->hw_features &= ~NETIF_F_GSO_SOFTWARE;
-			peer->max_mtu = max_mtu;
-		}
+		peer->max_mtu = max_mtu;
 
 		xdp_features_set_redirect_target(peer, true);
 	}
@@ -1910,15 +1910,17 @@ static int veth_newlink(struct net_device *dev,
 
 	priv = netdev_priv(dev);
 	rcu_assign_pointer(priv->peer, peer);
+	netdev_hold(peer, &priv->peer_tracker, GFP_KERNEL);
 	err = veth_init_queues(dev, tb);
 	if (err)
 		goto err_queues;
 
 	priv = netdev_priv(peer);
 	rcu_assign_pointer(priv->peer, dev);
+	netdev_hold(dev, &priv->peer_tracker, GFP_KERNEL);
 	err = veth_init_queues(peer, tb);
 	if (err)
-		goto err_queues;
+		goto err_peer_queues;
 
 	veth_disable_gro(dev);
 	/* update XDP supported features */
@@ -1927,7 +1929,11 @@ static int veth_newlink(struct net_device *dev,
 
 	return 0;
 
+err_peer_queues:
+	netdev_put(dev, &priv->peer_tracker);
+	priv = netdev_priv(dev);
 err_queues:
+	netdev_put(peer, &priv->peer_tracker);
 	unregister_netdevice(dev);
 err_register_dev:
 	/* nothing to do */
@@ -1942,24 +1948,25 @@ err_register_peer:
 
 static void veth_dellink(struct net_device *dev, struct list_head *head)
 {
-	struct veth_priv *priv;
+	netdevice_tracker *peer_tracker;
 	struct net_device *peer;
+	struct veth_priv *priv;
 
 	priv = netdev_priv(dev);
-	peer = rtnl_dereference(priv->peer);
+	peer_tracker = &priv->peer_tracker;
+	peer = unrcu_pointer(xchg(&priv->peer, NULL));
+	if (!peer)
+		return;
 
-	/* Note : dellink() is called from default_device_exit_batch(),
-	 * before a rcu_synchronize() point. The devices are guaranteed
-	 * not being freed before one RCU grace period.
-	 */
-	RCU_INIT_POINTER(priv->peer, NULL);
 	unregister_netdevice_queue(dev, head);
 
-	if (peer) {
-		priv = netdev_priv(peer);
-		RCU_INIT_POINTER(priv->peer, NULL);
-		unregister_netdevice_queue(peer, head);
-	}
+	priv = netdev_priv(peer);
+	dev = unrcu_pointer(xchg(&priv->peer, NULL));
+	if (dev)
+		unregister_netdevice_queue_net(dev_net(dev), peer, head);
+
+	netdev_put(peer, peer_tracker);
+	netdev_put(dev, &priv->peer_tracker);
 }
 
 static const struct nla_policy veth_policy[VETH_INFO_MAX + 1] = {

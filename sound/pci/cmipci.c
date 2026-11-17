@@ -1096,7 +1096,7 @@ static int save_mixer_state(struct cmipci *cm)
 		struct snd_ctl_elem_value *val;
 		unsigned int i;
 
-		val = kmalloc(sizeof(*val), GFP_KERNEL);
+		val = kmalloc_obj(*val);
 		if (!val)
 			return -ENOMEM;
 		for (i = 0; i < CM_SAVED_MIXERS; i++) {
@@ -1130,7 +1130,7 @@ static void restore_mixer_state(struct cmipci *cm)
 		struct snd_ctl_elem_value *val;
 		unsigned int i;
 
-		val = kmalloc(sizeof(*val), GFP_KERNEL);
+		val = kmalloc_obj(*val);
 		if (!val)
 			return;
 		cm->mixer_insensitive = 0; /* at first clear this;
@@ -2727,12 +2727,12 @@ static void snd_cmipci_proc_init(struct cmipci *cm)
 }
 
 static const struct pci_device_id snd_cmipci_ids[] = {
-	{PCI_VDEVICE(CMEDIA, PCI_DEVICE_ID_CMEDIA_CM8338A), 0},
-	{PCI_VDEVICE(CMEDIA, PCI_DEVICE_ID_CMEDIA_CM8338B), 0},
-	{PCI_VDEVICE(CMEDIA, PCI_DEVICE_ID_CMEDIA_CM8738), 0},
-	{PCI_VDEVICE(CMEDIA, PCI_DEVICE_ID_CMEDIA_CM8738B), 0},
-	{PCI_VDEVICE(AL, PCI_DEVICE_ID_CMEDIA_CM8738), 0},
-	{0,},
+	{PCI_VDEVICE(CMEDIA, PCI_DEVICE_ID_CMEDIA_CM8338A) },
+	{PCI_VDEVICE(CMEDIA, PCI_DEVICE_ID_CMEDIA_CM8338B) },
+	{PCI_VDEVICE(CMEDIA, PCI_DEVICE_ID_CMEDIA_CM8738) },
+	{PCI_VDEVICE(CMEDIA, PCI_DEVICE_ID_CMEDIA_CM8738B) },
+	{PCI_VDEVICE(AL, PCI_DEVICE_ID_CMEDIA_CM8738) },
+	{ }
 };
 
 

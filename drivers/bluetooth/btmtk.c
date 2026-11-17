@@ -188,7 +188,7 @@ int btmtk_setup_firmware_79xx(struct hci_dev *hdev, const char *fwname,
 				       MTK_FW_ROM_PATCH_GD_SIZE +
 				       MTK_FW_ROM_PATCH_SEC_MAP_SIZE * i +
 				       MTK_SEC_MAP_COMMON_SIZE,
-				       MTK_SEC_MAP_NEED_SEND_SIZE + 1);
+				       MTK_SEC_MAP_NEED_SEND_SIZE);
 
 				wmt_params.op = BTMTK_WMT_PATCH_DWNLD;
 				wmt_params.status = &status;
@@ -218,9 +218,14 @@ int btmtk_setup_firmware_79xx(struct hci_dev *hdev, const char *fwname,
 				}
 			}
 
+			/* If retry exhausted goto err_release_fw */
+			if (retry == 0) {
+				err = -EIO;
+				goto err_release_fw;
+			}
+
 			fw_ptr += section_offset;
 			wmt_params.op = BTMTK_WMT_PATCH_DWNLD;
-			wmt_params.status = NULL;
 
 			while (dl_size > 0) {
 				dlen = min_t(int, 250, dl_size);
@@ -238,7 +243,14 @@ int btmtk_setup_firmware_79xx(struct hci_dev *hdev, const char *fwname,
 				wmt_params.data = fw_ptr;
 
 				err = wmt_cmd_sync(hdev, &wmt_params);
-				if (err < 0) {
+				/* Status BTMTK_WMT_PATCH_PROGRESS indicates firmware is
+				 * in process of being downloaded, which is not expected to
+				 * occur here.
+				 */
+				if (status == BTMTK_WMT_PATCH_PROGRESS) {
+					err = -EIO;
+					goto err_release_fw;
+				} else if (err < 0) {
 					bt_dev_err(hdev, "Failed to send wmt patch dwnld (%d)",
 						   err);
 					goto err_release_fw;
@@ -567,7 +579,7 @@ static int btmtk_usb_submit_wmt_recv_urb(struct hci_dev *hdev)
 	if (!urb)
 		return -ENOMEM;
 
-	dr = kmalloc(sizeof(*dr), GFP_KERNEL);
+	dr = kmalloc_obj(*dr);
 	if (!dr) {
 		usb_free_urb(urb);
 		return -ENOMEM;
@@ -1023,40 +1035,22 @@ static int __set_mtk_intr_interface(struct hci_dev *hdev)
 {
 	struct btmtk_data *btmtk_data = hci_get_priv(hdev);
 	struct usb_interface *intf = btmtk_data->isopkt_intf;
-	int i, err;
+	int err;
 
 	if (!btmtk_data->isopkt_intf)
 		return -ENODEV;
 
-	err = usb_set_interface(btmtk_data->udev, MTK_ISO_IFNUM, 1);
+	err = usb_set_interface(btmtk_data->udev, MTK_ISO_IFNUM,
+			       (intf->num_altsetting > 1) ? 1 : 0);
 	if (err < 0) {
 		bt_dev_err(hdev, "setting interface failed (%d)", -err);
 		return err;
 	}
 
-	btmtk_data->isopkt_tx_ep = NULL;
-	btmtk_data->isopkt_rx_ep = NULL;
-
-	for (i = 0; i < intf->cur_altsetting->desc.bNumEndpoints; i++) {
-		struct usb_endpoint_descriptor *ep_desc;
-
-		ep_desc = &intf->cur_altsetting->endpoint[i].desc;
-
-		if (!btmtk_data->isopkt_tx_ep &&
-		    usb_endpoint_is_int_out(ep_desc)) {
-			btmtk_data->isopkt_tx_ep = ep_desc;
-			continue;
-		}
-
-		if (!btmtk_data->isopkt_rx_ep &&
-		    usb_endpoint_is_int_in(ep_desc)) {
-			btmtk_data->isopkt_rx_ep = ep_desc;
-			continue;
-		}
-	}
-
-	if (!btmtk_data->isopkt_tx_ep ||
-	    !btmtk_data->isopkt_rx_ep) {
+	err = usb_find_common_endpoints(intf->cur_altsetting, NULL, NULL,
+					&btmtk_data->isopkt_rx_ep,
+					&btmtk_data->isopkt_tx_ep);
+	if (err) {
 		bt_dev_err(hdev, "invalid interrupt descriptors");
 		return -ENODEV;
 	}
@@ -1385,16 +1379,6 @@ int btmtk_usb_setup(struct hci_dev *hdev)
 		break;
 	case 0x7922:
 	case 0x7925:
-		/*
-		 * A remote wakeup could cause the device completely unresponsive, and
-		 * recovering from such a state needs a power cycle.
-		 *
-		 * Since the remote wakeup capability is super broken, just disable it
-		 * to get rid of the troubles. The device can still be autosuspended
-		 * when the bluetooth interface is closed.
-		 */
-		device_set_wakeup_capable(&btmtk_data->udev->dev, false);
-		fallthrough;
 	case 0x7961:
 	case 0x7902:
 	case 0x6639:
@@ -1405,6 +1389,9 @@ int btmtk_usb_setup(struct hci_dev *hdev)
 						btmtk_usb_hci_wmt_sync,
 						dev_id);
 		if (err < 0) {
+			/* retry once if setup firmware error */
+			if (!test_and_set_bit(BTMTK_FIRMWARE_DL_RETRY, &btmtk_data->flags))
+				btmtk_reset_sync(hdev);
 			bt_dev_err(hdev, "Failed to set up firmware (%d)", err);
 			return err;
 		}
@@ -1431,6 +1418,9 @@ int btmtk_usb_setup(struct hci_dev *hdev)
 
 		hci_set_msft_opcode(hdev, 0xFD30);
 		hci_set_aosp_capable(hdev);
+
+		/* Clear BTMTK_FIRMWARE_DL_RETRY if setup successfully */
+		test_and_clear_bit(BTMTK_FIRMWARE_DL_RETRY, &btmtk_data->flags);
 
 		/* Set up ISO interface after protocol enabled */
 		if (test_bit(BTMTK_ISOPKT_OVER_INTR, &btmtk_data->flags)) {
@@ -1557,6 +1547,29 @@ int btmtk_usb_shutdown(struct hci_dev *hdev)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(btmtk_usb_shutdown);
+
+int btmtk_recv_event(struct hci_dev *hdev, struct sk_buff *skb)
+{
+	struct hci_event_hdr *hdr = (void *)skb->data;
+	struct hci_ev_cmd_complete *ec;
+
+	if (hdr->evt == HCI_EV_CMD_COMPLETE &&
+	    skb->len >= HCI_EVENT_HDR_SIZE + sizeof(*ec)) {
+		u16 opcode;
+
+		ec = (void *)(skb->data + HCI_EVENT_HDR_SIZE);
+		opcode = __le16_to_cpu(ec->opcode);
+
+		/* Filter vendor opcode */
+		if (opcode == 0xfc5d) {
+			kfree_skb(skb);
+			return 0;
+		}
+	}
+
+	return hci_recv_frame(hdev, skb);
+}
+EXPORT_SYMBOL_GPL(btmtk_recv_event);
 #endif
 
 MODULE_AUTHOR("Sean Wang <sean.wang@mediatek.com>");

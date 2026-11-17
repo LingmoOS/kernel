@@ -110,7 +110,7 @@ struct net_dm_alert_ops {
 	void (*kfree_skb_probe)(void *ignore, struct sk_buff *skb,
 				void *location,
 				enum skb_drop_reason reason,
-				struct sock *rx_sk);
+				const struct sock *rx_sk);
 	void (*napi_poll_probe)(void *ignore, struct napi_struct *napi,
 				int work, int budget);
 	void (*work_item_func)(struct work_struct *work);
@@ -265,7 +265,7 @@ out:
 static void trace_kfree_skb_hit(void *ignore, struct sk_buff *skb,
 				void *location,
 				enum skb_drop_reason reason,
-				struct sock *rx_sk)
+				const struct sock *rx_sk)
 {
 	trace_drop_common(skb, location);
 }
@@ -305,8 +305,7 @@ net_dm_hw_reset_per_cpu_data(struct per_cpu_dm_data *hw_data)
 	struct net_dm_hw_entries *hw_entries;
 	unsigned long flags;
 
-	hw_entries = kzalloc(struct_size(hw_entries, entries, dm_hit_limit),
-			     GFP_KERNEL);
+	hw_entries = kzalloc_flex(*hw_entries, entries, dm_hit_limit);
 	if (!hw_entries) {
 		/* If the memory allocation failed, we try to perform another
 		 * allocation in 1/10 second. Otherwise, the probe function
@@ -448,7 +447,7 @@ net_dm_hw_trap_summary_probe(void *ignore, const struct devlink *devlink,
 	if (metadata->trap_type == DEVLINK_TRAP_TYPE_CONTROL)
 		return;
 
-	hw_data = this_cpu_ptr(&dm_hw_cpu_data);
+	hw_data = raw_cpu_ptr(&dm_hw_cpu_data);
 	raw_spin_lock_irqsave(&hw_data->lock, flags);
 	hw_entries = hw_data->hw_entries;
 
@@ -493,7 +492,7 @@ static void net_dm_packet_trace_kfree_skb_hit(void *ignore,
 					      struct sk_buff *skb,
 					      void *location,
 					      enum skb_drop_reason reason,
-					      struct sock *rx_sk)
+					      const struct sock *rx_sk)
 {
 	ktime_t tstamp = ktime_get_real();
 	struct per_cpu_dm_data *data;
@@ -516,7 +515,7 @@ static void net_dm_packet_trace_kfree_skb_hit(void *ignore,
 	 */
 	nskb->tstamp = tstamp;
 
-	data = this_cpu_ptr(&dm_cpu_data);
+	data = raw_cpu_ptr(&dm_cpu_data);
 
 	spin_lock_irqsave(&data->drop_queue.lock, flags);
 	if (skb_queue_len(&data->drop_queue) < net_dm_queue_len)
@@ -851,7 +850,7 @@ net_dm_hw_metadata_copy(const struct devlink_trap_metadata *metadata)
 	const char *trap_group_name;
 	const char *trap_name;
 
-	hw_metadata = kzalloc(sizeof(*hw_metadata), GFP_ATOMIC);
+	hw_metadata = kzalloc_obj(*hw_metadata, GFP_ATOMIC);
 	if (!hw_metadata)
 		return NULL;
 
@@ -983,7 +982,7 @@ net_dm_hw_trap_packet_probe(void *ignore, const struct devlink *devlink,
 	NET_DM_SKB_CB(nskb)->hw_metadata = n_hw_metadata;
 	nskb->tstamp = tstamp;
 
-	hw_data = this_cpu_ptr(&dm_hw_cpu_data);
+	hw_data = raw_cpu_ptr(&dm_hw_cpu_data);
 
 	spin_lock_irqsave(&hw_data->drop_queue.lock, flags);
 	if (skb_queue_len(&hw_data->drop_queue) < net_dm_queue_len)
@@ -1579,7 +1578,7 @@ static int dropmon_net_event(struct notifier_block *ev_block,
 	case NETDEV_REGISTER:
 		if (WARN_ON_ONCE(rtnl_dereference(dev->dm_private)))
 			break;
-		stat = kzalloc(sizeof(*stat), GFP_KERNEL);
+		stat = kzalloc_obj(*stat);
 		if (!stat)
 			break;
 

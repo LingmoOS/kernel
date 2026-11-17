@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#define pr_fmt(fmt) "zram: lzo-rle: " fmt
+
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/lzo.h>
@@ -12,6 +14,14 @@ static void lzorle_release_params(struct zcomp_params *params)
 
 static int lzorle_setup_params(struct zcomp_params *params)
 {
+	if (params->dict_sz) {
+		pr_err("dictionary is not supported\n");
+		return -EOPNOTSUPP;
+	}
+	if (params->level != ZCOMP_PARAM_NOT_SET) {
+		pr_err("compression level is not supported\n");
+		return -EOPNOTSUPP;
+	}
 	return 0;
 }
 
@@ -51,8 +61,8 @@ static int lzorle_decompress(struct zcomp_params *params, struct zcomp_ctx *ctx,
 const struct zcomp_ops backend_lzorle = {
 	.compress	= lzorle_compress,
 	.decompress	= lzorle_decompress,
-	.create_ctx	= lzorle_create,
-	.destroy_ctx	= lzorle_destroy,
+	.create_cctx	= lzorle_create,
+	.destroy_cctx	= lzorle_destroy,
 	.setup_params	= lzorle_setup_params,
 	.release_params	= lzorle_release_params,
 	.name		= "lzo-rle",

@@ -1684,7 +1684,7 @@ static struct usb_function_instance *ncm_alloc_inst(void)
 	char *names[1];
 	struct config_group *ncm_interf_group;
 
-	opts = kzalloc(sizeof(*opts), GFP_KERNEL);
+	opts = kzalloc_obj(*opts);
 	if (!opts)
 		return ERR_PTR(-ENOMEM);
 	opts->ncm_os_desc.ext_compat_id = opts->ncm_ext_compat_id;
@@ -1766,7 +1766,7 @@ static struct usb_function *ncm_alloc(struct usb_function_instance *fi)
 	int status;
 
 	/* allocate and initialize one new instance */
-	ncm = kzalloc(sizeof(*ncm), GFP_KERNEL);
+	ncm = kzalloc_obj(*ncm);
 	if (!ncm)
 		return ERR_PTR(-ENOMEM);
 

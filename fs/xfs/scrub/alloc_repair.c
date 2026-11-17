@@ -3,7 +3,7 @@
  * Copyright (C) 2018-2023 Oracle.  All Rights Reserved.
  * Author: Darrick J. Wong <djwong@kernel.org>
  */
-#include "xfs.h"
+#include "xfs_platform.h"
 #include "xfs_fs.h"
 #include "xfs_shared.h"
 #include "xfs_format.h"
@@ -341,7 +341,7 @@ xrep_cntbt_extent_cmp(
 }
 
 /*
- * Sort the free extents by length so so that we can put the records into the
+ * Sort the free extents by length so that we can put the records into the
  * cntbt in the correct order.  Don't let userspace kill us if we're resorting
  * after allocating btree blocks.
  */
@@ -861,7 +861,7 @@ xrep_allocbt(
 	if (!xfs_has_rmapbt(mp))
 		return -EOPNOTSUPP;
 
-	ra = kzalloc(sizeof(struct xrep_abt), XCHK_GFP_FLAGS);
+	ra = kzalloc_obj(struct xrep_abt, XCHK_GFP_FLAGS);
 	if (!ra)
 		return -ENOMEM;
 	ra->sc = sc;

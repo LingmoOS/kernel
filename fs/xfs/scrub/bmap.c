@@ -3,7 +3,7 @@
  * Copyright (C) 2017-2023 Oracle.  All Rights Reserved.
  * Author: Darrick J. Wong <djwong@kernel.org>
  */
-#include "xfs.h"
+#include "xfs_platform.h"
 #include "xfs_fs.h"
 #include "xfs_shared.h"
 #include "xfs_format.h"
@@ -205,7 +205,7 @@ xchk_bmap_xref_rmap(
 {
 	struct xfs_rmap_irec	rmap;
 	unsigned long long	rmap_end;
-	uint64_t		owner = info->sc->ip->i_ino;
+	uint64_t		owner = I_INO(info->sc->ip);
 
 	if (xchk_skip_xref(info->sc->sm))
 		return;
@@ -543,7 +543,7 @@ xchk_bmapbt_rec(
 		for (i = 0; i < bs->cur->bc_nlevels - 1; i++) {
 			block = xfs_btree_get_block(bs->cur, i, &bp);
 			owner = be64_to_cpu(block->bb_u.l.bb_owner);
-			if (owner != ip->i_ino)
+			if (owner != I_INO(ip))
 				xchk_fblock_set_corrupt(bs->sc,
 						info->whichfork, 0);
 		}
@@ -600,7 +600,7 @@ xchk_bmap_btree(
 
 	/* Check the btree structure. */
 	cur = xfs_bmbt_init_cursor(mp, sc->tp, ip, whichfork);
-	xfs_rmap_ino_bmbt_owner(&oinfo, ip->i_ino, whichfork);
+	xfs_rmap_inode_bmbt_owner(&oinfo, ip, whichfork);
 	error = xchk_btree(sc, cur, xchk_bmapbt_rec, &oinfo, info);
 	xfs_btree_del_cursor(cur, error);
 out:
@@ -632,7 +632,7 @@ xchk_bmap_check_rmap(
 		return error;
 
 	/* Is this even the right fork? */
-	if (rec->rm_owner != sc->ip->i_ino)
+	if (rec->rm_owner != I_INO(sc->ip))
 		return 0;
 	if ((sbcri->whichfork == XFS_ATTR_FORK) ^
 	    !!(rec->rm_flags & XFS_RMAP_ATTR_FORK))
@@ -1010,7 +1010,7 @@ xchk_bmap_iext_iter(
 	 */
 	if (nr > 1 && info->whichfork != XFS_COW_FORK &&
 	    howmany_64(irec->br_blockcount, XFS_MAX_BMBT_EXTLEN) < nr)
-		xchk_ino_set_preen(info->sc, info->sc->ip->i_ino);
+		xchk_ino_set_preen(info->sc, I_INO(info->sc->ip));
 
 	return true;
 }
@@ -1110,8 +1110,9 @@ xchk_bmap(
 	 * the rmap must match the combined mapping exactly.
 	 */
 	while (xchk_bmap_iext_iter(&info, &irec)) {
-		if (xchk_should_terminate(sc, &error) ||
-		    (sc->sm->sm_flags & XFS_SCRUB_OFLAG_CORRUPT))
+		if (xchk_should_terminate(sc, &error))
+			return error;
+		if (sc->sm->sm_flags & XFS_SCRUB_OFLAG_CORRUPT)
 			return 0;
 
 		if (irec.br_startoff >= endoff) {

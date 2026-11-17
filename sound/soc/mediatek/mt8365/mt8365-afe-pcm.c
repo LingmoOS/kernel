@@ -1256,8 +1256,7 @@ static int mt8365_afe_cm2_io_input_mux_get(struct snd_kcontrol *kcontrol,
 static int mt8365_afe_cm2_io_input_mux_put(struct snd_kcontrol *kcontrol,
 					   struct snd_ctl_elem_value *ucontrol)
 {
-	struct snd_soc_dapm_context *dapm =
-		snd_soc_dapm_kcontrol_dapm(kcontrol);
+	struct snd_soc_dapm_context *dapm = snd_soc_dapm_kcontrol_to_dapm(kcontrol);
 	struct snd_soc_component *comp = snd_soc_dapm_to_component(dapm);
 	struct mtk_base_afe *afe = snd_soc_component_get_drvdata(comp);
 	struct mt8365_afe_private *afe_priv = afe->platform_priv;
@@ -2121,19 +2120,15 @@ static int mt8365_afe_pcm_dev_probe(struct platform_device *pdev)
 	spin_lock_init(&afe_priv->afe_ctrl_lock);
 	mutex_init(&afe_priv->afe_clk_mutex);
 
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	afe->base_addr = devm_ioremap_resource(&pdev->dev, res);
+	afe->base_addr = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(afe->base_addr))
 		return PTR_ERR(afe->base_addr);
 
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
-	if (res) {
-		afe_priv->afe_sram_vir_addr =
-			devm_ioremap_resource(&pdev->dev, res);
-		if (!IS_ERR(afe_priv->afe_sram_vir_addr)) {
-			afe_priv->afe_sram_phy_addr = res->start;
-			afe_priv->afe_sram_size = resource_size(res);
-		}
+	afe_priv->afe_sram_vir_addr =
+		devm_platform_get_and_ioremap_resource(pdev, 1, &res);
+	if (!IS_ERR(afe_priv->afe_sram_vir_addr)) {
+		afe_priv->afe_sram_phy_addr = res->start;
+		afe_priv->afe_sram_size = resource_size(res);
 	}
 
 	/* initial audio related clock */

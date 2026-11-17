@@ -3412,11 +3412,11 @@ static int dspxfr_image(struct hda_codec *codec,
 	if (fls_data == NULL)
 		return -EINVAL;
 
-	dma_engine = kzalloc(sizeof(*dma_engine), GFP_KERNEL);
+	dma_engine = kzalloc_obj(*dma_engine);
 	if (!dma_engine)
 		return -ENOMEM;
 
-	dma_engine->dmab = kzalloc(sizeof(*dma_engine->dmab), GFP_KERNEL);
+	dma_engine->dmab = kzalloc_obj(*dma_engine->dmab);
 	if (!dma_engine->dmab) {
 		kfree(dma_engine);
 		return -ENOMEM;
@@ -3775,22 +3775,12 @@ static void ca0132_gpio_setup(struct hda_codec *codec)
 
 	switch (ca0132_quirk(spec)) {
 	case QUIRK_SBZ:
-		snd_hda_codec_write(codec, 0x01, 0,
-				AC_VERB_SET_GPIO_DIRECTION, 0x07);
-		snd_hda_codec_write(codec, 0x01, 0,
-				AC_VERB_SET_GPIO_MASK, 0x07);
-		snd_hda_codec_write(codec, 0x01, 0,
-				AC_VERB_SET_GPIO_DATA, 0x04);
+		snd_hda_codec_set_gpio(codec, 0x07, 0x07, 0x04, 0);
 		snd_hda_codec_write(codec, 0x01, 0,
 				AC_VERB_SET_GPIO_DATA, 0x06);
 		break;
 	case QUIRK_R3DI:
-		snd_hda_codec_write(codec, 0x01, 0,
-				AC_VERB_SET_GPIO_DIRECTION, 0x1E);
-		snd_hda_codec_write(codec, 0x01, 0,
-				AC_VERB_SET_GPIO_MASK, 0x1F);
-		snd_hda_codec_write(codec, 0x01, 0,
-				AC_VERB_SET_GPIO_DATA, 0x0C);
+		snd_hda_codec_set_gpio(codec, 0x1F, 0x1E, 0x0C, 0);
 		break;
 	default:
 		break;
@@ -5528,6 +5518,30 @@ static int zxr_headphone_gain_set(struct hda_codec *codec, long val)
 	return 0;
 }
 
+/*
+ * Manual output selection (HP/Speaker Playback Switch or alt Output Select)
+ * is meaningful only when HP/Speaker auto-detect is disabled, since the
+ * select_out path always prefers jack presence when auto-detect is on. When
+ * the user explicitly chooses an output, turn auto-detect off so the manual
+ * choice actually takes effect, and notify userspace so the auto-detect
+ * control reflects the new state.
+ */
+static void ca0132_disable_hp_auto_detect(struct hda_codec *codec)
+{
+	struct ca0132_spec *spec = codec->spec;
+	struct snd_kcontrol *kctl;
+
+	if (!spec->vnode_lswitch[VNID_HP_ASEL - VNODE_START_NID])
+		return;
+
+	spec->vnode_lswitch[VNID_HP_ASEL - VNODE_START_NID] = 0;
+	kctl = snd_hda_find_mixer_ctl(codec,
+				      "HP/Speaker Auto Detect Playback Switch");
+	if (kctl)
+		snd_ctl_notify(codec->card, SNDRV_CTL_EVENT_MASK_VALUE,
+			       &kctl->id);
+}
+
 static int ca0132_vnode_switch_set(struct snd_kcontrol *kcontrol,
 				struct snd_ctl_elem_value *ucontrol)
 {
@@ -5540,14 +5554,11 @@ static int ca0132_vnode_switch_set(struct snd_kcontrol *kcontrol,
 	int auto_jack;
 
 	if (nid == VNID_HP_SEL) {
-		auto_jack =
-			spec->vnode_lswitch[VNID_HP_ASEL - VNODE_START_NID];
-		if (!auto_jack) {
-			if (ca0132_use_alt_functions(spec))
-				ca0132_alt_select_out(codec);
-			else
-				ca0132_select_out(codec);
-		}
+		ca0132_disable_hp_auto_detect(codec);
+		if (ca0132_use_alt_functions(spec))
+			ca0132_alt_select_out(codec);
+		else
+			ca0132_select_out(codec);
 		return 1;
 	}
 
@@ -5777,7 +5788,8 @@ static int ca0132_alt_mic_boost_info(struct snd_kcontrol *kcontrol,
 	uinfo->value.enumerated.items = MIC_BOOST_NUM_OF_STEPS;
 	if (uinfo->value.enumerated.item >= MIC_BOOST_NUM_OF_STEPS)
 		uinfo->value.enumerated.item = MIC_BOOST_NUM_OF_STEPS - 1;
-	sprintf(namestr, "%d %s", (uinfo->value.enumerated.item * 10), sfx);
+	snprintf(namestr, sizeof(namestr), "%d %s",
+		 (uinfo->value.enumerated.item * 10), sfx);
 	strscpy(uinfo->value.enumerated.name, namestr);
 	return 0;
 }
@@ -5829,9 +5841,9 @@ static int ae5_headphone_gain_info(struct snd_kcontrol *kcontrol,
 	uinfo->value.enumerated.items = AE5_HEADPHONE_GAIN_MAX;
 	if (uinfo->value.enumerated.item >= AE5_HEADPHONE_GAIN_MAX)
 		uinfo->value.enumerated.item = AE5_HEADPHONE_GAIN_MAX - 1;
-	sprintf(namestr, "%s %s",
-		ae5_headphone_gain_presets[uinfo->value.enumerated.item].name,
-		sfx);
+	snprintf(namestr, sizeof(namestr), "%s %s",
+		 ae5_headphone_gain_presets[uinfo->value.enumerated.item].name,
+		 sfx);
 	strscpy(uinfo->value.enumerated.name, namestr);
 	return 0;
 }
@@ -5883,8 +5895,8 @@ static int ae5_sound_filter_info(struct snd_kcontrol *kcontrol,
 	uinfo->value.enumerated.items = AE5_SOUND_FILTER_MAX;
 	if (uinfo->value.enumerated.item >= AE5_SOUND_FILTER_MAX)
 		uinfo->value.enumerated.item = AE5_SOUND_FILTER_MAX - 1;
-	sprintf(namestr, "%s",
-			ae5_filter_presets[uinfo->value.enumerated.item].name);
+	snprintf(namestr, sizeof(namestr), "%s",
+		 ae5_filter_presets[uinfo->value.enumerated.item].name);
 	strscpy(uinfo->value.enumerated.name, namestr);
 	return 0;
 }
@@ -6008,7 +6020,6 @@ static int ca0132_alt_output_select_put(struct snd_kcontrol *kcontrol,
 	struct ca0132_spec *spec = codec->spec;
 	int sel = ucontrol->value.enumerated.item[0];
 	unsigned int items = NUM_OF_OUTPUTS;
-	unsigned int auto_jack;
 
 	if (sel >= items)
 		return 0;
@@ -6018,10 +6029,8 @@ static int ca0132_alt_output_select_put(struct snd_kcontrol *kcontrol,
 
 	spec->out_enum_val = sel;
 
-	auto_jack = spec->vnode_lswitch[VNID_HP_ASEL - VNODE_START_NID];
-
-	if (!auto_jack)
-		ca0132_alt_select_out(codec);
+	ca0132_disable_hp_auto_detect(codec);
+	ca0132_alt_select_out(codec);
 
 	return 1;
 }
@@ -6624,7 +6633,7 @@ static int ca0132_alt_add_effect_slider(struct hda_codec *codec, hda_nid_t nid,
 	struct snd_kcontrol_new knew =
 		HDA_CODEC_VOLUME_MONO(namestr, nid, 1, 0, type);
 
-	sprintf(namestr, "FX: %s %s Volume", pfx, dirstr[dir]);
+	snprintf(namestr, sizeof(namestr), "FX: %s %s Volume", pfx, dirstr[dir]);
 
 	knew.tlv.c = NULL;
 
@@ -6663,9 +6672,9 @@ static int add_fx_switch(struct hda_codec *codec, hda_nid_t nid,
 	 * prefix to OutFX or InFX enable controls.
 	 */
 	if (ca0132_use_alt_controls(spec) && (nid <= IN_EFFECT_END_NID))
-		sprintf(namestr, "FX: %s %s Switch", pfx, dirstr[dir]);
+		snprintf(namestr, sizeof(namestr), "FX: %s %s Switch", pfx, dirstr[dir]);
 	else
-		sprintf(namestr, "%s %s Switch", pfx, dirstr[dir]);
+		snprintf(namestr, sizeof(namestr), "%s %s Switch", pfx, dirstr[dir]);
 
 	return snd_hda_ctl_add(codec, nid, snd_ctl_new1(&knew, codec));
 }
@@ -8522,10 +8531,9 @@ static void ca0132_set_dsp_msr(struct hda_codec *codec, bool is96k)
 
 static bool ca0132_download_dsp_images(struct hda_codec *codec)
 {
-	bool dsp_loaded = false;
 	struct ca0132_spec *spec = codec->spec;
 	const struct dsp_image_seg *dsp_os_image;
-	const struct firmware *fw_entry = NULL;
+	const struct firmware *fw_entry __free(firmware) = NULL;
 	/*
 	 * Alternate firmwares for different variants. The Recon3Di apparently
 	 * can use the default firmware, but I'll leave the option in case
@@ -8565,15 +8573,10 @@ static bool ca0132_download_dsp_images(struct hda_codec *codec)
 	dsp_os_image = (struct dsp_image_seg *)(fw_entry->data);
 	if (dspload_image(codec, dsp_os_image, 0, 0, true, 0)) {
 		codec_err(codec, "ca0132 DSP load image failed\n");
-		goto exit_download;
+		return false;
 	}
 
-	dsp_loaded = dspload_wait_loaded(codec);
-
-exit_download:
-	release_firmware(fw_entry);
-
-	return dsp_loaded;
+	return dspload_wait_loaded(codec);
 }
 
 static void ca0132_download_dsp(struct hda_codec *codec)
@@ -9626,6 +9629,7 @@ static void ca0132_free(struct hda_codec *codec)
 #endif
 	kfree(spec->spec_init_verbs);
 	kfree(codec->spec);
+	codec->spec = NULL;
 }
 
 static void dbpro_free(struct hda_codec *codec)
@@ -9636,6 +9640,7 @@ static void dbpro_free(struct hda_codec *codec)
 
 	kfree(spec->spec_init_verbs);
 	kfree(codec->spec);
+	codec->spec = NULL;
 }
 
 static void ca0132_config(struct hda_codec *codec)
@@ -9836,6 +9841,15 @@ static void ca0132_config(struct hda_codec *codec)
 		spec->dig_in = 0x09;
 		break;
 	}
+
+	/* Default HP/Speaker auto-detect from headphone pin verb: enable if the
+	 * pin config indicates presence detect (not AC_DEFCFG_MISC_NO_PRESENCE).
+	 */
+	if (spec->unsol_tag_hp &&
+	    (snd_hda_query_pin_caps(codec, spec->unsol_tag_hp) & AC_PINCAP_PRES_DETECT) &&
+	    !(get_defcfg_misc(snd_hda_codec_get_pincfg(codec, spec->unsol_tag_hp)) &
+	      AC_DEFCFG_MISC_NO_PRESENCE))
+		spec->vnode_lswitch[VNID_HP_ASEL - VNODE_START_NID] = 1;
 }
 
 static int ca0132_prepare_verbs(struct hda_codec *codec)
@@ -9851,9 +9865,7 @@ static int ca0132_prepare_verbs(struct hda_codec *codec)
 	 */
 	if (ca0132_use_pci_mmio(spec))
 		spec->desktop_init_verbs = ca0132_init_verbs1;
-	spec->spec_init_verbs = kcalloc(NUM_SPEC_VERBS,
-					sizeof(struct hda_verb),
-					GFP_KERNEL);
+	spec->spec_init_verbs = kzalloc_objs(struct hda_verb, NUM_SPEC_VERBS);
 	if (!spec->spec_init_verbs)
 		return -ENOMEM;
 
@@ -9963,7 +9975,7 @@ static int ca0132_codec_probe(struct hda_codec *codec,
 
 	codec_dbg(codec, "%s\n", __func__);
 
-	spec = kzalloc(sizeof(*spec), GFP_KERNEL);
+	spec = kzalloc_obj(*spec);
 	if (!spec)
 		return -ENOMEM;
 	codec->spec = spec;

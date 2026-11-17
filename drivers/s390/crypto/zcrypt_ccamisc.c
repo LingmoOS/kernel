@@ -7,8 +7,7 @@
  *  Collection of CCA misc functions used by zcrypt and pkey
  */
 
-#define KMSG_COMPONENT "zcrypt"
-#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
+#define pr_fmt(fmt) "zcrypt: " fmt
 
 #include <linux/export.h>
 #include <linux/init.h>
@@ -350,7 +349,7 @@ static inline void prep_xcrb(struct ica_xcRB *pxcrb,
 			     struct CPRBX *prepcblk)
 {
 	memset(pxcrb, 0, sizeof(*pxcrb));
-	pxcrb->agent_ID = 0x4341; /* 'CA' */
+	memcpy(&pxcrb->agent_ID, "CA", 2);
 	pxcrb->user_defined = (cardnr == 0xFFFF ? AUTOSELECT : cardnr);
 	pxcrb->request_control_blk_length =
 		preqcblk->cprb_len + preqcblk->req_parml;
@@ -1159,8 +1158,21 @@ static int _ip_cprb_helper(u16 cardnr, u16 domain,
 
 	/* do not check the key here, it may be incomplete */
 
-	/* copy the vlsc key token back */
+	/*
+	 * Copy the vlsc key token back.
+	 * The available space in the destination (key_token) and the source
+	 * (t) buffer is always larger as the valid range of prepparm->kb.len.
+	 * Validate t->len by comparing it with the length information in the
+	 * param block of the request (prepparm->kb.len)
+	 * The value range of prepparm->kb.len has been checked above.
+	 */
 	t = (struct cipherkeytoken *)prepparm->kb.tlv1.key_token;
+	if (t->len != prepparm->kb.len - 3 * sizeof(uint16_t)) {
+		ZCRYPT_DBF_ERR("%s reply with invalid key_token length %u\n",
+			       __func__, t->len);
+		rc = -EIO;
+		goto out;
+	}
 	memcpy(key_token, t, t->len);
 	*key_token_size = t->len;
 
@@ -1794,8 +1806,8 @@ out:
 EXPORT_SYMBOL(cca_get_info);
 
 int cca_findcard2(u32 *apqns, u32 *nr_apqns, u16 cardnr, u16 domain,
-		  int minhwtype, int mktype, u64 cur_mkvp, u64 old_mkvp,
-		  u32 xflags)
+		  int minhwtype, int mktype,
+		  const u8 *ptr_cur_mkvp, const u8 *ptr_old_mkvp, u32 xflags)
 {
 	struct zcrypt_device_status_ext *device_status;
 	int i, card, dom, curmatch, oldmatch;
@@ -1839,20 +1851,28 @@ int cca_findcard2(u32 *apqns, u32 *nr_apqns, u16 cardnr, u16 domain,
 		/* check min hardware type */
 		if (minhwtype > 0 && minhwtype > ci.hwtype)
 			continue;
-		if (cur_mkvp || old_mkvp) {
+		if (ptr_cur_mkvp || ptr_old_mkvp) {
 			/* check mkvps */
 			curmatch = oldmatch = 0;
 			if (mktype == AES_MK_SET) {
-				if (cur_mkvp && cur_mkvp == ci.cur_aes_mkvp)
+				if (ptr_cur_mkvp &&
+				    !memcmp(ptr_cur_mkvp, ci.cur_aes_mkvp,
+					    sizeof(ci.cur_aes_mkvp)))
 					curmatch = 1;
-				if (old_mkvp && ci.old_aes_mk_state == '2' &&
-				    old_mkvp == ci.old_aes_mkvp)
+				if (ptr_old_mkvp &&
+				    ci.old_aes_mk_state == '2' &&
+				    !memcmp(ptr_old_mkvp, ci.old_aes_mkvp,
+					    sizeof(ci.old_aes_mkvp)))
 					oldmatch = 1;
 			} else {
-				if (cur_mkvp && cur_mkvp == ci.cur_apka_mkvp)
+				if (ptr_cur_mkvp &&
+				    !memcmp(ptr_cur_mkvp, ci.cur_apka_mkvp,
+					    sizeof(ci.cur_apka_mkvp)))
 					curmatch = 1;
-				if (old_mkvp && ci.old_apka_mk_state == '2' &&
-				    old_mkvp == ci.old_apka_mkvp)
+				if (ptr_old_mkvp &&
+				    ci.old_apka_mk_state == '2' &&
+				    !memcmp(ptr_old_mkvp, ci.old_apka_mkvp,
+					    sizeof(ci.old_apka_mkvp)))
 					oldmatch = 1;
 			}
 			if (curmatch + oldmatch < 1)

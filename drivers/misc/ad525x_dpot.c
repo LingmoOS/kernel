@@ -751,7 +751,7 @@ int ad_dpot_probe(struct device *dev,
 	struct dpot_data *data;
 	int i;
 
-	data = kzalloc(sizeof(struct dpot_data), GFP_KERNEL);
+	data = kzalloc_obj(struct dpot_data);
 	if (!data) {
 		dev_err(dev, "failed to create client for %s ID 0x%lX\n",
 			name, devid);

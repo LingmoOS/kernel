@@ -148,10 +148,10 @@ bool netfs_dirty_folio(struct address_space *mapping, struct folio *folio)
 	if (!fscache_cookie_valid(cookie))
 		return true;
 
-	if (!(inode->i_state & I_PINNING_NETFS_WB)) {
+	if (!(inode_state_read_once(inode) & I_PINNING_NETFS_WB)) {
 		spin_lock(&inode->i_lock);
-		if (!(inode->i_state & I_PINNING_NETFS_WB)) {
-			inode->i_state |= I_PINNING_NETFS_WB;
+		if (!(inode_state_read(inode) & I_PINNING_NETFS_WB)) {
+			inode_state_set(inode, I_PINNING_NETFS_WB);
 			need_use = true;
 		}
 		spin_unlock(&inode->i_lock);
@@ -193,7 +193,7 @@ void netfs_clear_inode_writeback(struct inode *inode, const void *aux)
 {
 	struct fscache_cookie *cookie = netfs_i_cookie(netfs_inode(inode));
 
-	if (inode->i_state & I_PINNING_NETFS_WB) {
+	if (inode_state_read_once(inode) & I_PINNING_NETFS_WB) {
 		loff_t i_size = i_size_read(inode);
 		fscache_unuse_cookie(cookie, aux, &i_size);
 	}
@@ -212,18 +212,25 @@ EXPORT_SYMBOL(netfs_clear_inode_writeback);
 void netfs_invalidate_folio(struct folio *folio, size_t offset, size_t length)
 {
 	struct netfs_folio *finfo;
-	struct netfs_inode *ctx = netfs_inode(folio_inode(folio));
+	struct inode *inode = folio_inode(folio);
+	struct netfs_inode *ctx = netfs_inode(inode);
 	size_t flen = folio_size(folio);
 
 	_enter("{%lx},%zx,%zx", folio->index, offset, length);
 
 	if (offset == 0 && length == flen) {
-		unsigned long long i_size = i_size_read(&ctx->inode);
+		unsigned long long i_size, remote_i_size, zero_point;
 		unsigned long long fpos = folio_pos(folio), end;
 
+		netfs_read_sizes(inode, &i_size, &remote_i_size, &zero_point);
 		end = umin(fpos + flen, i_size);
-		if (fpos < i_size && end > ctx->zero_point)
-			ctx->zero_point = end;
+		if (fpos < i_size && end > zero_point) {
+			spin_lock(&inode->i_lock);
+			end = umin(fpos + flen, inode->i_size);
+			if (fpos < i_size && end > ctx->_zero_point)
+				netfs_write_zero_point(inode, end);
+			spin_unlock(&inode->i_lock);
+		}
 	}
 
 	folio_wait_private_2(folio); /* [DEPRECATED] */
@@ -297,15 +304,22 @@ EXPORT_SYMBOL(netfs_invalidate_folio);
  */
 bool netfs_release_folio(struct folio *folio, gfp_t gfp)
 {
-	struct netfs_inode *ctx = netfs_inode(folio_inode(folio));
-	unsigned long long end;
+	struct inode *inode = folio_inode(folio);
+	struct netfs_inode *ctx = netfs_inode(inode);
+	unsigned long long i_size, remote_i_size, zero_point, end;
 
 	if (folio_test_dirty(folio))
 		return false;
 
-	end = umin(folio_pos(folio) + folio_size(folio), ctx->remote_i_size);
-	if (end > ctx->zero_point)
-		ctx->zero_point = end;
+	netfs_read_sizes(inode, &i_size, &remote_i_size, &zero_point);
+	end = folio_next_pos(folio);
+	if (end > zero_point) {
+		spin_lock(&inode->i_lock);
+		end = umin(end, ctx->_remote_i_size);
+		if (end > ctx->_zero_point)
+			netfs_write_zero_point(inode, end);
+		spin_unlock(&inode->i_lock);
+	}
 
 	if (folio_test_private(folio))
 		return false;
@@ -551,6 +565,25 @@ void netfs_wait_for_paused_write(struct netfs_io_request *rreq)
 	return netfs_wait_for_pause(rreq, netfs_write_collection);
 }
 
+/*
+ * Wait for the readahead-acquired refs to be put.
+ */
+void netfs_wait_for_put_ra_refs(struct netfs_io_request *rreq)
+{
+	DEFINE_WAIT(myself);
+
+	for (;;) {
+		trace_netfs_rreq(rreq, netfs_rreq_trace_wait_put_ra_refs);
+		prepare_to_wait(&rreq->waitq, &myself, TASK_UNINTERRUPTIBLE);
+		if (!test_bit(NETFS_RREQ_NEED_PUT_RA_REFS, &rreq->flags))
+			break;
+		schedule();
+	}
+
+	trace_netfs_rreq(rreq, netfs_rreq_trace_waited_put_ra_refs);
+	finish_wait(&rreq->waitq, &myself);
+}
+
 /**
  * netfs_clear_stale_isize - Clear stale pagecache in a to-be-created hole
  * @inode: The inode to act upon.
@@ -586,8 +619,8 @@ void netfs_wait_for_paused_write(struct netfs_io_request *rreq)
  * Return: 0 on success, or -EAGAIN if @nowait is set and the folio is
  * mapped or under writeback and so can't be cleaned without blocking.
  */
-static int netfs_clear_stale_isize(struct inode *inode, unsigned long long from,
-				   unsigned long long to, bool nowait, bool exclusive)
+static int netfs_clear_stale_isize(struct inode *inode, uoff_t from,
+				   uoff_t to, bool nowait, bool exclusive)
 {
 	struct address_space *mapping = inode->i_mapping;
 	fgf_t fgp = FGP_LOCK;
@@ -617,7 +650,7 @@ static int netfs_clear_stale_isize(struct inode *inode, unsigned long long from,
 
 	if (folio_test_uptodate(folio) &&
 	    (!exclusive || folio_test_dirty(folio))) {
-		unsigned long long fpos = folio_pos(folio);
+		uoff_t fpos = folio_pos(folio);
 
 		if (!exclusive)
 			from = umax(from, i_size_read(inode));
@@ -635,15 +668,15 @@ out:
 }
 
 /* Clear stale pagecache before an extending buffered/DIO write. */
-int netfs_clear_stale_pre_isize(struct inode *inode, unsigned long long from,
-				unsigned long long to, bool nowait)
+int netfs_clear_stale_pre_isize(struct inode *inode, uoff_t from,
+				uoff_t to, bool nowait)
 {
 	return netfs_clear_stale_isize(inode, from, to, nowait, false);
 }
 
 /* Clear stale pagecache when extending a file under an exclusive resize. */
-void netfs_clear_stale_post_isize(struct inode *inode, unsigned long long from,
-				  unsigned long long to)
+void netfs_clear_stale_post_isize(struct inode *inode, uoff_t from,
+				  uoff_t to)
 {
 	netfs_clear_stale_isize(inode, from, to, false, true);
 }

@@ -840,7 +840,7 @@ static int sata_dwc_port_start(struct ata_port *ap)
 	}
 
 	/* Allocate Port Struct */
-	hsdevp = kzalloc(sizeof(*hsdevp), GFP_KERNEL);
+	hsdevp = kzalloc_obj(*hsdevp);
 	if (!hsdevp) {
 		err = -ENOMEM;
 		goto CLEANUP;
@@ -1031,6 +1031,7 @@ static unsigned int sata_dwc_qc_issue(struct ata_queued_cmd *qc)
 }
 
 static void sata_dwc_error_handler(struct ata_port *ap)
+	__must_hold(&ap->host->eh_mutex)
 {
 	ata_sff_error_handler(ap);
 }

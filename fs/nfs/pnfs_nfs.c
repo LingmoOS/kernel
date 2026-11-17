@@ -101,7 +101,7 @@ pnfs_alloc_commit_array(size_t n, gfp_t gfp_flags)
 	struct pnfs_commit_array *p;
 	struct pnfs_commit_bucket *b;
 
-	p = kmalloc(struct_size(p, buckets, n), gfp_flags);
+	p = kmalloc_flex(*p, buckets, n, gfp_flags);
 	if (!p)
 		return NULL;
 	p->nbuckets = n;
@@ -620,7 +620,7 @@ _data_server_lookup_locked(const struct nfs_net *nn,
 
 static struct nfs4_pnfs_ds_addr *nfs4_pnfs_ds_addr_alloc(gfp_t gfp_flags)
 {
-	struct nfs4_pnfs_ds_addr *da = kzalloc(sizeof(*da), gfp_flags);
+	struct nfs4_pnfs_ds_addr *da = kzalloc_obj(*da, gfp_flags);
 	if (da)
 		INIT_LIST_HEAD(&da->da_node);
 	return da;
@@ -738,7 +738,7 @@ nfs4_pnfs_ds_add(const struct net *net, struct list_head *dsaddrs, u32 version,
 		goto out;
 	}
 
-	ds = kzalloc(sizeof(*ds), gfp_flags);
+	ds = kzalloc_obj(*ds, gfp_flags);
 	if (!ds)
 		goto out;
 
@@ -890,7 +890,8 @@ static int _nfs4_pnfs_v4_ds_connect(struct nfs_server *mds_srv,
 				 struct nfs4_pnfs_ds *ds,
 				 unsigned int timeo,
 				 unsigned int retrans,
-				 u32 minor_version)
+				 u32 minor_version,
+				 bool tightly_coupled)
 {
 	struct nfs_client *clp = ERR_PTR(-EIO);
 	struct nfs_client *mds_clp = mds_srv->nfs_client;
@@ -980,12 +981,14 @@ static int _nfs4_pnfs_v4_ds_connect(struct nfs_server *mds_srv,
 
 			clp = nfs4_set_ds_client(mds_srv, &da->da_addr,
 						 da->da_addrlen, ds_proto,
-						 timeo, retrans, minor_version);
+						 timeo, retrans, minor_version,
+						 tightly_coupled);
 			if (IS_ERR(clp))
 				continue;
 
 			status = nfs4_init_ds_session(clp,
-					mds_srv->nfs_client->cl_lease_time);
+					mds_srv->nfs_client->cl_lease_time,
+					tightly_coupled);
 			if (status) {
 				nfs_put_client(clp);
 				clp = ERR_PTR(-EIO);
@@ -1013,7 +1016,8 @@ out:
  */
 int nfs4_pnfs_ds_connect(struct nfs_server *mds_srv, struct nfs4_pnfs_ds *ds,
 			  struct nfs4_deviceid_node *devid, unsigned int timeo,
-			  unsigned int retrans, u32 version, u32 minor_version)
+			  unsigned int retrans, u32 version, u32 minor_version,
+			  bool tightly_coupled)
 {
 	int err;
 
@@ -1036,7 +1040,7 @@ int nfs4_pnfs_ds_connect(struct nfs_server *mds_srv, struct nfs4_pnfs_ds *ds,
 		break;
 	case 4:
 		err = _nfs4_pnfs_v4_ds_connect(mds_srv, ds, timeo, retrans,
-					       minor_version);
+					       minor_version, tightly_coupled);
 		break;
 	default:
 		dprintk("%s: unsupported DS version %d\n", __func__, version);

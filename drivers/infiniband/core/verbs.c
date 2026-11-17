@@ -49,9 +49,11 @@
 #include <rdma/ib_verbs.h>
 #include <rdma/ib_cache.h>
 #include <rdma/ib_addr.h>
+#include <rdma/ib_umem.h>
 #include <rdma/rw.h>
 #include <rdma/lag.h>
 
+#include "rdma_core.h"
 #include "core_priv.h"
 #include <trace/events/rdma_core.h>
 
@@ -78,6 +80,7 @@ static const char * const ib_events[] = {
 	[IB_EVENT_QP_LAST_WQE_REACHED]	= "last WQE reached",
 	[IB_EVENT_CLIENT_REREGISTER]	= "client reregister",
 	[IB_EVENT_GID_CHANGE]		= "GID changed",
+	[IB_EVENT_DEVICE_SPEED_CHANGE]  = "device speed change"
 };
 
 const char *__attribute_const__ ib_event_msg(enum ib_event_type event)
@@ -148,6 +151,7 @@ __attribute_const__ int ib_rate_to_mult(enum ib_rate rate)
 	case IB_RATE_400_GBPS: return 160;
 	case IB_RATE_600_GBPS: return 240;
 	case IB_RATE_800_GBPS: return 320;
+	case IB_RATE_1600_GBPS: return 640;
 	default:	       return  -1;
 	}
 }
@@ -178,6 +182,7 @@ __attribute_const__ enum ib_rate mult_to_ib_rate(int mult)
 	case 160: return IB_RATE_400_GBPS;
 	case 240: return IB_RATE_600_GBPS;
 	case 320: return IB_RATE_800_GBPS;
+	case 640: return IB_RATE_1600_GBPS;
 	default:  return IB_RATE_PORT_CURRENT;
 	}
 }
@@ -208,6 +213,7 @@ __attribute_const__ int ib_rate_to_mbps(enum ib_rate rate)
 	case IB_RATE_400_GBPS: return 425000;
 	case IB_RATE_600_GBPS: return 637500;
 	case IB_RATE_800_GBPS: return 850000;
+	case IB_RATE_1600_GBPS: return 1700000;
 	default:	       return -1;
 	}
 }
@@ -1189,7 +1195,7 @@ static struct ib_qp *__ib_open_qp(struct ib_qp *real_qp,
 	unsigned long flags;
 	int err;
 
-	qp = kzalloc(sizeof *qp, GFP_KERNEL);
+	qp = kzalloc_obj(*qp);
 	if (!qp)
 		return ERR_PTR(-ENOMEM);
 
@@ -1267,10 +1273,9 @@ static struct ib_qp *create_xrc_qp_user(struct ib_qp *qp,
 
 static struct ib_qp *create_qp(struct ib_device *dev, struct ib_pd *pd,
 			       struct ib_qp_init_attr *attr,
-			       struct ib_udata *udata,
+			       struct uverbs_attr_bundle *uattrs,
 			       struct ib_uqp_object *uobj, const char *caller)
 {
-	struct ib_udata dummy = {};
 	struct ib_qp *qp;
 	int ret;
 
@@ -1295,6 +1300,7 @@ static struct ib_qp *create_qp(struct ib_device *dev, struct ib_pd *pd,
 	qp->qp_context = attr->qp_context;
 
 	spin_lock_init(&qp->mr_lock);
+	xa_init(&qp->comp_cntrs);
 	INIT_LIST_HEAD(&qp->rdma_mrs);
 	INIT_LIST_HEAD(&qp->sig_mrs);
 	init_completion(&qp->srq_completion);
@@ -1303,9 +1309,10 @@ static struct ib_qp *create_qp(struct ib_device *dev, struct ib_pd *pd,
 	qp->recv_cq = attr->recv_cq;
 
 	rdma_restrack_new(&qp->res, RDMA_RESTRACK_QP);
-	WARN_ONCE(!udata && !caller, "Missing kernel QP owner");
-	rdma_restrack_set_name(&qp->res, udata ? NULL : caller);
-	ret = dev->ops.create_qp(qp, attr, udata);
+	WARN_ONCE(!uattrs && !caller, "Missing kernel QP owner");
+	rdma_restrack_set_name(&qp->res, uattrs ? NULL : caller);
+	ret = dev->ops.create_qp(qp, attr,
+				 uattrs ? &uattrs->driver_udata : NULL);
 	if (ret)
 		goto err_create;
 
@@ -1324,9 +1331,11 @@ static struct ib_qp *create_qp(struct ib_device *dev, struct ib_pd *pd,
 	return qp;
 
 err_security:
-	qp->device->ops.destroy_qp(qp, udata ? &dummy : NULL);
+	qp->device->ops.destroy_qp(
+		qp, uattrs ? uverbs_get_cleared_udata(uattrs) : NULL);
 err_create:
 	rdma_restrack_put(&qp->res);
+	xa_destroy(&qp->comp_cntrs);
 	kfree(qp);
 	return ERR_PTR(ret);
 
@@ -1340,13 +1349,13 @@ err_create:
  * @attr: A list of initial attributes required to create the
  *   QP.  If QP creation succeeds, then the attributes are updated to
  *   the actual capabilities of the created QP.
- * @udata: User data
+ * @uattrs: User ioctl attributes and udata
  * @uobj: uverbs obect
  * @caller: caller's build-time module name
  */
 struct ib_qp *ib_create_qp_user(struct ib_device *dev, struct ib_pd *pd,
 				struct ib_qp_init_attr *attr,
-				struct ib_udata *udata,
+				struct uverbs_attr_bundle *uattrs,
 				struct ib_uqp_object *uobj, const char *caller)
 {
 	struct ib_qp *qp, *xrc_qp;
@@ -1354,7 +1363,7 @@ struct ib_qp *ib_create_qp_user(struct ib_device *dev, struct ib_pd *pd,
 	if (attr->qp_type == IB_QPT_XRC_TGT)
 		qp = create_qp(dev, pd, attr, NULL, NULL, caller);
 	else
-		qp = create_qp(dev, pd, attr, udata, uobj, NULL);
+		qp = create_qp(dev, pd, attr, uattrs, uobj, NULL);
 	if (attr->qp_type != IB_QPT_XRC_TGT || IS_ERR(qp))
 		return qp;
 
@@ -1602,7 +1611,6 @@ static const struct {
 						 IB_QP_QKEY),
 				 [IB_QPT_GSI] = (IB_QP_CUR_STATE		|
 						 IB_QP_QKEY),
-				 [IB_QPT_RAW_PACKET] = IB_QP_RATE_LIMIT,
 			 }
 		}
 	},
@@ -1636,7 +1644,6 @@ static const struct {
 						IB_QP_QKEY),
 				[IB_QPT_GSI] = (IB_QP_CUR_STATE			|
 						IB_QP_QKEY),
-				[IB_QPT_RAW_PACKET] = IB_QP_RATE_LIMIT,
 			}
 		},
 		[IB_QPS_SQD]   = {
@@ -1774,7 +1781,7 @@ bool ib_modify_qp_is_ok(enum ib_qp_state cur_state, enum ib_qp_state next_state,
 	if ((mask & req_param) != req_param)
 		return false;
 
-	if (mask & ~(req_param | opt_param | IB_QP_STATE))
+	if (mask & ~(req_param | opt_param | IB_QP_STATE | IB_QP_RATE_LIMIT))
 		return false;
 
 	return true;
@@ -2150,6 +2157,8 @@ int ib_destroy_qp_user(struct ib_qp *qp, struct ib_udata *udata)
 	const struct ib_gid_attr *alt_path_sgid_attr = qp->alt_path_sgid_attr;
 	const struct ib_gid_attr *av_sgid_attr = qp->av_sgid_attr;
 	struct ib_qp_security *sec;
+	struct ib_comp_cntr *cc;
+	unsigned long index;
 	int ret;
 
 	WARN_ON_ONCE(qp->mrs_used > 0);
@@ -2183,6 +2192,10 @@ int ib_destroy_qp_user(struct ib_qp *qp, struct ib_udata *udata)
 	if (av_sgid_attr)
 		rdma_put_gid_attr(av_sgid_attr);
 
+	xa_for_each(&qp->comp_cntrs, index, cc)
+		atomic_dec(&cc->usecnt);
+	xa_destroy(&qp->comp_cntrs);
+
 	ib_qp_usecnt_dec(qp);
 	if (sec)
 		ib_destroy_qp_security_end(sec);
@@ -2205,12 +2218,14 @@ struct ib_cq *__ib_create_cq(struct ib_device *device,
 	struct ib_cq *cq;
 	int ret;
 
+	if (WARN_ON_ONCE(!cq_attr->cqe))
+		return ERR_PTR(-EINVAL);
+
 	cq = rdma_zalloc_drv_obj(device, ib_cq);
 	if (!cq)
 		return ERR_PTR(-ENOMEM);
 
 	cq->device = device;
-	cq->uobject = NULL;
 	cq->comp_handler = comp_handler;
 	cq->event_handler = event_handler;
 	cq->cq_context = cq_context;
@@ -2225,7 +2240,6 @@ struct ib_cq *__ib_create_cq(struct ib_device *device,
 		kfree(cq);
 		return ERR_PTR(ret);
 	}
-
 	rdma_restrack_add(&cq->res);
 	return cq;
 }
@@ -2265,16 +2279,6 @@ int ib_destroy_cq_user(struct ib_cq *cq, struct ib_udata *udata)
 	return ret;
 }
 EXPORT_SYMBOL(ib_destroy_cq_user);
-
-int ib_resize_cq(struct ib_cq *cq, int cqe)
-{
-	if (cq->shared)
-		return -EOPNOTSUPP;
-
-	return cq->device->ops.resize_cq ?
-		cq->device->ops.resize_cq(cq, cqe, NULL) : -EOPNOTSUPP;
-}
-EXPORT_SYMBOL(ib_resize_cq);
 
 /* Memory regions */
 
@@ -2431,7 +2435,7 @@ struct ib_mr *ib_alloc_mr_integrity(struct ib_pd *pd,
 		goto out;
 	}
 
-	sig_attrs = kzalloc(sizeof(struct ib_sig_attrs), GFP_KERNEL);
+	sig_attrs = kzalloc_obj(struct ib_sig_attrs);
 	if (!sig_attrs) {
 		mr = ERR_PTR(-ENOMEM);
 		goto out;
@@ -3178,7 +3182,7 @@ struct rdma_hw_stats *rdma_alloc_hw_stats_struct(
 {
 	struct rdma_hw_stats *stats;
 
-	stats = kzalloc(struct_size(stats, value, num_counters), GFP_KERNEL);
+	stats = kzalloc_flex(*stats, value, num_counters);
 	if (!stats)
 		return NULL;
 

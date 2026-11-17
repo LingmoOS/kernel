@@ -72,11 +72,10 @@ static void wacom_wac_queue_flush(struct hid_device *hdev,
 {
 	while (!kfifo_is_empty(fifo)) {
 		int size = kfifo_peek_len(fifo);
-		u8 *buf;
+		u8 *buf __free(kfree) = kzalloc(size, GFP_ATOMIC);
 		unsigned int count;
 		int err;
 
-		buf = kzalloc(size, GFP_ATOMIC);
 		if (!buf) {
 			kfifo_skip(fifo);
 			continue;
@@ -89,7 +88,6 @@ static void wacom_wac_queue_flush(struct hid_device *hdev,
 			// to flush seems reasonable enough, however.
 			hid_warn(hdev, "%s: removed fifo entry with unexpected size\n",
 				 __func__);
-			kfree(buf);
 			continue;
 		}
 		err = hid_report_raw_event(hdev, HID_INPUT_REPORT, buf, size, size, false);
@@ -97,8 +95,6 @@ static void wacom_wac_queue_flush(struct hid_device *hdev,
 			hid_warn(hdev, "%s: unable to flush event due to error %d\n",
 				 __func__, err);
 		}
-
-		kfree(buf);
 	}
 }
 
@@ -933,7 +929,7 @@ static int wacom_add_shared_data(struct hid_device *hdev)
 
 	data = wacom_get_hdev_data(hdev);
 	if (!data) {
-		data = kzalloc(sizeof(struct wacom_hdev_data), GFP_KERNEL);
+		data = kzalloc_obj(struct wacom_hdev_data);
 		if (!data) {
 			mutex_unlock(&wacom_udev_list_lock);
 			return -ENOMEM;
@@ -3029,7 +3025,6 @@ static void wacom_remove(struct hid_device *hdev)
 		wacom_release_resources(wacom);
 }
 
-#ifdef CONFIG_PM
 static int wacom_resume(struct hid_device *hdev)
 {
 	struct wacom *wacom = hid_get_drvdata(hdev);
@@ -3049,7 +3044,6 @@ static int wacom_reset_resume(struct hid_device *hdev)
 {
 	return wacom_resume(hdev);
 }
-#endif /* CONFIG_PM */
 
 static struct hid_driver wacom_driver = {
 	.name =		"wacom",
@@ -3057,10 +3051,8 @@ static struct hid_driver wacom_driver = {
 	.probe =	wacom_probe,
 	.remove =	wacom_remove,
 	.report =	wacom_wac_report,
-#ifdef CONFIG_PM
-	.resume =	wacom_resume,
-	.reset_resume =	wacom_reset_resume,
-#endif
+	.resume =	pm_ptr(wacom_resume),
+	.reset_resume =	pm_ptr(wacom_reset_resume),
 	.raw_event =	wacom_raw_event,
 };
 module_hid_driver(wacom_driver);

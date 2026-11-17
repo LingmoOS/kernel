@@ -43,6 +43,7 @@
 #include "amdgpu_vram_mgr.h"
 #include "amdgpu_vm.h"
 #include "amdgpu_dma_buf.h"
+#include "kfd_svm.h"
 
 /**
  * DOC: amdgpu_object
@@ -93,7 +94,8 @@ static void amdgpu_bo_user_destroy(struct ttm_buffer_object *tbo)
 bool amdgpu_bo_is_amdgpu_bo(struct ttm_buffer_object *bo)
 {
 	if (bo->destroy == &amdgpu_bo_destroy ||
-	    bo->destroy == &amdgpu_bo_user_destroy)
+	    bo->destroy == &amdgpu_bo_user_destroy ||
+	    bo->destroy == &svm_range_bo_destroy)
 		return true;
 
 	return false;
@@ -149,14 +151,6 @@ void amdgpu_bo_placement_from_domain(struct amdgpu_bo *abo, u32 domain)
 		places[c].fpfn = 0;
 		places[c].lpfn = 0;
 		places[c].mem_type = AMDGPU_PL_DOORBELL;
-		places[c].flags = 0;
-		c++;
-	}
-
-	if (domain & AMDGPU_GEM_DOMAIN_MMIO_REMAP) {
-		places[c].fpfn = 0;
-		places[c].lpfn = 0;
-		places[c].mem_type = AMDGPU_PL_MMIO_REMAP;
 		places[c].flags = 0;
 		c++;
 	}
@@ -728,13 +722,17 @@ int amdgpu_bo_create(struct amdgpu_device *adev,
 	    bo->tbo.resource->mem_type == TTM_PL_VRAM) {
 		struct dma_fence *fence;
 
-		r = amdgpu_ttm_clear_buffer(bo, bo->tbo.base.resv, &fence);
+		r = amdgpu_ttm_clear_buffer(amdgpu_ttm_next_clear_entity(adev),
+					    bo, bo->tbo.base.resv, &fence,
+					    true, AMDGPU_KERNEL_JOB_ID_TTM_CLEAR_BUFFER);
 		if (unlikely(r))
 			goto fail_unreserve;
 
-		dma_resv_add_fence(bo->tbo.base.resv, fence,
-				   DMA_RESV_USAGE_KERNEL);
-		dma_fence_put(fence);
+		if (fence) {
+			dma_resv_add_fence(bo->tbo.base.resv, fence,
+					   DMA_RESV_USAGE_KERNEL);
+			dma_fence_put(fence);
+		}
 	}
 	if (!bp->resv)
 		amdgpu_bo_unreserve(bo);
@@ -917,6 +915,19 @@ void amdgpu_bo_unref(struct amdgpu_bo **bo)
 	*bo = NULL;
 }
 
+/* Map a BO onto vram_pin_size_xcp[]. bo->xcp_id < 0 means "any partition":
+ * such pins are not owned by a single partition and go to
+ * vram_pin_size_common, which every partition subtracts.
+ */
+static int amdgpu_bo_get_xcp(struct amdgpu_bo *bo)
+{
+	s8 xcp = bo->xcp_id;
+
+	if (xcp >= 0 && xcp < MAX_XCP)
+		return xcp;
+	return -1;
+}
+
 /**
  * amdgpu_bo_pin - pin an &amdgpu_bo buffer object
  * @bo: &amdgpu_bo buffer object to be pinned
@@ -997,7 +1008,17 @@ int amdgpu_bo_pin(struct amdgpu_bo *bo, u32 domain)
 	ttm_bo_pin(&bo->tbo);
 
 	if (bo->tbo.resource->mem_type == TTM_PL_VRAM) {
+		int xcp = amdgpu_bo_get_xcp(bo);
+
 		atomic64_add(amdgpu_bo_size(bo), &adev->vram_pin_size);
+		if (xcp >= 0) {
+			atomic64_add(amdgpu_bo_size(bo),
+				     &adev->vram_pin_size_xcp[xcp]);
+		} else {
+			atomic64_add(amdgpu_bo_size(bo),
+				     &adev->vram_pin_size_common);
+		}
+		amdgpu_amdkfd_account_vram_pin(bo, xcp);
 		atomic64_add(amdgpu_vram_mgr_bo_visible_size(bo),
 			     &adev->visible_pin_size);
 	} else if (bo->tbo.resource->mem_type == TTM_PL_TT) {
@@ -1030,7 +1051,17 @@ void amdgpu_bo_unpin(struct amdgpu_bo *bo)
 		dma_buf_unpin(bo->tbo.base.import_attach);
 
 	if (bo->tbo.resource->mem_type == TTM_PL_VRAM) {
+		int xcp = amdgpu_bo_get_xcp(bo);
+
 		atomic64_sub(amdgpu_bo_size(bo), &adev->vram_pin_size);
+		if (xcp >= 0) {
+			atomic64_sub(amdgpu_bo_size(bo),
+				     &adev->vram_pin_size_xcp[xcp]);
+		} else {
+			atomic64_sub(amdgpu_bo_size(bo),
+				     &adev->vram_pin_size_common);
+		}
+		amdgpu_amdkfd_account_vram_unpin(bo, xcp);
 		atomic64_sub(amdgpu_vram_mgr_bo_visible_size(bo),
 			     &adev->visible_pin_size);
 	} else if (bo->tbo.resource->mem_type == TTM_PL_TT) {
@@ -1053,7 +1084,8 @@ static const char * const amdgpu_vram_names[] = {
 	"DDR5",
 	"LPDDR4",
 	"LPDDR5",
-	"HBM3E"
+	"HBM3E",
+	"HBM4"
 };
 
 /**
@@ -1083,10 +1115,10 @@ int amdgpu_bo_init(struct amdgpu_device *adev)
 				adev->gmc.aper_size);
 	}
 
-	DRM_INFO("Detected VRAM RAM=%lluM, BAR=%lluM\n",
+	drm_info(adev_to_drm(adev), "Detected VRAM RAM=%lluM, BAR=%lluM\n",
 		 adev->gmc.mc_vram_size >> 20,
 		 (unsigned long long)adev->gmc.aper_size >> 20);
-	DRM_INFO("RAM width %dbits %s\n",
+	drm_info(adev_to_drm(adev), "RAM width %dbits %s\n",
 		 adev->gmc.vram_width, amdgpu_vram_names[adev->gmc.vram_type]);
 	return amdgpu_ttm_init(adev);
 }
@@ -1128,6 +1160,10 @@ int amdgpu_bo_set_tiling_flags(struct amdgpu_bo *bo, u64 tiling_flags)
 	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
 	struct amdgpu_bo_user *ubo;
 
+	/* MMIO_REMAP is BAR I/O space; tiling should never be used here. */
+	WARN_ON_ONCE(bo->tbo.resource &&
+		     bo->tbo.resource->mem_type == AMDGPU_PL_MMIO_REMAP);
+
 	BUG_ON(bo->tbo.type == ttm_bo_type_kernel);
 	if (adev->family <= AMDGPU_FAMILY_CZ &&
 	    AMDGPU_TILING_GET(tiling_flags, TILE_SPLIT) > 6)
@@ -1149,6 +1185,13 @@ int amdgpu_bo_set_tiling_flags(struct amdgpu_bo *bo, u64 tiling_flags)
 void amdgpu_bo_get_tiling_flags(struct amdgpu_bo *bo, u64 *tiling_flags)
 {
 	struct amdgpu_bo_user *ubo;
+
+	/*
+	 * MMIO_REMAP BOs are not real VRAM/GTT memory but a fixed BAR I/O window.
+	 * They should never go through GEM tiling helpers.
+	 */
+	WARN_ON_ONCE(bo->tbo.resource &&
+		     bo->tbo.resource->mem_type == AMDGPU_PL_MMIO_REMAP);
 
 	BUG_ON(bo->tbo.type == ttm_bo_type_kernel);
 	dma_resv_assert_held(bo->tbo.base.resv);
@@ -1273,7 +1316,7 @@ void amdgpu_bo_move_notify(struct ttm_buffer_object *bo,
 
 	if (abo->tbo.base.dma_buf && !drm_gem_is_imported(&abo->tbo.base) &&
 	    old_mem && old_mem->mem_type != TTM_PL_SYSTEM)
-		dma_buf_move_notify(abo->tbo.base.dma_buf);
+		dma_buf_invalidate_mappings(abo->tbo.base.dma_buf);
 
 	/* move_notify is called before move happens */
 	trace_amdgpu_bo_move(abo, new_mem ? new_mem->mem_type : -1,
@@ -1324,8 +1367,9 @@ void amdgpu_bo_release_notify(struct ttm_buffer_object *bo)
 	if (r)
 		goto out;
 
-	r = amdgpu_fill_buffer(abo, 0, &bo->base._resv, &fence, true,
-			       AMDGPU_KERNEL_JOB_ID_CLEAR_ON_RELEASE);
+	r = amdgpu_ttm_clear_buffer(amdgpu_ttm_next_clear_entity(adev),
+				    abo, &bo->base._resv, &fence,
+				    false, AMDGPU_KERNEL_JOB_ID_CLEAR_ON_RELEASE);
 	if (WARN_ON(r))
 		goto out;
 
@@ -1537,8 +1581,17 @@ u64 amdgpu_bo_gpu_offset_no_check(struct amdgpu_bo *bo)
  */
 uint32_t amdgpu_bo_mem_stats_placement(struct amdgpu_bo *bo)
 {
-	uint32_t domain = bo->preferred_domains & AMDGPU_GEM_DOMAIN_MASK;
+	u32 domain;
 
+	/*
+	 * MMIO_REMAP is internal now, so it no longer maps from a userspace
+	 * domain bit. Keep fdinfo/mem-stats visibility by checking the actual
+	 * TTM placement.
+	 */
+	if (bo->tbo.resource && bo->tbo.resource->mem_type == AMDGPU_PL_MMIO_REMAP)
+		return AMDGPU_PL_MMIO_REMAP;
+
+	domain = bo->preferred_domains & AMDGPU_GEM_DOMAIN_MASK;
 	if (!domain)
 		return TTM_PL_SYSTEM;
 
@@ -1557,8 +1610,6 @@ uint32_t amdgpu_bo_mem_stats_placement(struct amdgpu_bo *bo)
 		return AMDGPU_PL_OA;
 	case AMDGPU_GEM_DOMAIN_DOORBELL:
 		return AMDGPU_PL_DOORBELL;
-	case AMDGPU_GEM_DOMAIN_MMIO_REMAP:
-		return AMDGPU_PL_MMIO_REMAP;
 	default:
 		return TTM_PL_SYSTEM;
 	}
@@ -1668,9 +1719,9 @@ u64 amdgpu_bo_print_info(int id, struct amdgpu_bo *bo, struct seq_file *m)
 	attachment = READ_ONCE(bo->tbo.base.import_attach);
 
 	if (attachment)
-		seq_printf(m, " imported from ino:%lu", file_inode(dma_buf->file)->i_ino);
+		seq_printf(m, " imported from ino:%llu", file_inode(dma_buf->file)->i_ino);
 	else if (dma_buf)
-		seq_printf(m, " exported as ino:%lu", file_inode(dma_buf->file)->i_ino);
+		seq_printf(m, " exported as ino:%llu", file_inode(dma_buf->file)->i_ino);
 
 	amdgpu_bo_print_flag(m, bo, CPU_ACCESS_REQUIRED);
 	amdgpu_bo_print_flag(m, bo, NO_CPU_ACCESS);

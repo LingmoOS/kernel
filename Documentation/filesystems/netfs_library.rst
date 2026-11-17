@@ -460,8 +460,8 @@ its own write paths, and exports a helper so a filesystem can do the same from
 a resize path (truncate, setattr, fallocate and the like) that holds the
 inode's ``i_rwsem`` exclusively across the whole resize::
 
-	void netfs_clear_stale_post_isize(struct inode *inode, unsigned long long from,
-					  unsigned long long to);
+	void netfs_clear_stale_post_isize(struct inode *inode, uoff_t from,
+					  uoff_t to);
 
 This zeroes any such data within the ``[from, to)`` hole to be made, where
 @from is the old EOF and @to is the new one, and the caller must have already

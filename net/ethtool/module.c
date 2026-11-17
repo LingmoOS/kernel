@@ -6,10 +6,10 @@
 #include <net/devlink.h>
 #include <net/netdev_lock.h>
 
-#include "netlink.h"
-#include "common.h"
 #include "bitset.h"
+#include "common.h"
 #include "module_fw.h"
+#include "netlink.h"
 
 struct module_req_info {
 	struct ethnl_req_info base;
@@ -309,7 +309,7 @@ module_flash_fw_schedule(struct net_device *dev, const char *file_name,
 	struct ethtool_module_fw_flash *module_fw;
 	int err;
 
-	module_fw = kzalloc(sizeof(*module_fw), GFP_KERNEL);
+	module_fw = kzalloc_obj(*module_fw);
 	if (!module_fw)
 		return -ENOMEM;
 
@@ -429,8 +429,7 @@ int ethnl_act_module_fw_flash(struct sk_buff *skb, struct genl_info *info)
 		return ret;
 	dev = req_info.dev;
 
-	rtnl_lock();
-	netdev_lock_ops(dev);
+	netdev_lock_ops_compat(dev);
 	ret = ethnl_ops_begin(dev);
 	if (ret < 0)
 		goto out_unlock;
@@ -445,8 +444,7 @@ out_complete:
 	ethnl_ops_complete(dev);
 
 out_unlock:
-	netdev_unlock_ops(dev);
-	rtnl_unlock();
+	netdev_unlock_ops_compat(dev);
 	ethnl_parse_header_dev_put(&req_info);
 	return ret;
 }

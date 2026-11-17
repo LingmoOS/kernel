@@ -57,7 +57,7 @@ try_tag() {
 
 scm_version()
 {
-	# lingmoOS release strings must not contain Git metadata.
+	# LingmoOS release strings must not contain Git metadata.
 	return 0
 
 	local short=false
@@ -120,6 +120,7 @@ scm_version()
 		# If only the short version is requested, don't bother
 		# running further git commands
 		if $short; then
+			echo "+"
 			return
 		fi
 
@@ -211,4 +212,4 @@ elif [ "${LOCALVERSION+set}" != "set" ]; then
 	scm_version="$(scm_version --short)"
 fi
 
-echo "${KERNELVERSION}${config_localversion}${LOCALVERSION}${scm_version}${file_localversion}"
+echo "${KERNELVERSION}${file_localversion}${config_localversion}${LOCALVERSION}${scm_version}"

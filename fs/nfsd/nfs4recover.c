@@ -32,13 +32,14 @@
 *
 */
 
-#include <crypto/hash.h>
+#include <crypto/md5.h>
 #include <crypto/sha2.h>
 #include <linux/file.h>
 #include <linux/slab.h>
 #include <linux/namei.h>
 #include <linux/sched.h>
 #include <linux/fs.h>
+#include <linux/hex.h>
 #include <linux/module.h>
 #include <net/net_namespace.h>
 #include <linux/sunrpc/rpc_pipe_fs.h>
@@ -92,57 +93,18 @@ nfs4_reset_creds(const struct cred *original)
 	put_cred(revert_creds(original));
 }
 
-static int
+static void
 nfs4_make_rec_clidname(char dname[HEXDIR_LEN], const struct xdr_netobj *clname)
 {
 	u8 digest[MD5_DIGEST_SIZE];
-	struct crypto_shash *tfm;
-	int status;
 
 	dprintk("NFSD: nfs4_make_rec_clidname for %.*s\n",
 			clname->len, clname->data);
-	tfm = crypto_alloc_shash("md5", 0, 0);
-	if (IS_ERR(tfm)) {
-		status = PTR_ERR(tfm);
-		goto out_no_tfm;
-	}
 
-	status = crypto_shash_tfm_digest(tfm, clname->data, clname->len,
-					 digest);
-	if (status)
-		goto out;
+	md5(clname->data, clname->len, digest);
 
 	static_assert(HEXDIR_LEN == 2 * MD5_DIGEST_SIZE + 1);
 	sprintf(dname, "%*phN", MD5_DIGEST_SIZE, digest);
-
-	status = 0;
-out:
-	crypto_free_shash(tfm);
-out_no_tfm:
-	return status;
-}
-
-/*
- * If we had an error generating the recdir name for the legacy tracker
- * then warn the admin. If the error doesn't appear to be transient,
- * then disable recovery tracking.
- */
-static void
-legacy_recdir_name_error(struct nfs4_client *clp, int error)
-{
-	printk(KERN_ERR "NFSD: unable to generate recoverydir "
-			"name (%d).\n", error);
-
-	/*
-	 * if the algorithm just doesn't exist, then disable the recovery
-	 * tracker altogether. The crypto libs will generally return this if
-	 * FIPS is enabled as well.
-	 */
-	if (error == -ENOENT) {
-		printk(KERN_ERR "NFSD: disabling legacy clientid tracking. "
-			"Reboot recovery will not function correctly!\n");
-		nfsd4_client_tracking_exit(clp->net);
-	}
 }
 
 static void
@@ -171,9 +133,7 @@ nfsd4_create_clid_dir(struct nfs4_client *clp)
 	if (!nn->rec_file)
 		return;
 
-	status = nfs4_make_rec_clidname(dname, &clp->cl_name);
-	if (status)
-		return legacy_recdir_name_error(clp, status);
+	nfs4_make_rec_clidname(dname, &clp->cl_name);
 
 	status = nfs4_save_creds(&original_cred);
 	if (status < 0)
@@ -184,13 +144,11 @@ nfsd4_create_clid_dir(struct nfs4_client *clp)
 		goto out_creds;
 
 	dir = nn->rec_file->f_path.dentry;
-	/* lock the parent */
-	inode_lock(d_inode(dir));
 
-	dentry = lookup_one(&nop_mnt_idmap, &QSTR(dname), dir);
+	dentry = start_creating(&nop_mnt_idmap, dir, &QSTR(dname));
 	if (IS_ERR(dentry)) {
 		status = PTR_ERR(dentry);
-		goto out_unlock;
+		goto out;
 	}
 	if (d_really_is_positive(dentry))
 		/*
@@ -201,15 +159,13 @@ nfsd4_create_clid_dir(struct nfs4_client *clp)
 		 * In the 4.0 case, we should never get here; but we may
 		 * as well be forgiving and just succeed silently.
 		 */
-		goto out_put;
-	dentry = vfs_mkdir(&nop_mnt_idmap, d_inode(dir), dentry, S_IRWXU);
+		goto out_end;
+	dentry = vfs_mkdir(&nop_mnt_idmap, d_inode(dir), dentry, 0700, NULL);
 	if (IS_ERR(dentry))
 		status = PTR_ERR(dentry);
-out_put:
-	if (!status)
-		dput(dentry);
-out_unlock:
-	inode_unlock(d_inode(dir));
+out_end:
+	end_creating(dentry);
+out:
 	if (status == 0) {
 		if (test_bit(NFSD_NET_IN_GRACE, &nn->flags))
 			__nfsd4_create_reclaim_record_grace(clp, dname, nn);
@@ -247,7 +203,7 @@ nfsd4_build_namelist(struct dir_context *__ctx, const char *name, int namlen,
 
 	if (namlen != HEXDIR_LEN - 1)
 		return true;
-	entry = kmalloc(sizeof(struct name_list), GFP_KERNEL);
+	entry = kmalloc_obj(struct name_list);
 	if (entry == NULL)
 		return false;
 	memcpy(entry->name, name, HEXDIR_LEN - 1);
@@ -306,20 +262,12 @@ nfsd4_unlink_clid_dir(char *name, struct nfsd_net *nn)
 	dprintk("NFSD: nfsd4_unlink_clid_dir. name %s\n", name);
 
 	dir = nn->rec_file->f_path.dentry;
-	inode_lock_nested(d_inode(dir), I_MUTEX_PARENT);
-	dentry = lookup_one(&nop_mnt_idmap, &QSTR(name), dir);
-	if (IS_ERR(dentry)) {
-		status = PTR_ERR(dentry);
-		goto out_unlock;
-	}
-	status = -ENOENT;
-	if (d_really_is_negative(dentry))
-		goto out;
-	status = vfs_rmdir(&nop_mnt_idmap, d_inode(dir), dentry);
-out:
-	dput(dentry);
-out_unlock:
-	inode_unlock(d_inode(dir));
+	dentry = start_removing(&nop_mnt_idmap, dir, &QSTR(name));
+	if (IS_ERR(dentry))
+		return PTR_ERR(dentry);
+
+	status = vfs_rmdir(&nop_mnt_idmap, d_inode(dir), dentry, NULL);
+	end_removing(dentry);
 	return status;
 }
 
@@ -356,9 +304,7 @@ nfsd4_remove_clid_dir(struct nfs4_client *clp)
 	if (!nn->rec_file || !test_bit(NFSD4_CLIENT_STABLE, &clp->cl_flags))
 		return;
 
-	status = nfs4_make_rec_clidname(dname, &clp->cl_name);
-	if (status)
-		return legacy_recdir_name_error(clp, status);
+	nfs4_make_rec_clidname(dname, &clp->cl_name);
 
 	status = mnt_want_write_file(nn->rec_file);
 	if (status)
@@ -408,16 +354,14 @@ purge_old(struct dentry *parent, char *cname, struct nfsd_net *nn)
 	if (nfs4_has_reclaimed_state(name, nn))
 		goto out_free;
 
-	inode_lock_nested(d_inode(parent), I_MUTEX_PARENT);
-	child = lookup_one(&nop_mnt_idmap, &QSTR(cname), parent);
+	child = start_removing_noperm(parent, &QSTR(cname));
 	if (!IS_ERR(child)) {
-		status = vfs_rmdir(&nop_mnt_idmap, d_inode(parent), child);
+		status = vfs_rmdir(&nop_mnt_idmap, d_inode(parent), child, NULL);
 		if (status)
 			printk("failed to remove client recovery directory %pd\n",
 			       child);
-		dput(child);
 	}
-	inode_unlock(d_inode(parent));
+	end_removing(child);
 
 out_free:
 	kfree(name.data);
@@ -534,9 +478,8 @@ nfs4_legacy_state_init(struct net *net)
 	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
 	int i;
 
-	nn->reclaim_str_hashtbl = kmalloc_array(CLIENT_HASH_SIZE,
-						sizeof(struct list_head),
-						GFP_KERNEL);
+	nn->reclaim_str_hashtbl = kmalloc_objs(struct list_head,
+					       CLIENT_HASH_SIZE);
 	if (!nn->reclaim_str_hashtbl)
 		return -ENOMEM;
 
@@ -639,7 +582,6 @@ nfs4_recoverydir(void)
 static int
 nfsd4_check_legacy_client(struct nfs4_client *clp)
 {
-	int status;
 	char dname[HEXDIR_LEN];
 	struct nfs4_client_reclaim *crp;
 	struct nfsd_net *nn = net_generic(clp->net, nfsd_net_id);
@@ -649,11 +591,7 @@ nfsd4_check_legacy_client(struct nfs4_client *clp)
 	if (test_bit(NFSD4_CLIENT_STABLE, &clp->cl_flags))
 		return 0;
 
-	status = nfs4_make_rec_clidname(dname, &clp->cl_name);
-	if (status) {
-		legacy_recdir_name_error(clp, status);
-		return status;
-	}
+	nfs4_make_rec_clidname(dname, &clp->cl_name);
 
 	/* look for it in the reclaim hashtable otherwise */
 	name.data = kmemdup(dname, HEXDIR_LEN, GFP_KERNEL);
@@ -986,7 +924,7 @@ __nfsd4_init_cld_pipe(struct net *net)
 	if (nn->cld_net)
 		return 0;
 
-	cn = kzalloc(sizeof(*cn), GFP_KERNEL);
+	cn = kzalloc_obj(*cn);
 	if (!cn) {
 		ret = -ENOMEM;
 		goto err;
@@ -1054,7 +992,7 @@ alloc_cld_upcall(struct nfsd_net *nn)
 	struct cld_upcall *new, *tmp;
 	struct cld_net *cn = nn->cld_net;
 
-	new = kzalloc(sizeof(*new), GFP_KERNEL);
+	new = kzalloc_obj(*new);
 	if (!new)
 		return new;
 
@@ -1279,13 +1217,10 @@ nfsd4_cld_check(struct nfs4_client *clp)
 
 #ifdef CONFIG_NFSD_LEGACY_CLIENT_TRACKING
 	if (nn->cld_net->cn_has_legacy) {
-		int status;
 		char dname[HEXDIR_LEN];
 		struct xdr_netobj name;
 
-		status = nfs4_make_rec_clidname(dname, &clp->cl_name);
-		if (status)
-			return -ENOENT;
+		nfs4_make_rec_clidname(dname, &clp->cl_name);
 
 		name.data = kmemdup(dname, HEXDIR_LEN, GFP_KERNEL);
 		if (!name.data) {
@@ -1335,11 +1270,8 @@ nfsd4_cld_check_v2(struct nfs4_client *clp)
 	if (cn->cn_has_legacy) {
 		struct xdr_netobj name;
 		char dname[HEXDIR_LEN];
-		int status;
 
-		status = nfs4_make_rec_clidname(dname, &clp->cl_name);
-		if (status)
-			return -ENOENT;
+		nfs4_make_rec_clidname(dname, &clp->cl_name);
 
 		name.data = kmemdup(dname, HEXDIR_LEN, GFP_KERNEL);
 		if (!name.data) {
@@ -1471,9 +1403,8 @@ nfs4_cld_state_init(struct net *net)
 	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
 	int i;
 
-	nn->reclaim_str_hashtbl = kmalloc_array(CLIENT_HASH_SIZE,
-						sizeof(struct list_head),
-						GFP_KERNEL);
+	nn->reclaim_str_hashtbl = kmalloc_objs(struct list_head,
+					       CLIENT_HASH_SIZE);
 	if (!nn->reclaim_str_hashtbl)
 		return -ENOMEM;
 
@@ -1722,11 +1653,7 @@ nfsd4_cltrack_legacy_recdir(const struct xdr_netobj *name)
 		return NULL;
 	}
 
-	copied = nfs4_make_rec_clidname(result + copied, name);
-	if (copied) {
-		kfree(result);
-		return NULL;
-	}
+	nfs4_make_rec_clidname(result + copied, name);
 
 	return result;
 }

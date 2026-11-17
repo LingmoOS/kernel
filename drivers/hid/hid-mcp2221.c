@@ -19,7 +19,14 @@
 #include <linux/gpio/driver.h>
 #include <linux/iio/iio.h>
 #include <linux/minmax.h>
+#include <linux/moduleparam.h>
 #include "hid-ids.h"
+
+static bool gpio_mode_enforce;
+
+module_param(gpio_mode_enforce, bool, 0644);
+MODULE_PARM_DESC(gpio_mode_enforce,
+	 "Enforce GPIO mode for GP0 thru GP3 (default: false, will be used for IIO)");
 
 /* Commands codes in a raw output report */
 enum {
@@ -543,10 +550,10 @@ static int mcp_smbus_xfer(struct i2c_adapter *adapter, u16 addr,
 			if (ret)
 				goto exit;
 
-			mcp->rxbuf_idx = 0;
-			mcp->rxbuf = data->block;
-			mcp->txbuf[0] = MCP2221_I2C_GET_DATA;
-			ret = mcp_send_data_req_status(mcp, mcp->txbuf, 1);
+			ret = mcp_i2c_smbus_read(mcp, NULL,
+						MCP2221_I2C_RD_RPT_START,
+						addr, data->block[0] + 1,
+						data->block);
 			if (ret)
 				goto exit;
 		} else {
@@ -562,14 +569,14 @@ static int mcp_smbus_xfer(struct i2c_adapter *adapter, u16 addr,
 	case I2C_SMBUS_I2C_BLOCK_DATA:
 		if (read_write == I2C_SMBUS_READ) {
 			ret = mcp_smbus_write(mcp, addr, command, NULL,
-						0, MCP2221_I2C_WR_NO_STOP, 1);
+						0, MCP2221_I2C_WR_NO_STOP, 0);
 			if (ret)
 				goto exit;
 
-			mcp->rxbuf_idx = 0;
-			mcp->rxbuf = data->block;
-			mcp->txbuf[0] = MCP2221_I2C_GET_DATA;
-			ret = mcp_send_data_req_status(mcp, mcp->txbuf, 1);
+			ret = mcp_i2c_smbus_read(mcp, NULL,
+						MCP2221_I2C_RD_RPT_START,
+						addr, data->block[0],
+						&data->block[1]);
 			if (ret)
 				goto exit;
 		} else {
@@ -657,7 +664,7 @@ static int mcp2221_check_gpio_pinfunc(struct mcp2221 *mcp)
 	int needgpiofix = 0;
 	int ret;
 
-	if (IS_ENABLED(CONFIG_IIO))
+	if (IS_ENABLED(CONFIG_IIO) && !gpio_mode_enforce)
 		return 0;
 
 	ret = mcp_gpio_read_sram(mcp);
@@ -1340,7 +1347,8 @@ static int mcp2221_probe(struct hid_device *hdev,
 
 #if IS_REACHABLE(CONFIG_IIO)
 	INIT_DELAYED_WORK(&mcp->init_work, mcp_init_work);
-	schedule_delayed_work(&mcp->init_work, msecs_to_jiffies(100));
+	if (!gpio_mode_enforce)
+		schedule_delayed_work(&mcp->init_work, msecs_to_jiffies(100));
 #endif
 
 	return 0;

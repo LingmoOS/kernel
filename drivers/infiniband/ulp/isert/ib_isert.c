@@ -155,9 +155,8 @@ isert_alloc_rx_descriptors(struct isert_conn *isert_conn)
 	u64 dma_addr;
 	int i, j;
 
-	isert_conn->rx_descs = kcalloc(ISERT_QP_MAX_RECV_DTOS,
-				       sizeof(struct iser_rx_desc),
-				       GFP_KERNEL);
+	isert_conn->rx_descs = kzalloc_objs(struct iser_rx_desc,
+					    ISERT_QP_MAX_RECV_DTOS);
 	if (!isert_conn->rx_descs)
 		return -ENOMEM;
 
@@ -218,9 +217,9 @@ isert_create_device_ib_res(struct isert_device *device)
 	struct ib_device *ib_dev = device->ib_device;
 	int ret;
 
-	isert_dbg("devattr->max_send_sge: %d devattr->max_recv_sge %d\n",
+	isert_dbg("devattr->max_send_sge: %u devattr->max_recv_sge %u\n",
 		  ib_dev->attrs.max_send_sge, ib_dev->attrs.max_recv_sge);
-	isert_dbg("devattr->max_sge_rd: %d\n", ib_dev->attrs.max_sge_rd);
+	isert_dbg("devattr->max_sge_rd: %u\n", ib_dev->attrs.max_sge_rd);
 
 	device->pd = ib_alloc_pd(ib_dev, 0);
 	if (IS_ERR(device->pd)) {
@@ -278,7 +277,7 @@ isert_device_get(struct rdma_cm_id *cma_id)
 		}
 	}
 
-	device = kzalloc(sizeof(struct isert_device), GFP_KERNEL);
+	device = kzalloc_obj(struct isert_device);
 	if (!device) {
 		mutex_unlock(&device_list_mutex);
 		return ERR_PTR(-ENOMEM);
@@ -337,8 +336,7 @@ isert_alloc_login_buf(struct isert_conn *isert_conn,
 {
 	int ret;
 
-	isert_conn->login_desc = kzalloc(sizeof(*isert_conn->login_desc),
-			GFP_KERNEL);
+	isert_conn->login_desc = kzalloc_obj(*isert_conn->login_desc);
 	if (!isert_conn->login_desc)
 		return -ENOMEM;
 
@@ -387,8 +385,7 @@ isert_set_nego_params(struct isert_conn *isert_conn,
 	struct ib_device_attr *attr = &isert_conn->device->ib_device->attrs;
 
 	/* Set max inflight RDMA READ requests */
-	isert_conn->initiator_depth = min_t(u8, param->initiator_depth,
-				attr->max_qp_init_rd_atom);
+	isert_conn->initiator_depth = min(param->initiator_depth, attr->max_qp_init_rd_atom);
 	isert_dbg("Using initiator_depth: %u\n", isert_conn->initiator_depth);
 
 	if (param->private_data) {
@@ -433,7 +430,7 @@ isert_connect_request(struct rdma_cm_id *cma_id, struct rdma_cm_event *event)
 	isert_dbg("cma_id: %p, portal: %p\n",
 		 cma_id, cma_id->context);
 
-	isert_conn = kzalloc(sizeof(struct isert_conn), GFP_KERNEL);
+	isert_conn = kzalloc_obj(struct isert_conn);
 	if (!isert_conn)
 		return -ENOMEM;
 
@@ -2320,7 +2317,7 @@ isert_setup_np(struct iscsi_np *np,
 	struct rdma_cm_id *isert_lid;
 	int ret;
 
-	isert_np = kzalloc(sizeof(struct isert_np), GFP_KERNEL);
+	isert_np = kzalloc_obj(struct isert_np);
 	if (!isert_np)
 		return -ENOMEM;
 
@@ -2694,7 +2691,7 @@ static struct iscsit_transport iser_target_transport = {
 
 static int __init isert_init(void)
 {
-	isert_login_wq = alloc_workqueue("isert_login_wq", 0, 0);
+	isert_login_wq = alloc_workqueue("isert_login_wq", WQ_PERCPU, 0);
 	if (!isert_login_wq) {
 		isert_err("Unable to allocate isert_login_wq\n");
 		return -ENOMEM;

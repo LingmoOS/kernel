@@ -589,6 +589,7 @@ static int elevator_switch(struct request_queue *q, struct elv_change_ctx *ctx)
 		blk_queue_flag_clear(QUEUE_FLAG_SQ_SCHED, q);
 		q->elevator = NULL;
 		q->nr_requests = q->tag_set->queue_depth;
+		q->async_depth = q->tag_set->queue_depth;
 	}
 	blk_add_trace_msg(q, "elv switch: %s", ctx->name);
 
@@ -728,7 +729,11 @@ void elv_update_nr_hw_queues(struct request_queue *q,
 void elevator_set_default(struct request_queue *q)
 {
 	struct elv_change_ctx ctx = {
+#if defined(CONFIG_ZEN_INTERACTIVE) && defined(CONFIG_IOSCHED_BFQ)
+		.name = "bfq",
+#else
 		.name = "mq-deadline",
+#endif
 		.no_uevent = true,
 	};
 	int err;
@@ -744,17 +749,22 @@ void elevator_set_default(struct request_queue *q)
 	 * have multiple queues or mq-deadline is not available, default
 	 * to "none".
 	 */
+	if (q->nr_hw_queues != 1 && !blk_mq_is_shared_tags(q->tag_set->flags))
+#if defined(CONFIG_ZEN_INTERACTIVE) && defined(CONFIG_MQ_IOSCHED_KYBER)
+		ctx.name = "kyber";
+#else
+		return;
+#endif
+
 	ctx.type = elevator_find_get(ctx.name);
 	if (!ctx.type)
 		return;
 
-	if ((q->nr_hw_queues == 1 ||
-			blk_mq_is_shared_tags(q->tag_set->flags))) {
-		err = elevator_change(q, &ctx);
-		if (err < 0)
-			pr_warn("\"%s\" elevator initialization, failed %d, falling back to \"none\"\n",
-					ctx.name, err);
-	}
+	err = elevator_change(q, &ctx);
+	if (err < 0)
+		pr_warn("\"%s\" elevator initialization, failed %d, falling back to \"none\"\n",
+				ctx.name, err);
+
 	elevator_put(ctx.type);
 }
 
@@ -811,8 +821,13 @@ ssize_t elv_iosched_store(struct gendisk *disk, const char *buf,
 	 * reference during concurrent disk deletion:
 	 *   update_nr_hwq_lock -> kn->active (via del_gendisk -> kobject_del)
 	 *   kn->active -> update_nr_hwq_lock (via this sysfs write path)
+	 *
+	 * Use the writer lock instead of the reader lock of update_nr_hwq_lock
+	 * to serialize the two-stage elevator switch steps in
+	 * elevator_change(): the core switch step under the elevator lock and
+	 * the elevator_change_done() step outside the elevator lock.
 	 */
-	if (!down_read_trylock(&set->update_nr_hwq_lock)) {
+	if (!down_write_trylock(&set->update_nr_hwq_lock)) {
 		ret = -EBUSY;
 		goto out;
 	}
@@ -823,7 +838,7 @@ ssize_t elv_iosched_store(struct gendisk *disk, const char *buf,
 	} else {
 		ret = -ENOENT;
 	}
-	up_read(&set->update_nr_hwq_lock);
+	up_write(&set->update_nr_hwq_lock);
 
 out:
 	if (ctx.type)

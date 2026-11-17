@@ -13,6 +13,7 @@
 #include <linux/delay.h>
 #include <linux/slab.h>
 #include <linux/usb/typec_dp.h>
+#include <linux/usb/typec_tbt.h>
 
 #include "ucsi.h"
 #include "trace.h"
@@ -62,7 +63,8 @@ void ucsi_notify_common(struct ucsi *ucsi, u32 cci)
 EXPORT_SYMBOL_GPL(ucsi_notify_common);
 
 int ucsi_sync_control_common(struct ucsi *ucsi, u64 command, u32 *cci,
-			     void *data, size_t size)
+			     void *data, size_t size, void *msg_out,
+			     size_t msg_out_size)
 {
 	bool ack = UCSI_COMMAND(command) == UCSI_ACK_CC_CI;
 	int ret;
@@ -73,6 +75,17 @@ int ucsi_sync_control_common(struct ucsi *ucsi, u64 command, u32 *cci,
 		set_bit(COMMAND_PENDING, &ucsi->flags);
 
 	reinit_completion(&ucsi->complete);
+
+	if (msg_out && msg_out_size) {
+		if (!ucsi->ops->write_message_out) {
+			ret = -EOPNOTSUPP;
+			goto out_clear_bit;
+		}
+
+		ret = ucsi->ops->write_message_out(ucsi, msg_out, msg_out_size);
+		if (ret)
+			goto out_clear_bit;
+	}
 
 	ret = ucsi->ops->async_control(ucsi, command);
 	if (ret)
@@ -110,11 +123,12 @@ static int ucsi_acknowledge(struct ucsi *ucsi, bool conn_ack)
 		ctrl |= UCSI_ACK_CONNECTOR_CHANGE;
 	}
 
-	return ucsi->ops->sync_control(ucsi, ctrl, NULL, NULL, 0);
+	return ucsi->ops->sync_control(ucsi, ctrl, NULL, NULL, 0, NULL, 0);
 }
 
 static int ucsi_run_command(struct ucsi *ucsi, u64 command, u32 *cci,
-			    void *data, size_t size, bool conn_ack)
+			    void *data, size_t size, void *msg_out,
+			    size_t msg_out_size, bool conn_ack)
 {
 	int ret, err;
 
@@ -123,10 +137,12 @@ static int ucsi_run_command(struct ucsi *ucsi, u64 command, u32 *cci,
 	if (size > UCSI_MAX_DATA_LENGTH(ucsi))
 		return -EINVAL;
 
-	ret = ucsi->ops->sync_control(ucsi, command, cci, data, size);
+	ret = ucsi->ops->sync_control(ucsi, command, cci, data, size,
+				      msg_out, msg_out_size);
 
 	if (*cci & UCSI_CCI_BUSY)
-		return ucsi_run_command(ucsi, UCSI_CANCEL, cci, NULL, 0, false) ?: -EBUSY;
+		return ucsi_run_command(ucsi, UCSI_CANCEL, cci,
+					NULL, 0, NULL, 0, false) ?: -EBUSY;
 	if (ret)
 		return ret;
 
@@ -158,7 +174,8 @@ static int ucsi_read_error(struct ucsi *ucsi, u8 connector_num)
 	int ret;
 
 	command = UCSI_GET_ERROR_STATUS | UCSI_CONNECTOR_NUMBER(connector_num);
-	ret = ucsi_run_command(ucsi, command, &cci, &error, sizeof(error), false);
+	ret = ucsi_run_command(ucsi, command, &cci, &error,
+			       sizeof(error), NULL, 0, false);
 	if (ret < 0)
 		return ret;
 
@@ -208,7 +225,8 @@ static int ucsi_read_error(struct ucsi *ucsi, u8 connector_num)
 }
 
 static int ucsi_send_command_common(struct ucsi *ucsi, u64 cmd,
-				    void *data, size_t size, bool conn_ack)
+				    void *data, size_t size, void *msg_out,
+				    size_t msg_out_size, bool conn_ack)
 {
 	u8 connector_num;
 	u32 cci;
@@ -236,10 +254,13 @@ static int ucsi_send_command_common(struct ucsi *ucsi, u64 cmd,
 
 	mutex_lock(&ucsi->ppm_lock);
 
-	ret = ucsi_run_command(ucsi, cmd, &cci, data, size, conn_ack);
+	ret = ucsi_run_command(ucsi, cmd, &cci, data, size,
+			       msg_out, msg_out_size, conn_ack);
 
 	if (cci & UCSI_CCI_ERROR)
 		ret = ucsi_read_error(ucsi, connector_num);
+
+	trace_ucsi_run_command(cmd, ret);
 
 	mutex_unlock(&ucsi->ppm_lock);
 	return ret;
@@ -248,9 +269,22 @@ static int ucsi_send_command_common(struct ucsi *ucsi, u64 cmd,
 int ucsi_send_command(struct ucsi *ucsi, u64 command,
 		      void *data, size_t size)
 {
-	return ucsi_send_command_common(ucsi, command, data, size, false);
+	return ucsi_send_command_common(ucsi, command, data,
+					size, NULL, 0, false);
 }
 EXPORT_SYMBOL_GPL(ucsi_send_command);
+
+int ucsi_write_message_out_command(struct ucsi *ucsi, u64 command,
+				   void *data, size_t size, void *msg_out,
+				   size_t msg_out_size)
+{
+	if (msg_out_size > UCSI_MAX_MSG_OUT_DATA_LEN(ucsi))
+		return -EINVAL;
+
+	return ucsi_send_command_common(ucsi, command, data,
+					size, msg_out, msg_out_size, false);
+}
+EXPORT_SYMBOL_GPL(ucsi_write_message_out_command);
 
 /* -------------------------------------------------------------------------- */
 
@@ -299,7 +333,7 @@ static int ucsi_partner_task(struct ucsi_connector *con,
 	if (!con->partner)
 		return 0;
 
-	uwork = kzalloc(sizeof(*uwork), GFP_KERNEL);
+	uwork = kzalloc_obj(*uwork);
 	if (!uwork)
 		return -ENOMEM;
 
@@ -321,6 +355,7 @@ void ucsi_altmode_update_active(struct ucsi_connector *con)
 {
 	const struct typec_altmode *altmode = NULL;
 	u64 command;
+	u16 svid = 0;
 	int ret;
 	u8 cur;
 	int i;
@@ -342,6 +377,10 @@ void ucsi_altmode_update_active(struct ucsi_connector *con)
 	for (i = 0; con->partner_altmode[i]; i++)
 		typec_altmode_update_active(con->partner_altmode[i],
 					    con->partner_altmode[i] == altmode);
+
+	if (altmode)
+		svid = altmode->svid;
+	typec_altmode_state_update(con->partner, svid, 0);
 }
 
 static int ucsi_altmode_next_mode(struct typec_altmode **alt, u16 svid)
@@ -418,6 +457,9 @@ static int ucsi_register_altmode(struct ucsi_connector *con,
 			else
 				alt = ucsi_register_displayport(con, override,
 								i, desc);
+			break;
+		case USB_TYPEC_TBT_SID:
+			alt = ucsi_register_thunderbolt(con, override, i, desc);
 			break;
 		default:
 			alt = typec_port_register_altmode(con->port, desc);
@@ -754,6 +796,8 @@ static int ucsi_register_altmodes(struct ucsi_connector *con, u8 recipient)
 			desc.vdo = alt[j].mid;
 			desc.svid = alt[j].svid;
 			desc.roles = TYPEC_PORT_DRD;
+			desc.mode_selection = con->ucsi->ops->add_partner_altmodes &&
+					!con->typec_cap.no_mode_control;
 
 			ret = ucsi_register_altmode(con, &desc, recipient);
 			if (ret)
@@ -785,12 +829,15 @@ static void ucsi_unregister_altmodes(struct ucsi_connector *con, u8 recipient)
 	}
 
 	while (adev[i]) {
-		if (recipient == UCSI_RECIPIENT_SOP &&
-		    (adev[i]->svid == USB_TYPEC_DP_SID ||
-			(adev[i]->svid == USB_TYPEC_NVIDIA_VLINK_SID &&
-			adev[i]->vdo != USB_TYPEC_NVIDIA_VLINK_DBG_VDO))) {
+		if (recipient == UCSI_RECIPIENT_SOP) {
 			pdev = typec_altmode_get_partner(adev[i]);
-			ucsi_displayport_remove_partner((void *)pdev);
+
+			if (adev[i]->svid == USB_TYPEC_DP_SID ||
+			    (adev[i]->svid == USB_TYPEC_NVIDIA_VLINK_SID &&
+			     adev[i]->vdo != USB_TYPEC_NVIDIA_VLINK_DBG_VDO))
+				ucsi_displayport_remove_partner((void *)pdev);
+			else if (adev[i]->svid == USB_TYPEC_TBT_SID)
+				ucsi_thunderbolt_remove_partner((void *)pdev);
 		}
 		typec_unregister_altmode(adev[i]);
 		adev[i++] = NULL;
@@ -804,7 +851,8 @@ static int ucsi_get_connector_status(struct ucsi_connector *con, bool conn_ack)
 			  UCSI_MAX_DATA_LENGTH(con->ucsi));
 	int ret;
 
-	ret = ucsi_send_command_common(con->ucsi, command, &con->status, size, conn_ack);
+	ret = ucsi_send_command_common(con->ucsi, command, &con->status, size,
+				       NULL, 0, conn_ack);
 
 	return ret < 0 ? ret : 0;
 }
@@ -976,6 +1024,8 @@ static int ucsi_check_altmodes(struct ucsi_connector *con)
 	if (con->partner_altmode[0]) {
 		num_partner_am = ucsi_get_num_altmode(con->partner_altmode);
 		typec_partner_set_num_altmodes(con->partner, num_partner_am);
+		if (con->ucsi->ops->add_partner_altmodes)
+			con->ucsi->ops->add_partner_altmodes(con);
 		ucsi_altmode_update_active(con);
 		return 0;
 	} else {
@@ -1052,8 +1102,8 @@ static int ucsi_register_plug(struct ucsi_connector *con)
 	plug = typec_register_plug(con->cable, &desc);
 	if (IS_ERR(plug)) {
 		dev_err(con->ucsi->dev,
-			"con%d: failed to register plug (%ld)\n", con->num,
-			PTR_ERR(plug));
+			"con%d: failed to register plug (%pe)\n", con->num,
+			plug);
 		return PTR_ERR(plug);
 	}
 
@@ -1111,8 +1161,8 @@ static int ucsi_register_cable(struct ucsi_connector *con)
 	cable = typec_register_cable(con->port, &desc);
 	if (IS_ERR(cable)) {
 		dev_err(con->ucsi->dev,
-			"con%d: failed to register cable (%ld)\n", con->num,
-			PTR_ERR(cable));
+			"con%d: failed to register cable (%pe)\n", con->num,
+			cable);
 		return PTR_ERR(cable);
 	}
 
@@ -1153,6 +1203,28 @@ static int ucsi_check_connector_capability(struct ucsi_connector *con)
 	return ret;
 }
 
+static void ucsi_orientation(struct ucsi_connector *con)
+{
+	if (con->ucsi->version < UCSI_VERSION_2_0)
+		return;
+
+	if (!UCSI_CONSTAT(con, CONNECTED)) {
+		typec_set_orientation(con->port, TYPEC_ORIENTATION_NONE);
+		return;
+	}
+
+	switch (UCSI_CONSTAT(con, ORIENTATION)) {
+	case UCSI_CONSTAT_ORIENTATION_NORMAL:
+		typec_set_orientation(con->port, TYPEC_ORIENTATION_NORMAL);
+		break;
+	case UCSI_CONSTAT_ORIENTATION_REVERSE:
+		typec_set_orientation(con->port, TYPEC_ORIENTATION_REVERSE);
+		break;
+	default:
+		break;
+	}
+}
+
 static void ucsi_pwr_opmode_change(struct ucsi_connector *con)
 {
 	switch (UCSI_CONSTAT(con, PWR_OPMODE)) {
@@ -1167,14 +1239,17 @@ static void ucsi_pwr_opmode_change(struct ucsi_connector *con)
 	case UCSI_CONSTAT_PWR_OPMODE_TYPEC1_5:
 		con->rdo = 0;
 		typec_set_pwr_opmode(con->port, TYPEC_PWR_MODE_1_5A);
+		ucsi_port_psy_changed(con);
 		break;
 	case UCSI_CONSTAT_PWR_OPMODE_TYPEC3_0:
 		con->rdo = 0;
 		typec_set_pwr_opmode(con->port, TYPEC_PWR_MODE_3_0A);
+		ucsi_port_psy_changed(con);
 		break;
 	default:
 		con->rdo = 0;
 		typec_set_pwr_opmode(con->port, TYPEC_PWR_MODE_USB);
+		ucsi_port_psy_changed(con);
 		break;
 	}
 }
@@ -1216,8 +1291,8 @@ static int ucsi_register_partner(struct ucsi_connector *con)
 	partner = typec_register_partner(con->port, &desc);
 	if (IS_ERR(partner)) {
 		dev_err(con->ucsi->dev,
-			"con%d: failed to register partner (%ld)\n", con->num,
-			PTR_ERR(partner));
+			"con%d: failed to register partner (%pe)\n", con->num,
+			partner);
 		return PTR_ERR(partner);
 	}
 
@@ -1239,6 +1314,8 @@ static void ucsi_unregister_partner(struct ucsi_connector *con)
 		return;
 
 	typec_set_mode(con->port, TYPEC_STATE_SAFE);
+	if (con->ucsi->ops->remove_partner_altmodes)
+		con->ucsi->ops->remove_partner_altmodes(con);
 
 	typec_partner_set_usb_power_delivery(con->partner, NULL);
 	ucsi_unregister_partner_pdos(con);
@@ -1282,10 +1359,18 @@ static void ucsi_partner_change(struct ucsi_connector *con)
 			if (UCSI_CONSTAT(con, PARTNER_FLAG_USB))
 				typec_set_mode(con->port, TYPEC_STATE_USB);
 		}
+
+		if (((con->ucsi->version >= UCSI_VERSION_3_0 &&
+		    UCSI_CONSTAT(con, PARTNER_FLAG_USB4_GEN4)) ||
+		    (con->ucsi->version >= UCSI_VERSION_2_0 &&
+		    UCSI_CONSTAT(con, PARTNER_FLAG_USB4_GEN3))) && con->partner)
+			typec_partner_set_usb_mode(con->partner, USB_MODE_USB4);
 	}
 
-	/* Only notify USB controller if partner supports USB data */
-	if (!(UCSI_CONSTAT(con, PARTNER_FLAG_USB)))
+	if ((!UCSI_CONSTAT(con, PARTNER_FLAG_USB)) &&
+	    ((con->ucsi->quirks & UCSI_USB4_IMPLIES_USB) &&
+	     (!(UCSI_CONSTAT(con, PARTNER_FLAG_USB4_GEN3) ||
+		UCSI_CONSTAT(con, PARTNER_FLAG_USB4_GEN4)))))
 		u_role = USB_ROLE_NONE;
 
 	ret = usb_role_switch_set_role(con->usb_role_sw, u_role);
@@ -1410,6 +1495,7 @@ static void ucsi_handle_connector_change(struct work_struct *work)
 		typec_set_pwr_role(con->port, role);
 		ucsi_port_psy_changed(con);
 		ucsi_partner_change(con);
+		ucsi_orientation(con);
 
 		if (UCSI_CONSTAT(con, CONNECTED)) {
 			ucsi_register_partner(con);
@@ -1433,6 +1519,8 @@ static void ucsi_handle_connector_change(struct work_struct *work)
 
 	if (con->partner && (change & UCSI_CONSTAT_PARTNER_CHANGE)) {
 		ucsi_partner_change(con);
+		if (con->partner_altmode[0])
+			ucsi_altmode_update_active(con);
 
 		/* Complete pending data role swap */
 		if (!completion_done(&con->complete))
@@ -1442,7 +1530,7 @@ static void ucsi_handle_connector_change(struct work_struct *work)
 	if (change & UCSI_CONSTAT_CAM_CHANGE)
 		ucsi_partner_task(con, ucsi_check_altmodes, 1, HZ);
 
-	if (change & UCSI_CONSTAT_BC_CHANGE)
+	if (change & (UCSI_CONSTAT_BC_CHANGE | UCSI_CONSTAT_SINK_PATH_CHANGE))
 		ucsi_port_psy_changed(con);
 
 	if (con->ucsi->version >= UCSI_VERSION_2_1 &&
@@ -1806,6 +1894,10 @@ static int ucsi_register_port(struct ucsi *ucsi, struct ucsi_connector *con)
 
 	cap->driver_data = con;
 	cap->ops = &ucsi_ops;
+	cap->no_mode_control = !(con->ucsi->cap.features & UCSI_CAP_ALT_MODE_OVERRIDE);
+
+	if (ucsi->version >= UCSI_VERSION_2_0)
+		con->typec_cap.orientation_aware = true;
 
 	if (ucsi->ops->update_connector)
 		ucsi->ops->update_connector(con);
@@ -1863,6 +1955,7 @@ static int ucsi_register_port(struct ucsi *ucsi, struct ucsi_connector *con)
 		typec_set_pwr_role(con->port, UCSI_CONSTAT(con, PWR_DIR));
 		ucsi_register_partner(con);
 		ucsi_pwr_opmode_change(con);
+		ucsi_orientation(con);
 		ucsi_port_psy_changed(con);
 		if (con->ucsi->cap.features & UCSI_CAP_GET_PD_MESSAGE)
 			ucsi_get_partner_identity(con);
@@ -2024,7 +2117,7 @@ static int ucsi_init(struct ucsi *ucsi)
 	}
 
 	/* Allocate the connectors. Released in ucsi_unregister() */
-	connector = kcalloc(ucsi->cap.num_connectors + 1, sizeof(*connector), GFP_KERNEL);
+	connector = kzalloc_objs(*connector, ucsi->cap.num_connectors + 1);
 	if (!connector) {
 		ret = -ENOMEM;
 		goto err_reset;
@@ -2140,7 +2233,7 @@ static void ucsi_init_work(struct work_struct *work)
 			return;
 		}
 
-		queue_delayed_work(system_long_wq, &ucsi->work,
+		queue_delayed_work(system_dfl_long_wq, &ucsi->work,
 				   UCSI_ROLE_SWITCH_INTERVAL);
 	}
 }
@@ -2214,7 +2307,7 @@ struct ucsi *ucsi_create(struct device *dev, const struct ucsi_operations *ops)
 	    !ops->read_message_in || !ops->sync_control || !ops->async_control)
 		return ERR_PTR(-EINVAL);
 
-	ucsi = kzalloc(sizeof(*ucsi), GFP_KERNEL);
+	ucsi = kzalloc_obj(*ucsi);
 	if (!ucsi)
 		return ERR_PTR(-ENOMEM);
 
@@ -2264,7 +2357,7 @@ int ucsi_register(struct ucsi *ucsi)
 		UCSI_BCD_GET_MINOR(ucsi->version),
 		UCSI_BCD_GET_SUBMINOR(ucsi->version));
 
-	queue_delayed_work(system_long_wq, &ucsi->work, 0);
+	queue_delayed_work(system_dfl_long_wq, &ucsi->work, 0);
 
 	ucsi_debugfs_register(ucsi);
 	return 0;

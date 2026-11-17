@@ -180,6 +180,29 @@ static void ima_rdwr_violation_check(struct file *file,
 				  "invalid_pcr", "open_writers");
 }
 
+/*
+ * Detect file change based on STATX_CHANGE_COOKIE, when supported, and
+ * fallback to detecting file change based on i_version. On filesystems
+ * which do not support either, assume the file changed.
+ */
+static bool ima_detect_file_change(struct ima_iint_cache *iint,
+				   struct inode *inode, struct file *file)
+{
+	struct kstat stat;
+	int result;
+
+	result = vfs_getattr_nosec(&file->f_path, &stat, STATX_CHANGE_COOKIE,
+				   AT_STATX_SYNC_AS_STAT);
+
+	if (!result && stat.result_mask & STATX_CHANGE_COOKIE)
+		return stat.change_cookie != iint->real_inode.version;
+
+	if (IS_I_VERSION(inode))
+		return !inode_eq_iversion(inode, iint->real_inode.version);
+
+	return true;
+}
+
 static void ima_check_last_writer(struct ima_iint_cache *iint,
 				  struct inode *inode, struct file *file)
 {
@@ -191,18 +214,13 @@ static void ima_check_last_writer(struct ima_iint_cache *iint,
 
 	mutex_lock(&iint->mutex);
 	if (atomic_read(&inode->i_writecount) == 1) {
-		struct kstat stat;
-
 		clear_bit(IMA_EMITTED_OPENWRITERS, &iint->atomic_flags);
 
 		update = test_and_clear_bit(IMA_UPDATE_XATTR,
 					    &iint->atomic_flags);
-		if ((iint->flags & IMA_NEW_FILE) ||
-		    vfs_getattr_nosec(&file->f_path, &stat,
-				      STATX_CHANGE_COOKIE,
-				      AT_STATX_SYNC_AS_STAT) ||
-		    !(stat.result_mask & STATX_CHANGE_COOKIE) ||
-		    stat.change_cookie != iint->real_inode.version) {
+
+		if (iint->flags & IMA_NEW_FILE ||
+		    ima_detect_file_change(iint, inode, file)) {
 			iint->flags &= ~(IMA_DONE_MASK | IMA_NEW_FILE);
 			iint->measured_pcrs = 0;
 			if (update)
@@ -1240,6 +1258,28 @@ int ima_measure_critical_data(const char *event_label,
 }
 EXPORT_SYMBOL_GPL(ima_measure_critical_data);
 
+/**
+ * ima_measure_raw_policy - Measure the raw policy write buffer
+ * @buf: pointer to the buffer containing the raw policy data
+ * @buf_len: size of the buffer
+ *
+ * Measure the raw policy buffer sent to the IMA policy securityfs file. The
+ * buffer is written from userspace, and the measurement is performed before
+ * parsing it. This measurement includes any data written on the policy file
+ * such as malformed policy rules and comments.
+ *
+ * Return 0 on success, a negative value otherwise.
+ */
+int ima_measure_raw_policy(const char *buf, size_t buf_len)
+{
+	if (!buf || !buf_len)
+		return -EINVAL;
+
+	return process_buffer_measurement(&nop_mnt_idmap, NULL, buf, buf_len,
+					  "ima_policy_written", POLICY_CHECK,
+					  0, NULL, false, NULL, 0);
+}
+
 #ifdef CONFIG_INTEGRITY_ASYMMETRIC_KEYS
 
 /**
@@ -1353,10 +1393,14 @@ struct lsm_blob_sizes ima_blob_sizes __ro_after_init = {
 };
 
 DEFINE_LSM(ima) = {
-	.name = "ima",
+	.id = &ima_lsmid,
 	.init = init_ima_lsm,
 	.order = LSM_ORDER_LAST,
 	.blobs = &ima_blob_sizes,
+	/* Start IMA after the TPM is available */
+#ifndef CONFIG_IMA_INIT_LATE_SYNC
+	.initcall_late = init_ima,
+#else
+	.initcall_late_sync = init_ima,
+#endif
 };
-
-late_initcall(init_ima);	/* Start IMA after the TPM is available */

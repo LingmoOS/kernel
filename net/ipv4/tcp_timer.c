@@ -22,6 +22,7 @@
 #include <linux/module.h>
 #include <linux/gfp.h>
 #include <net/tcp.h>
+#include <net/tcp_ecn.h>
 #include <net/rstreason.h>
 
 static u32 tcp_clamp_rto_to_user_timeout(const struct sock *sk)
@@ -296,7 +297,7 @@ static int tcp_write_timeout(struct sock *sk)
 		return 1;
 	}
 
-	if (sk_rethink_txhash(sk)) {
+	if (__sk_rethink_txhash_reset_dst(sk)) {
 		WRITE_ONCE(tp->timeout_rehash, tp->timeout_rehash + 1);
 		__NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPTIMEOUTREHASH);
 	}
@@ -461,7 +462,7 @@ static void tcp_fastopen_synack_timer(struct sock *sk, struct request_sock *req)
 	struct tcp_sock *tp = tcp_sk(sk);
 	int max_retries;
 
-	req->rsk_ops->syn_ack_timeout(req);
+	tcp_syn_ack_timeout(req);
 
 	/* Add one more retry for fastopen.
 	 * Paired with WRITE_ONCE() in tcp_sock_set_syncnt()
@@ -482,6 +483,8 @@ static void tcp_fastopen_synack_timer(struct sock *sk, struct request_sock *req)
 	 * it's not good to give up too easily.
 	 */
 	tcp_rtx_synack(sk, req);
+	if (req->num_retrans > 1 && tcp_rsk(req)->accecn_ok)
+		tcp_rsk(req)->accecn_fail_mode |= TCP_ACCECN_ACE_FAIL_SEND;
 	req->num_timeout++;
 	tcp_update_rto_stats(sk);
 	if (!tp->retrans_stamp)
@@ -748,13 +751,12 @@ out:
 	sock_put(sk);
 }
 
-void tcp_syn_ack_timeout(const struct request_sock *req)
+noinline_for_tracing void tcp_syn_ack_timeout(const struct request_sock *req)
 {
 	struct net *net = read_pnet(&inet_rsk(req)->ireq_net);
 
 	__NET_INC_STATS(net, LINUX_MIB_TCPTIMEOUTS);
 }
-EXPORT_IPV6_MOD(tcp_syn_ack_timeout);
 
 void tcp_reset_keepalive_timer(struct sock *sk, unsigned long len)
 {
@@ -776,7 +778,6 @@ void tcp_set_keepalive(struct sock *sk, int val)
 	else if (!val)
 		tcp_delete_keepalive_timer(sk);
 }
-EXPORT_IPV6_MOD_GPL(tcp_set_keepalive);
 
 static void tcp_keepalive_timer(struct timer_list *t)
 {

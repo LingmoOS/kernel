@@ -139,7 +139,21 @@ enum {
  * @ndo_queue_get_dma_dev: Get dma device for zero-copy operations to be used
  *			   for this queue. Return NULL on error.
  *
- * @ndo_default_qcfg:	Populate queue config struct with defaults. Optional.
+ * @ndo_default_qcfg:	(Optional) Populate queue config struct with defaults.
+ *			Queue config structs are passed to this helper before
+ *			the user-requested settings are applied.
+ *
+ * @ndo_validate_qcfg: (Optional) Check if queue config is supported.
+ *			Called when configuration affecting a queue may be
+ *			changing, either due to NIC-wide config, or config
+ *			scoped to the queue at a specified index.
+ *			When NIC-wide config is changed the callback will
+ *			be invoked for all queues.
+ *
+ * @ndo_queue_create:	Create a new RX queue on a virtual device that will
+ *			be paired with a physical device's queue via leasing.
+ *			Return the new queue id on success, negative error
+ *			on failure.
  *
  * @supported_params:	Bitmask of supported parameters, see QCFG_*.
  *
@@ -164,13 +178,21 @@ struct netdev_queue_mgmt_ops {
 				  int idx);
 	void	(*ndo_default_qcfg)(struct net_device *dev,
 				    struct netdev_queue_config *qcfg);
+	int	(*ndo_validate_qcfg)(struct net_device *dev,
+				     struct netdev_queue_config *qcfg,
+				     struct netlink_ext_ack *extack);
 	struct device *	(*ndo_queue_get_dma_dev)(struct net_device *dev,
 						 int idx);
+	int	(*ndo_queue_create)(struct net_device *dev,
+				    struct netlink_ext_ack *extack);
 
 	unsigned int supported_params;
 };
 
-bool netif_rxq_has_unreadable_mp(struct net_device *dev, int idx);
+void netdev_queue_config(struct net_device *dev, int rxq,
+			 struct netdev_queue_config *qcfg);
+
+bool netif_rxq_has_unreadable_mp(struct net_device *dev, unsigned int rxq_idx);
 
 /**
  * DOC: Lockless queue stopping / waking helpers.
@@ -329,6 +351,17 @@ static inline void netif_subqueue_sent(const struct net_device *dev,
 	netdev_tx_sent_queue(txq, bytes);
 }
 
+static inline unsigned int netif_xmit_timeout_ms(struct netdev_queue *txq)
+{
+	unsigned long trans_start = READ_ONCE(txq->trans_start);
+
+	if (netif_xmit_stopped(txq) &&
+	    time_after(jiffies, trans_start + txq->dev->watchdog_timeo))
+		return jiffies_to_msecs(jiffies - trans_start);
+
+	return 0;
+}
+
 #define netif_subqueue_maybe_stop(dev, idx, get_desc, stop_thrs, start_thrs) \
 	({								\
 		struct netdev_queue *_txq;				\
@@ -347,6 +380,14 @@ static inline void netif_subqueue_sent(const struct net_device *dev,
 					 get_desc, start_thrs);		\
 	})
 
-struct device *netdev_queue_get_dma_dev(struct net_device *dev, int idx);
-
-#endif
+struct device *netdev_queue_get_dma_dev(struct net_device *dev,
+					unsigned int idx,
+					enum netdev_queue_type type);
+bool netdev_can_create_queue(const struct net_device *dev,
+			     struct netlink_ext_ack *extack);
+bool netdev_can_lease_queue(const struct net_device *dev,
+			    struct netlink_ext_ack *extack);
+bool netdev_queue_busy(struct net_device *dev, unsigned int idx,
+		       enum netdev_queue_type type,
+		       struct netlink_ext_ack *extack);
+#endif /* _LINUX_NET_QUEUES_H */

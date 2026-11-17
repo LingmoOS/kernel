@@ -21,8 +21,7 @@
  * - the only place where we can see skb->sk != NULL
  */
 
-#define KMSG_COMPONENT "IPVS"
-#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
+#define pr_fmt(fmt) "IPVS: " fmt
 
 #include <linux/kernel.h>
 #include <linux/slab.h>
@@ -58,7 +57,7 @@ enum {
 
 static inline struct ip_vs_dest_dst *ip_vs_dest_dst_alloc(void)
 {
-	return kmalloc(sizeof(struct ip_vs_dest_dst), GFP_ATOMIC);
+	return kmalloc_obj(struct ip_vs_dest_dst, GFP_ATOMIC);
 }
 
 static inline void ip_vs_dest_dst_free(struct ip_vs_dest_dst *dest_dst)
@@ -348,9 +347,11 @@ __ip_vs_get_out_rt(struct netns_ipvs *ipvs, int skb_af, struct sk_buff *skb,
 				goto err_unreach;
 			}
 			/* It is forbidden to attach dest->dest_dst if
-			 * device is going down.
+			 * device is going down or if server is removed and
+			 * stored in dest_trash.
 			 */
-			if (!rt_dev_is_down(dst_dev_rcu(&rt->dst)))
+			if (!rt_dev_is_down(dst_dev_rcu(&rt->dst)) &&
+			    dest->cflags & IP_VS_DEST_CF_AVAILABLE)
 				__ip_vs_dst_set(dest, dest_dst, &rt->dst, 0);
 			else
 				noref = 0;
@@ -525,9 +526,11 @@ __ip_vs_get_out_rt_v6(struct netns_ipvs *ipvs, int skb_af, struct sk_buff *skb,
 			rt = dst_rt6_info(dst);
 			cookie = rt6_get_cookie(rt);
 			/* It is forbidden to attach dest->dest_dst if
-			 * device is going down.
+			 * device is going down or if server is removed and
+			 * stored in dest_trash.
 			 */
-			if (!rt_dev_is_down(dst_dev_rcu(&rt->dst)))
+			if (!rt_dev_is_down(dst_dev_rcu(&rt->dst)) &&
+			    dest->cflags & IP_VS_DEST_CF_AVAILABLE)
 				__ip_vs_dst_set(dest, dest_dst, &rt->dst, cookie);
 			else
 				noref = 0;
@@ -1095,7 +1098,7 @@ ipvs_gue_encap(struct net *net, struct sk_buff *skb,
 	dport = cp->dest->tun_port;
 	udph->dest = dport;
 	udph->source = sport;
-	udph->len = htons(skb->len);
+	udp_set_len(udph, skb->len);
 	udph->check = 0;
 
 	*next_protocol = IPPROTO_UDP;

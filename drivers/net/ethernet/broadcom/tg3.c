@@ -8729,9 +8729,8 @@ static int tg3_mem_tx_acquire(struct tg3 *tp)
 		tnapi++;
 
 	for (i = 0; i < tp->txq_cnt; i++, tnapi++) {
-		tnapi->tx_buffers = kcalloc(TG3_TX_RING_SIZE,
-					    sizeof(struct tg3_tx_ring_info),
-					    GFP_KERNEL);
+		tnapi->tx_buffers = kzalloc_objs(struct tg3_tx_ring_info,
+						 TG3_TX_RING_SIZE);
 		if (!tnapi->tx_buffers)
 			goto err_out;
 
@@ -12719,29 +12718,17 @@ static int tg3_get_sset_count(struct net_device *dev, int sset)
 	}
 }
 
-static int tg3_get_rxnfc(struct net_device *dev, struct ethtool_rxnfc *info,
-			 u32 *rules __always_unused)
+static u32 tg3_get_rx_ring_count(struct net_device *dev)
 {
 	struct tg3 *tp = netdev_priv(dev);
 
 	if (!tg3_flag(tp, SUPPORT_MSIX))
-		return -EOPNOTSUPP;
+		return 1;
 
-	switch (info->cmd) {
-	case ETHTOOL_GRXRINGS:
-		if (netif_running(tp->dev))
-			info->data = tp->rxq_cnt;
-		else {
-			info->data = num_online_cpus();
-			if (info->data > TG3_RSS_MAX_NUM_QS)
-				info->data = TG3_RSS_MAX_NUM_QS;
-		}
+	if (netif_running(tp->dev))
+		return tp->rxq_cnt;
 
-		return 0;
-
-	default:
-		return -EOPNOTSUPP;
-	}
+	return min_t(u32, netif_get_num_default_rss_queues(), tp->rxq_max);
 }
 
 static u32 tg3_get_rxfh_indir_size(struct net_device *dev)
@@ -14268,7 +14255,7 @@ static const struct ethtool_ops tg3_ethtool_ops = {
 	.get_coalesce		= tg3_get_coalesce,
 	.set_coalesce		= tg3_set_coalesce,
 	.get_sset_count		= tg3_get_sset_count,
-	.get_rxnfc		= tg3_get_rxnfc,
+	.get_rx_ring_count	= tg3_get_rx_ring_count,
 	.get_rxfh_indir_size    = tg3_get_rxfh_indir_size,
 	.get_rxfh		= tg3_get_rxfh,
 	.set_rxfh		= tg3_set_rxfh,
@@ -18201,39 +18188,15 @@ unlock:
 
 static SIMPLE_DEV_PM_OPS(tg3_pm_ops, tg3_suspend, tg3_resume);
 
-/* Systems where ACPI _PTS (Prepare To Sleep) S5 will result in a fatal
- * PCIe AER event on the tg3 device if the tg3 device is not, or cannot
- * be, powered down.
+/* Systems where powering down a tg3 device on restarts triggers
+ * NMIs and fatal hangs during reboot if the network adapters were
+ * initialized under SNP.
  */
-static const struct dmi_system_id tg3_restart_aer_quirk_table[] = {
-	{
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
-			DMI_MATCH(DMI_PRODUCT_NAME, "PowerEdge R440"),
-		},
-	},
-	{
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
-			DMI_MATCH(DMI_PRODUCT_NAME, "PowerEdge R540"),
-		},
-	},
-	{
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
-			DMI_MATCH(DMI_PRODUCT_NAME, "PowerEdge R640"),
-		},
-	},
+static const struct dmi_system_id tg3_restart_snp_quirk_table[] = {
 	{
 		.matches = {
 			DMI_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
 			DMI_MATCH(DMI_PRODUCT_NAME, "PowerEdge R650"),
-		},
-	},
-	{
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
-			DMI_MATCH(DMI_PRODUCT_NAME, "PowerEdge R740"),
 		},
 	},
 	{
@@ -18259,14 +18222,18 @@ static void tg3_shutdown(struct pci_dev *pdev)
 	if (netif_running(dev))
 		dev_close(dev);
 
-	if (system_state == SYSTEM_POWER_OFF)
+	if (!dmi_first_match(tg3_restart_snp_quirk_table) ||
+	    system_state == SYSTEM_POWER_OFF) {
 		tg3_power_down(tp);
-	else if (system_state == SYSTEM_RESTART &&
-		 dmi_first_match(tg3_restart_aer_quirk_table) &&
+	} else if (system_state == SYSTEM_RESTART &&
 		 pdev->current_state != PCI_D3cold &&
 		 pdev->current_state != PCI_UNKNOWN) {
 		/* Disable PCIe AER on the tg3 to avoid a fatal
 		 * error during this system restart.
+		 * Needed since on restarts for systems in
+		 * tg3_restart_snp_quirk_table skipping on powering down the
+		 * tg3 device causes a fatal AER error during ACPI _PTS
+		 * (Prepare To Sleep).
 		 */
 		pcie_capability_clear_word(pdev, PCI_EXP_DEVCTL,
 					   PCI_EXP_DEVCTL_CERE |

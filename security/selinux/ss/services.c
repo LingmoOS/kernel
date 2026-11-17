@@ -108,7 +108,7 @@ static int selinux_set_mapping(struct policydb *pol,
 		i++;
 
 	/* Allocate space for the class records, plus one for class zero */
-	out_map->mapping = kcalloc(++i, sizeof(*out_map->mapping), GFP_ATOMIC);
+	out_map->mapping = kzalloc_objs(*out_map->mapping, ++i, GFP_ATOMIC);
 	if (!out_map->mapping)
 		return -ENOMEM;
 
@@ -461,7 +461,7 @@ static void security_dump_masked_av(struct policydb *policydb,
 	struct common_datum *common_dat;
 	struct class_datum *tclass_dat;
 	struct audit_buffer *ab;
-	char *tclass_name;
+	const char *tclass_name;
 	char *scontext_name = NULL;
 	char *tcontext_name = NULL;
 	char *permission_names[SEL_VEC_MAX];
@@ -715,6 +715,9 @@ static void context_struct_compute_av(struct policydb *policydb,
 	 * If the given source and target types have boundary
 	 * constraint, lazy checks have to mask any violated
 	 * permission and notice it to userspace via audit.
+	 *
+	 * Infinite recursion is avoided via a depth pre-check in
+	 * type_bounds_sanity_check().
 	 */
 	type_attribute_bounds_av(policydb, scontext, tcontext,
 				 tclass, avd);
@@ -1352,8 +1355,8 @@ const char *security_get_initial_sid_context(u32 sid)
 }
 
 static int security_sid_to_context_core(u32 sid, char **scontext,
-					u32 *scontext_len, int force,
-					int only_invalid)
+					u32 *scontext_len, bool force,
+					bool only_invalid)
 {
 	struct selinux_policy *policy;
 	struct policydb *policydb;
@@ -1436,14 +1439,14 @@ out_unlock:
 int security_sid_to_context(u32 sid, char **scontext, u32 *scontext_len)
 {
 	return security_sid_to_context_core(sid, scontext,
-					    scontext_len, 0, 0);
+					    scontext_len, false, false);
 }
 
 int security_sid_to_context_force(u32 sid,
 				  char **scontext, u32 *scontext_len)
 {
 	return security_sid_to_context_core(sid, scontext,
-					    scontext_len, 1, 0);
+					    scontext_len, true, false);
 }
 
 /**
@@ -1463,7 +1466,7 @@ int security_sid_to_context_inval(u32 sid,
 				  char **scontext, u32 *scontext_len)
 {
 	return security_sid_to_context_core(sid, scontext,
-					    scontext_len, 1, 1);
+					    scontext_len, true, true);
 }
 
 /*
@@ -1549,7 +1552,7 @@ out:
 
 static int security_context_to_sid_core(const char *scontext, u32 scontext_len,
 					u32 *sid, u32 def_sid, gfp_t gfp_flags,
-					int force)
+					bool force)
 {
 	struct selinux_policy *policy;
 	struct policydb *policydb;
@@ -1638,7 +1641,7 @@ int security_context_to_sid(const char *scontext, u32 scontext_len, u32 *sid,
 			    gfp_t gfp)
 {
 	return security_context_to_sid_core(scontext, scontext_len,
-					    sid, SECSID_NULL, gfp, 0);
+					    sid, SECSID_NULL, gfp, false);
 }
 
 int security_context_str_to_sid(const char *scontext, u32 *sid, gfp_t gfp)
@@ -1670,14 +1673,14 @@ int security_context_to_sid_default(const char *scontext, u32 scontext_len,
 				    u32 *sid, u32 def_sid, gfp_t gfp_flags)
 {
 	return security_context_to_sid_core(scontext, scontext_len,
-					    sid, def_sid, gfp_flags, 1);
+					    sid, def_sid, gfp_flags, true);
 }
 
 int security_context_to_sid_force(const char *scontext, u32 scontext_len,
 				  u32 *sid)
 {
 	return security_context_to_sid_core(scontext, scontext_len,
-					    sid, SECSID_NULL, GFP_KERNEL, 1);
+					    sid, SECSID_NULL, GFP_KERNEL, true);
 }
 
 static int compute_sid_handle_invalid_context(
@@ -2312,11 +2315,11 @@ int security_load_policy(void *data, size_t len,
 	int rc = 0;
 	struct policy_file file = { data, len }, *fp = &file;
 
-	newpolicy = kzalloc(sizeof(*newpolicy), GFP_KERNEL);
+	newpolicy = kzalloc_obj(*newpolicy);
 	if (!newpolicy)
 		return -ENOMEM;
 
-	newpolicy->sidtab = kzalloc(sizeof(*newpolicy->sidtab), GFP_KERNEL);
+	newpolicy->sidtab = kzalloc_obj(*newpolicy->sidtab);
 	if (!newpolicy->sidtab) {
 		rc = -ENOMEM;
 		goto err_policy;
@@ -2360,7 +2363,7 @@ int security_load_policy(void *data, size_t len,
 	 * in the new SID table.
 	 */
 
-	convert_data = kmalloc(sizeof(*convert_data), GFP_KERNEL);
+	convert_data = kmalloc_obj(*convert_data);
 	if (!convert_data) {
 		rc = -ENOMEM;
 		goto err_free_isids;
@@ -2940,7 +2943,7 @@ int security_get_bools(struct selinux_policy *policy,
 		goto err;
 
 	rc = -ENOMEM;
-	*values = kcalloc(*len, sizeof(int), GFP_ATOMIC);
+	*values = kzalloc_objs(int, *len, GFP_ATOMIC);
 	if (!*values)
 		goto err;
 
@@ -3459,6 +3462,13 @@ struct selinux_audit_rule {
 	struct context au_ctxt;
 };
 
+int selinux_audit_rule_avc_callback(u32 event)
+{
+	if (event == AVC_CALLBACK_RESET)
+		return audit_update_lsm_rules();
+	return 0;
+}
+
 void selinux_audit_rule_free(void *vrule)
 {
 	struct selinux_audit_rule *rule = vrule;
@@ -3511,7 +3521,7 @@ int selinux_audit_rule_init(u32 field, u32 op, char *rulestr, void **vrule,
 		return -EINVAL;
 	}
 
-	tmprule = kzalloc(sizeof(struct selinux_audit_rule), gfp);
+	tmprule = kzalloc_obj(struct selinux_audit_rule, gfp);
 	if (!tmprule)
 		return -ENOMEM;
 	context_init(&tmprule->au_ctxt);
@@ -3709,25 +3719,6 @@ out:
 	return match;
 }
 
-static int aurule_avc_callback(u32 event)
-{
-	if (event == AVC_CALLBACK_RESET)
-		return audit_update_lsm_rules();
-	return 0;
-}
-
-static int __init aurule_init(void)
-{
-	int err;
-
-	err = avc_add_callback(aurule_avc_callback, AVC_CALLBACK_RESET);
-	if (err)
-		panic("avc_add_callback() failed, error %d\n", err);
-
-	return err;
-}
-__initcall(aurule_init);
-
 #ifdef CONFIG_NETLABEL
 /**
  * security_netlbl_cache_add - Add an entry to the NetLabel cache
@@ -3745,7 +3736,7 @@ static void security_netlbl_cache_add(struct netlbl_lsm_secattr *secattr,
 {
 	u32 *sid_cache;
 
-	sid_cache = kmalloc(sizeof(*sid_cache), GFP_ATOMIC);
+	sid_cache = kmalloc_obj(*sid_cache, GFP_ATOMIC);
 	if (sid_cache == NULL)
 		return;
 	secattr->cache = netlbl_secattr_cache_alloc(GFP_ATOMIC);

@@ -2,7 +2,7 @@
 menu "Android"
 
 config ANDROID_BINDER_IPC
-	tristate "Android Binder IPC Driver"
+	bool "Android Binder IPC Driver"
 	depends on MMU
 	depends on NET
 	default n
@@ -16,7 +16,7 @@ config ANDROID_BINDER_IPC
 
 config ANDROID_BINDER_IPC_RUST
 	bool "Rust version of Android Binder IPC Driver"
-	depends on RUST && MMU && !ANDROID_BINDER_IPC
+	depends on RUST && MMU && NET && !ANDROID_BINDER_IPC
 	help
 	  This enables the Rust implementation of the Binder driver.
 
@@ -28,8 +28,8 @@ config ANDROID_BINDER_IPC_RUST
 	  between said processes.
 
 config ANDROID_BINDERFS
-	tristate "Android Binderfs filesystem"
-	depends on (ANDROID_BINDER_IPC=y) || (ANDROID_BINDER_IPC=m && m)
+	bool "Android Binderfs filesystem"
+	depends on ANDROID_BINDER_IPC
 	default n
 	help
 	  Binderfs is a pseudo-filesystem for the Android Binder IPC driver

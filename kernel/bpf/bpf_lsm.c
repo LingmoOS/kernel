@@ -18,10 +18,11 @@
 #include <linux/bpf-cgroup.h>
 
 /* For every LSM hook that allows attachment of BPF programs, declare a nop
- * function where a BPF program can be attached.
+ * function where a BPF program can be attached. Notably, we qualify each with
+ * weak linkage such that strong overrides can be implemented if need be.
  */
 #define LSM_HOOK(RET, DEFAULT, NAME, ...)	\
-noinline RET bpf_lsm_##NAME(__VA_ARGS__)	\
+__weak noinline RET bpf_lsm_##NAME(__VA_ARGS__)	\
 {						\
 	return DEFAULT;				\
 }
@@ -54,6 +55,7 @@ BTF_ID(func, bpf_lsm_audit_rule_match)
 BTF_ID(func, bpf_lsm_xfrm_decode_session)
 #endif
 BTF_ID(func, bpf_lsm_ismaclabel)
+BTF_ID(func, bpf_lsm_file_alloc_security)
 BTF_SET_END(bpf_lsm_disabled_hooks)
 
 /* List of LSM hooks that should operate on 'current' cgroup regardless
@@ -184,7 +186,7 @@ static const struct bpf_func_proto bpf_ima_inode_hash_proto = {
 	.arg1_type	= ARG_PTR_TO_BTF_ID,
 	.arg1_btf_id	= &bpf_ima_inode_hash_btf_ids[0],
 	.arg2_type	= ARG_PTR_TO_UNINIT_MEM,
-	.arg3_type	= ARG_CONST_SIZE,
+	.arg3_type	= ARG_MEM_SIZE,
 	.allowed	= bpf_ima_inode_hash_allowed,
 };
 
@@ -203,7 +205,7 @@ static const struct bpf_func_proto bpf_ima_file_hash_proto = {
 	.arg1_type	= ARG_PTR_TO_BTF_ID,
 	.arg1_btf_id	= &bpf_ima_file_hash_btf_ids[0],
 	.arg2_type	= ARG_PTR_TO_UNINIT_MEM,
-	.arg3_type	= ARG_CONST_SIZE,
+	.arg3_type	= ARG_MEM_SIZE,
 	.allowed	= bpf_ima_inode_hash_allowed,
 };
 
@@ -380,6 +382,8 @@ BTF_ID(func, bpf_lsm_task_alloc)
 BTF_ID(func, bpf_lsm_task_prctl)
 BTF_ID(func, bpf_lsm_task_setscheduler)
 BTF_ID(func, bpf_lsm_userns_create)
+BTF_ID(func, bpf_lsm_bdev_alloc_security)
+BTF_ID(func, bpf_lsm_bdev_setintegrity)
 BTF_SET_END(sleepable_lsm_hooks)
 
 BTF_SET_START(untrusted_lsm_hooks)
@@ -392,6 +396,8 @@ BTF_ID(func, bpf_lsm_sk_alloc_security)
 BTF_ID(func, bpf_lsm_sk_free_security)
 #endif /* CONFIG_SECURITY_NETWORK */
 BTF_ID(func, bpf_lsm_task_free)
+BTF_ID(func, bpf_lsm_bdev_alloc_security)
+BTF_ID(func, bpf_lsm_bdev_free_security)
 BTF_SET_END(untrusted_lsm_hooks)
 
 bool bpf_lsm_is_sleepable_hook(u32 btf_id)

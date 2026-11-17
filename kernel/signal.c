@@ -130,28 +130,10 @@ static bool sig_ignored(struct task_struct *t, int sig, bool force)
  */
 static inline bool has_pending_signals(sigset_t *signal, sigset_t *blocked)
 {
-	unsigned long ready;
-	long i;
-
-	switch (_NSIG_WORDS) {
-	default:
-		for (i = _NSIG_WORDS, ready = 0; --i >= 0 ;)
-			ready |= signal->sig[i] &~ blocked->sig[i];
-		break;
-
-	case 4: ready  = signal->sig[3] &~ blocked->sig[3];
-		ready |= signal->sig[2] &~ blocked->sig[2];
-		ready |= signal->sig[1] &~ blocked->sig[1];
-		ready |= signal->sig[0] &~ blocked->sig[0];
-		break;
-
-	case 2: ready  = signal->sig[1] &~ blocked->sig[1];
-		ready |= signal->sig[0] &~ blocked->sig[0];
-		break;
-
-	case 1: ready  = signal->sig[0] &~ blocked->sig[0];
-	}
-	return ready !=	0;
+	unsigned long ready = 0;
+	for (long i = 0; i < _NSIG_WORDS; i++)
+		ready |= signal->sig[i] & ~blocked->sig[i];
+	return ready != 0;
 }
 
 #define PENDING(p,b) has_pending_signals(&(p)->signal, (b))
@@ -1024,9 +1006,7 @@ static void complete_signal(int sig, struct task_struct *p, enum pid_type type)
 	 * Found a killable thread.  If the signal will be fatal,
 	 * then start taking the whole group down immediately.
 	 */
-	if (sig_fatal(p, sig) &&
-	    (signal->core_state || !(signal->flags & SIGNAL_GROUP_EXIT)) &&
-	    !sigismember(&t->real_blocked, sig) &&
+	if (sig_fatal(p, sig) && !sigismember(&t->real_blocked, sig) &&
 	    (sig == SIGKILL || !p->ptrace)) {
 		/*
 		 * This signal will be fatal to the whole group.
@@ -1226,7 +1206,7 @@ static inline bool has_si_pid_and_uid(struct kernel_siginfo *info)
 int send_signal_locked(int sig, struct kernel_siginfo *info,
 		       struct task_struct *t, enum pid_type type)
 {
-	struct kernel_siginfo rewritten;
+	struct kernel_siginfo __maybe_unused rewritten;
 	/* Should SIGKILL or SIGSTOP be received by a pid namespace init? */
 	bool force = false;
 
@@ -1238,27 +1218,34 @@ int send_signal_locked(int sig, struct kernel_siginfo *info,
 		force = true;
 	} else if (has_si_pid_and_uid(info)) {
 		/* SIGKILL and SIGSTOP is special or has ids */
+#ifdef CONFIG_USER_NS
 		struct user_namespace *t_user_ns;
-
-		rewritten = *info;
-		info = &rewritten;
+		kuid_t uid;
 
 		rcu_read_lock();
 		t_user_ns = task_cred_xxx(t, user_ns);
 		if (current_user_ns() != t_user_ns) {
-			kuid_t uid = make_kuid(current_user_ns(), info->si_uid);
-			info->si_uid = from_kuid_munged(t_user_ns, uid);
+			rewritten = *info;
+			info = &rewritten;
+			uid = make_kuid(current_user_ns(), info->si_uid);
+			rewritten.si_uid = from_kuid_munged(t_user_ns, uid);
 		}
 		rcu_read_unlock();
-
+#endif
 		/* A kernel generated signal? */
 		force = (info->si_code == SI_KERNEL);
 
+#ifdef CONFIG_PID_NS
 		/* From an ancestor pid namespace? */
 		if (!task_pid_nr_ns(current, task_active_pid_ns(t))) {
-			info->si_pid = 0;
+			if (info != &rewritten) {
+				rewritten = *info;
+				info = &rewritten;
+			}
+			rewritten.si_pid = 0;
 			force = true;
 		}
+#endif
 	}
 	return __send_signal_locked(sig, info, t, type, force);
 }
@@ -1403,8 +1390,8 @@ int zap_other_threads(struct task_struct *p)
 	return count;
 }
 
-struct sighand_struct *__lock_task_sighand(struct task_struct *tsk,
-					   unsigned long *flags)
+struct sighand_struct *lock_task_sighand(struct task_struct *tsk,
+					 unsigned long *flags)
 {
 	struct sighand_struct *sighand;
 
@@ -2259,13 +2246,13 @@ bool do_notify_parent(struct task_struct *tsk, int sig)
 	bool autoreap = false;
 	u64 utime, stime;
 
-	WARN_ON_ONCE(sig == -1);
+	if (WARN_ON_ONCE(!valid_signal(sig)))
+		return false;
 
 	/* do_notify_parent_cldstop should have been called instead.  */
 	WARN_ON_ONCE(task_is_stopped_or_traced(tsk));
 
-	WARN_ON_ONCE(!tsk->ptrace &&
-	       (tsk->group_leader != tsk || !thread_group_empty(tsk)));
+	WARN_ON_ONCE(!tsk->ptrace && !thread_group_empty(tsk));
 
 	/* ptraced, or group-leader without sub-threads */
 	do_notify_pidfd(tsk);
@@ -2337,11 +2324,15 @@ bool do_notify_parent(struct task_struct *tsk, int sig)
 		if (psig->action[SIGCHLD-1].sa.sa_handler == SIG_IGN)
 			sig = 0;
 	}
+	if (!tsk->ptrace && tsk->signal->autoreap) {
+		autoreap = true;
+		sig = 0;
+	}
 	/*
 	 * Send with __send_signal as si_pid and si_uid are in the
 	 * parent's namespaces.
 	 */
-	if (valid_signal(sig) && sig)
+	if (sig)
 		__send_signal_locked(sig, &info, tsk->parent, PIDTYPE_TGID, false);
 	__wake_up_parent(tsk, tsk->parent);
 	spin_unlock_irqrestore(&psig->siglock, flags);
@@ -2900,8 +2891,9 @@ bool get_signal(struct ksignal *ksig)
 
 	/*
 	 * Do this once, we can't return to user-mode if freezing() == T.
-	 * do_signal_stop() and ptrace_stop() do freezable_schedule() and
-	 * thus do not need another check after return.
+	 * do_signal_stop() and ptrace_stop() set TASK_STOPPED/TASK_TRACED
+	 * and the freezer handles those states via TASK_FROZEN, thus they
+	 * do not need another check after return.
 	 */
 	try_to_freeze();
 
@@ -4023,6 +4015,15 @@ static void prepare_kill_siginfo(int sig, struct kernel_siginfo *info,
 	info->si_uid = from_kuid_munged(current_user_ns(), current_uid());
 }
 
+/*
+ * Not even root can pretend to send SI_FROMKERNEL() signals.
+ * Nor can they impersonate kill()/tgkill(), which have si_pid/uid
+ */
+static bool si_code_reserved_to_kernel(int si_code)
+{
+	return si_code >= 0 || si_code == SI_TKILL;
+}
+
 /**
  *  sys_kill - send a signal to a process
  *  @pid: the PID of the process
@@ -4030,11 +4031,7 @@ static void prepare_kill_siginfo(int sig, struct kernel_siginfo *info,
  */
 SYSCALL_DEFINE2(kill, pid_t, pid, int, sig)
 {
-	struct kernel_siginfo info;
-
-	prepare_kill_siginfo(sig, &info, PIDTYPE_TGID);
-
-	return kill_something_info(sig, &info, pid);
+	return kill_something_info(sig, SEND_SIG_NOINFO, pid);
 }
 
 /*
@@ -4118,7 +4115,7 @@ static int do_pidfd_send_signal(struct pid *pid, int sig, enum pid_type type,
 
 		/* Only allow sending arbitrary signals to yourself. */
 		if ((task_pid(current) != pid || type > PIDTYPE_TGID) &&
-		    (kinfo.si_code >= 0 || kinfo.si_code == SI_TKILL))
+		    si_code_reserved_to_kernel(kinfo.si_code))
 			return -EPERM;
 	} else {
 		prepare_kill_siginfo(sig, &kinfo, type);
@@ -4273,11 +4270,8 @@ SYSCALL_DEFINE2(tkill, pid_t, pid, int, sig)
 
 static int do_rt_sigqueueinfo(pid_t pid, int sig, kernel_siginfo_t *info)
 {
-	/* Not even root can pretend to send signals from the kernel.
-	 * Nor can they impersonate a kill()/tgkill(), which adds source info.
-	 */
-	if ((info->si_code >= 0 || info->si_code == SI_TKILL) &&
-	    (task_pid_vnr(current) != pid))
+	if (si_code_reserved_to_kernel(info->si_code) &&
+	    task_pid_vnr(current) != pid)
 		return -EPERM;
 
 	/* POSIX.1b doesn't mention process groups.  */
@@ -4320,11 +4314,8 @@ static int do_rt_tgsigqueueinfo(pid_t tgid, pid_t pid, int sig, kernel_siginfo_t
 	if (pid <= 0 || tgid <= 0)
 		return -EINVAL;
 
-	/* Not even root can pretend to send signals from the kernel.
-	 * Nor can they impersonate a kill()/tgkill(), which adds source info.
-	 */
-	if ((info->si_code >= 0 || info->si_code == SI_TKILL) &&
-	    (task_pid_vnr(current) != pid))
+	if (si_code_reserved_to_kernel(info->si_code) &&
+	    task_pid_vnr(current) != pid)
 		return -EPERM;
 
 	return do_send_specific(tgid, pid, sig, info);

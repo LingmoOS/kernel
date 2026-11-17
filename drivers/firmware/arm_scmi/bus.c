@@ -89,7 +89,7 @@ static int scmi_protocol_device_request(const struct scmi_device_id *id_table)
 	 * No duplicate found for requested id_table, so let's create a new
 	 * requested device entry for this new valid request.
 	 */
-	rdev = kzalloc(sizeof(*rdev), GFP_KERNEL);
+	rdev = kzalloc_obj(*rdev);
 	if (!rdev) {
 		ret = -ENOMEM;
 		goto out;
@@ -102,7 +102,7 @@ static int scmi_protocol_device_request(const struct scmi_device_id *id_table)
 	 * there.
 	 */
 	if (!phead) {
-		phead = kzalloc(sizeof(*phead), GFP_KERNEL);
+		phead = kzalloc_obj(*phead);
 		if (!phead) {
 			kfree(rdev);
 			ret = -ENOMEM;

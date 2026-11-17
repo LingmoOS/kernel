@@ -15,12 +15,14 @@
 #include <linux/aer.h>
 #include <linux/align.h>
 #include <linux/bitfield.h>
+#include <linux/hex.h>
 #include <linux/types.h>
 #include <linux/kernel.h>
 #include <linux/export.h>
 #include <linux/pci.h>
 #include <linux/isa-dma.h> /* isa_dma_bridge_buggy */
 #include <linux/init.h>
+#include <linux/iommu.h>
 #include <linux/delay.h>
 #include <linux/acpi.h>
 #include <linux/dmi.h>
@@ -94,16 +96,24 @@ static bool pcie_lbms_seen(struct pci_dev *dev, u16 lnksta)
 int pcie_failed_link_retrain(struct pci_dev *dev)
 {
 	u16 lnksta, lnkctl2, oldlnkctl2;
+	enum pci_bus_speed speed_cap;
 	int ret = -ENOTTY;
-	u32 lnkcap;
 
 	if (!pci_is_pcie(dev) || !pcie_downstream_port(dev) ||
 	    !pcie_cap_has_lnkctl2(dev) || !dev->link_active_reporting)
 		return ret;
 
+	speed_cap = pcie_get_speed_cap(dev);
+	if (speed_cap <= PCIE_SPEED_2_5GT)
+		return ret;
+
 	pcie_capability_read_word(dev, PCI_EXP_LNKSTA, &lnksta);
 	pcie_capability_read_word(dev, PCI_EXP_LNKCTL2, &oldlnkctl2);
-	if (!(lnksta & PCI_EXP_LNKSTA_DLLLA) && pcie_lbms_seen(dev, lnksta)) {
+	if (lnksta & PCI_EXP_LNKSTA_DLLLA) {
+		;
+	} else if (PCIE_LNKCTL2_TLS2SPEED(oldlnkctl2) == PCIE_SPEED_2_5GT) {
+		return ret;
+	} else if (pcie_lbms_seen(dev, lnksta)) {
 		pci_info(dev, "broken device, retraining non-functional downstream link at 2.5GT/s\n");
 		ret = pcie_set_target_speed(dev, PCIE_SPEED_2_5GT, false);
 		if (ret)
@@ -111,11 +121,9 @@ int pcie_failed_link_retrain(struct pci_dev *dev)
 	}
 
 	pcie_capability_read_word(dev, PCI_EXP_LNKCTL2, &lnkctl2);
-	pcie_capability_read_dword(dev, PCI_EXP_LNKCAP, &lnkcap);
-	if ((lnkctl2 & PCI_EXP_LNKCTL2_TLS) == PCI_EXP_LNKCTL2_TLS_2_5GT &&
-	    (lnkcap & PCI_EXP_LNKCAP_SLS) != PCI_EXP_LNKCAP_SLS_2_5GB) {
+	if ((lnkctl2 & PCI_EXP_LNKCTL2_TLS) == PCI_EXP_LNKCTL2_TLS_2_5GT) {
 		pci_info(dev, "removing 2.5GT/s downstream link speed restriction\n");
-		ret = pcie_set_target_speed(dev, PCIE_LNKCAP_SLS2SPEED(lnkcap), false);
+		ret = pcie_set_target_speed(dev, speed_cap, false);
 		if (ret)
 			goto err;
 	}
@@ -1280,9 +1288,7 @@ DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_VIA,	PCI_DEVICE_ID_VIA_82C597_0,	quirk_vt
 
 /*
  * CardBus controllers have a legacy base address that enables them to
- * respond as i82365 pcmcia controllers.  We don't want them to do this
- * even if the Linux CardBus driver is not loaded, because the Linux i82365
- * driver does not (and should not) handle CardBus.
+ * respond as i82365 PCMCIA controllers.  We don't want them to do this.
  */
 static void quirk_cardbus_legacy(struct pci_dev *dev)
 {
@@ -1940,6 +1946,8 @@ DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_ATI, 0x4388, quirk_no_msi);
 DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_ATI, 0x4389, quirk_no_msi);
 DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_ATI, 0x438a, quirk_no_msi);
 DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_ATI, 0x438b, quirk_no_msi);
+/* ULi M1575 EHCI (10b9:5239): MSI stalls the async schedule */
+DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_AL, 0x5239, quirk_no_msi);
 
 static void quirk_pcie_mch(struct pci_dev *pdev)
 {
@@ -2380,6 +2388,24 @@ DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_PLX, PCI_DEVICE_ID_PLX_9050,
 DECLARE_PCI_FIXUP_HEADER(0x1402, 0x2000, quirk_plx_pci9050);
 DECLARE_PCI_FIXUP_HEADER(0x1402, 0x2600, quirk_plx_pci9050);
 
+/*
+ * An idle downstream port of a PLX/Broadcom PEX 8532/8533/8548 switch
+ * autosuspends into D3hot, and that takes the whole switch down with
+ * it -- any device behind another port of the same switch then sees a
+ * fatal, non-recoverable bus fault on its next access. Keep these
+ * ports out of D3 entirely.
+ */
+static void quirk_plx_pex_no_d3(struct pci_dev *dev)
+{
+	if (pci_pcie_type(dev) == PCI_EXP_TYPE_DOWNSTREAM) {
+		dev->dev_flags |= PCI_DEV_FLAGS_NO_D3;
+		pci_info(dev, "avoiding D3 on this downstream port\n");
+	}
+}
+DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_PLX, 0x8532, quirk_plx_pex_no_d3);
+DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_PLX, 0x8533, quirk_plx_pex_no_d3);
+DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_PLX, 0x8548, quirk_plx_pex_no_d3);
+
 static void quirk_netmos(struct pci_dev *dev)
 {
 	unsigned int num_parallel = (dev->subsystem_device & 0xf0) >> 4;
@@ -2572,6 +2598,17 @@ static void quirk_p64h2_1k_io(struct pci_dev *dev)
 	}
 }
 DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_INTEL, 0x1460, quirk_p64h2_1k_io);
+
+/*
+ * Unmasking Advisory Non-Fatal Errors on the Apple T2 Secure Enclave
+ * causes a MacBookPro16,1 to lose power.  Set this before pci_aer_init()
+ * so that it leaves the ANFE mask bit unchanged.
+ */
+static void quirk_no_aer_anfe(struct pci_dev *dev)
+{
+	dev->no_aer_anfe = 1;
+}
+DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_APPLE, 0x1802, quirk_no_aer_anfe);
 
 /*
  * Under some circumstances, AER is not linked with extended capabilities.
@@ -3746,106 +3783,6 @@ static void quirk_no_bus_reset(struct pci_dev *dev)
 	dev->dev_flags |= PCI_DEV_FLAGS_NO_BUS_RESET;
 }
 
-static bool acs_on_downstream;
-static bool acs_on_multifunction;
-
-#define NUM_ACS_IDS 16
-struct acs_on_id {
-	unsigned short vendor;
-	unsigned short device;
-};
-static struct acs_on_id acs_on_ids[NUM_ACS_IDS];
-static u8 max_acs_id;
-
-static __init int pcie_acs_override_setup(char *p)
-{
-	if (!p)
-		return -EINVAL;
-
-	while (*p) {
-		if (!strncmp(p, "downstream", 10))
-			acs_on_downstream = true;
-		if (!strncmp(p, "multifunction", 13))
-			acs_on_multifunction = true;
-		if (!strncmp(p, "id:", 3)) {
-			char opt[5];
-			int ret;
-			long val;
-
-			if (max_acs_id >= NUM_ACS_IDS - 1) {
-				pr_warn("Out of PCIe ACS override slots (%d)\n",
-						NUM_ACS_IDS);
-				goto next;
-			}
-
-			p += 3;
-			snprintf(opt, 5, "%s", p);
-			ret = kstrtol(opt, 16, &val);
-			if (ret) {
-				pr_warn("PCIe ACS ID parse error %d\n", ret);
-				goto next;
-			}
-			acs_on_ids[max_acs_id].vendor = val;
-
-			p += strcspn(p, ":");
-			if (*p != ':') {
-				pr_warn("PCIe ACS invalid ID\n");
-				goto next;
-			}
-
-			p++;
-			snprintf(opt, 5, "%s", p);
-			ret = kstrtol(opt, 16, &val);
-			if (ret) {
-				pr_warn("PCIe ACS ID parse error %d\n", ret);
-				goto next;
-			}
-			acs_on_ids[max_acs_id].device = val;
-			max_acs_id++;
-		}
-next:
-		p += strcspn(p, ",");
-		if (*p == ',')
-			p++;
-	}
-
-	if (acs_on_downstream || acs_on_multifunction || max_acs_id)
-		pr_warn("Warning: PCIe ACS overrides enabled; This may allow non-IOMMU protected peer-to-peer DMA\n");
-
-	return 0;
-}
-early_param("pcie_acs_override", pcie_acs_override_setup);
-
-static int pcie_acs_overrides(struct pci_dev *dev, u16 acs_flags)
-{
-	int i;
-
-	/* Never override ACS for legacy devices or devices with ACS caps */
-	if (!pci_is_pcie(dev) ||
-		pci_find_ext_capability(dev, PCI_EXT_CAP_ID_ACS))
-			return -ENOTTY;
-
-	for (i = 0; i < max_acs_id; i++)
-		if (acs_on_ids[i].vendor == dev->vendor &&
-			acs_on_ids[i].device == dev->device)
-				return 1;
-
-	switch (pci_pcie_type(dev)) {
-	case PCI_EXP_TYPE_DOWNSTREAM:
-	case PCI_EXP_TYPE_ROOT_PORT:
-		if (acs_on_downstream)
-			return 1;
-		break;
-	case PCI_EXP_TYPE_ENDPOINT:
-	case PCI_EXP_TYPE_UPSTREAM:
-	case PCI_EXP_TYPE_LEG_END:
-	case PCI_EXP_TYPE_RC_END:
-		if (acs_on_multifunction && dev->multifunction)
-			return 1;
-	}
-
-	return -ENOTTY;
-}
 /*
  * After asserting Secondary Bus Reset to downstream devices via a GB10
  * Root Port, the link may not retrain correctly.
@@ -4347,6 +4284,22 @@ static const struct pci_dev_reset_methods pci_dev_reset_methods[] = {
 	{ 0 }
 };
 
+static int __pci_dev_specific_reset(struct pci_dev *dev, bool probe,
+				    const struct pci_dev_reset_methods *i)
+{
+	int ret;
+
+	ret = pci_dev_reset_iommu_prepare(dev);
+	if (ret) {
+		pci_err(dev, "failed to stop IOMMU for a PCI reset: %d\n", ret);
+		return ret;
+	}
+
+	ret = i->reset(dev, probe);
+	pci_dev_reset_iommu_done(dev);
+	return ret;
+}
+
 /*
  * These device-specific reset methods are here rather than in a driver
  * because when a host assigns a device to a guest VM, the host may need
@@ -4361,7 +4314,7 @@ int pci_dev_specific_reset(struct pci_dev *dev, bool probe)
 		     i->vendor == (u16)PCI_ANY_ID) &&
 		    (i->device == dev->device ||
 		     i->device == (u16)PCI_ANY_ID))
-			return i->reset(dev, probe);
+			return __pci_dev_specific_reset(dev, probe, i);
 	}
 
 	return -ENOTTY;
@@ -4571,6 +4524,16 @@ DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_BROADCOM, 0x9000,
 				quirk_bridge_cavm_thrx2_pcie_root);
 DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_BROADCOM, 0x9084,
 				quirk_bridge_cavm_thrx2_pcie_root);
+
+/*
+ * AST1150 doesn't use a real PCI bus and always forwards the requester ID
+ * from downstream devices.
+ */
+static void quirk_aspeed_pci_bridge_no_alias(struct pci_dev *pdev)
+{
+	pdev->dev_flags |= PCI_DEV_FLAGS_PCI_BRIDGE_NO_ALIAS;
+}
+DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_ASPEED, 0x1150, quirk_aspeed_pci_bridge_no_alias);
 
 /*
  * Intersil/Techwell TW686[4589]-based video capture cards have an empty (zero)
@@ -5150,6 +5113,128 @@ static int  pci_quirk_wangxun_nic_acs(struct pci_dev *dev, u16 acs_flags)
 	return false;
 }
 
+static bool acs_on_downstream;
+static bool acs_on_multifunction;
+
+#define NUM_ACS_IDS 16
+struct acs_on_id {
+	unsigned short vendor;
+	unsigned short device;
+};
+static struct acs_on_id acs_on_ids[NUM_ACS_IDS];
+static u8 max_acs_id;
+
+static int __init pcie_acs_parse_id(const char *p, struct acs_on_id *id)
+{
+	unsigned int val = 0;
+	int i, d;
+
+	if (p[7] != ':')
+		return -EINVAL;
+
+	for (i = 3; i < 12; i++) {
+		if (i == 7)
+			continue;
+		d = hex_to_bin(p[i]);
+		if (d < 0)
+			return -EINVAL;
+		val = (val << 4) | d;
+	}
+
+	id->vendor = val >> 16;
+	id->device = val & 0xffff;
+	return 0;
+}
+
+static int __init pcie_acs_override_setup(char *p)
+{
+	if (!p)
+		return -EINVAL;
+
+	while (*p) {
+		size_t len = strcspn(p, ",");
+
+		if (len == strlen("downstream") &&
+		    !strncmp(p, "downstream", len)) {
+			acs_on_downstream = true;
+		} else if (len == strlen("multifunction") &&
+			   !strncmp(p, "multifunction", len)) {
+			acs_on_multifunction = true;
+		} else if (len == strlen("id:nnnn:nnnn") &&
+			   !strncmp(p, "id:", 3)) {
+			struct acs_on_id id;
+
+			if (pcie_acs_parse_id(p, &id)) {
+				pr_warn("Invalid PCIe ACS override '%.*s'\n",
+					(int)len, p);
+			} else if (max_acs_id >= ARRAY_SIZE(acs_on_ids)) {
+				pr_warn("Out of PCIe ACS override slots (%d)\n",
+					NUM_ACS_IDS);
+			} else {
+				acs_on_ids[max_acs_id++] = id;
+			}
+		} else if (len) {
+			pr_warn("Invalid PCIe ACS override '%.*s'\n",
+				(int)len, p);
+		}
+
+		p += len;
+		if (*p == ',')
+			p++;
+	}
+
+	if (acs_on_downstream || acs_on_multifunction || max_acs_id) {
+		pr_warn("Warning: PCIe ACS overrides enabled; This may allow non-IOMMU protected peer-to-peer DMA\n");
+		add_taint(TAINT_USER, LOCKDEP_STILL_OK);
+	}
+
+	return 0;
+}
+early_param("pcie_acs_override", pcie_acs_override_setup);
+
+static int pcie_acs_overrides(struct pci_dev *dev, u16 acs_flags)
+{
+	int i;
+
+	if (!acs_on_downstream && !acs_on_multifunction && !max_acs_id)
+		return -ENOTTY;
+
+	/* Only answer the IOMMU group isolation query (REQ_ACS_FLAGS) */
+	if (acs_flags != (PCI_ACS_SV | PCI_ACS_RR | PCI_ACS_CR | PCI_ACS_UF))
+		return -ENOTTY;
+
+	/* Never override ACS for legacy devices or devices with ACS caps */
+	if (!pci_is_pcie(dev) || dev->acs_cap)
+		return -ENOTTY;
+
+	if (dev->untrusted || dev->external_facing)
+		return -ENOTTY;
+
+	switch (pci_pcie_type(dev)) {
+	case PCI_EXP_TYPE_DOWNSTREAM:
+	case PCI_EXP_TYPE_ROOT_PORT:
+		if (acs_on_downstream)
+			return 1;
+		break;
+	case PCI_EXP_TYPE_ENDPOINT:
+	case PCI_EXP_TYPE_UPSTREAM:
+	case PCI_EXP_TYPE_LEG_END:
+	case PCI_EXP_TYPE_RC_END:
+		if (acs_on_multifunction && dev->multifunction)
+			return 1;
+		break;
+	default:
+		return -ENOTTY;
+	}
+
+	for (i = 0; i < max_acs_id; i++)
+		if (acs_on_ids[i].vendor == dev->vendor &&
+		    acs_on_ids[i].device == dev->device)
+			return 1;
+
+	return -ENOTTY;
+}
+
 static const struct pci_dev_acs_enabled {
 	u16 vendor;
 	u16 device;
@@ -5318,7 +5403,6 @@ static const struct pci_dev_acs_enabled {
 	{ PCI_VENDOR_ID_ZHAOXIN, PCI_ANY_ID, pci_quirk_zhaoxin_pcie_ports_acs },
 	/* Wangxun nics */
 	{ PCI_VENDOR_ID_WANGXUN, PCI_ANY_ID, pci_quirk_wangxun_nic_acs },
-	/* ACS override */
 	{ PCI_ANY_ID, PCI_ANY_ID, pcie_acs_overrides },
 	{ 0 }
 };
@@ -5669,6 +5753,7 @@ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_INTEL, 0x443, quirk_intel_qat_vf_cap);
  * AMD Starship/Matisse HD Audio Controller 0x1487
  * AMD Starship USB 3.0 Host Controller 0x148c
  * AMD Matisse USB 3.0 Host Controller 0x149c
+ * AMD Neural Processing Unit 0x1502 0x17f0
  * Intel 82579LM Gigabit Ethernet Controller 0x1502
  * Intel 82579V Gigabit Ethernet Controller 0x1503
  * Mediatek MT7922 802.11ax PCI Express Wireless Network Adapter
@@ -5682,6 +5767,8 @@ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_AMD, 0x1487, quirk_no_flr);
 DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_AMD, 0x148c, quirk_no_flr);
 DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_AMD, 0x149c, quirk_no_flr);
 DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_AMD, 0x7901, quirk_no_flr);
+DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_AMD, 0x1502, quirk_no_flr);
+DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_AMD, 0x17f0, quirk_no_flr);
 DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_INTEL, 0x1502, quirk_no_flr);
 DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_INTEL, 0x1503, quirk_no_flr);
 DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_MEDIATEK, 0x0616, quirk_no_flr);
@@ -5694,6 +5781,18 @@ static void quirk_no_flr_snet(struct pci_dev *dev)
 		quirk_no_flr(dev);
 }
 DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_SOLIDRUN, 0x1000, quirk_no_flr_snet);
+
+/* Some Samsung SSDs advertise Immediate Readiness but aren't ready after FLR */
+static void quirk_no_imm_ready(struct pci_dev *dev)
+{
+	if (!dev->imm_ready)
+		return;
+
+	pci_info(dev, "Ignoring incorrectly advertised Immediate Readiness support\n");
+	dev->imm_ready = 0;
+}
+DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_SAMSUNG, 0xa80c, quirk_no_imm_ready);
+DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_SAMSUNG, 0xa80d, quirk_no_imm_ready);
 
 static void quirk_no_ext_tags(struct pci_dev *pdev)
 {
@@ -5782,6 +5881,48 @@ DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_INTEL, 0x1457, quirk_intel_e2000_no_ats);
 DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_INTEL, 0x1459, quirk_intel_e2000_no_ats);
 DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_INTEL, 0x145a, quirk_intel_e2000_no_ats);
 DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_INTEL, 0x145c, quirk_intel_e2000_no_ats);
+
+static bool quirk_nvidia_gpu_ats_required(struct pci_dev *pdev)
+{
+	switch (pdev->device) {
+	case 0x2e00 ... 0x2e3f: /* GB20B */
+		return true;
+	}
+	return false;
+}
+
+static const struct pci_dev_ats_required {
+	u16 vendor;
+	u16 device;
+	bool (*ats_required)(struct pci_dev *dev);
+} pci_dev_ats_required[] = {
+	/* NVIDIA GPUs */
+	{ PCI_VENDOR_ID_NVIDIA, PCI_ANY_ID, quirk_nvidia_gpu_ats_required },
+	/* NVIDIA CX10 Family NVlink-C2C */
+	{ PCI_VENDOR_ID_MELLANOX, 0x2101, NULL },
+	{ 0 }
+};
+
+/*
+ * Some NVIDIA devices do not implement CXL config space, but present as PCIe
+ * devices that can issue CXL-like cache operations like CXL.cache. Thus, they
+ * require ATS to obtain host physical addresses, like pci_cxl_ats_required().
+ */
+bool pci_dev_specific_ats_required(struct pci_dev *pdev)
+{
+	const struct pci_dev_ats_required *i;
+
+	for (i = pci_dev_ats_required; i->vendor; i++) {
+		if (i->vendor != pdev->vendor)
+			continue;
+		if (i->ats_required && i->ats_required(pdev))
+			return true;
+		if (!i->ats_required && i->device == pdev->device)
+			return true;
+	}
+
+	return false;
+}
 #endif /* CONFIG_PCI_ATS */
 
 /* Freescale PCIe doesn't support MSI in RC mode */
@@ -5907,7 +6048,7 @@ DECLARE_PCI_FIXUP_CLASS_RESUME_EARLY(PCI_VENDOR_ID_NVIDIA, PCI_ANY_ID,
 
 /*
  * Some IDT switches incorrectly flag an ACS Source Validation error on
- * completions for config read requests even though PCIe r4.0, sec
+ * completions for config read requests even though PCIe r7.0, sec
  * 6.12.1.1, says that completions are never affected by ACS Source
  * Validation.  Here's the text of IDT 89H32H8G3-YC, erratum #36:
  *
@@ -5920,44 +6061,20 @@ DECLARE_PCI_FIXUP_CLASS_RESUME_EARLY(PCI_VENDOR_ID_NVIDIA, PCI_ANY_ID,
  *
  * The workaround suggested by IDT is to issue a config write to the
  * downstream device before issuing the first config read.  This allows the
- * downstream device to capture its bus and device numbers (see PCIe r4.0,
- * sec 2.2.9), thus avoiding the ACS error on the completion.
+ * downstream device to capture its bus and device numbers (see PCIe r7.0,
+ * sec 2.2.9.1), thus avoiding the ACS error on the completion.
  *
  * However, we don't know when the device is ready to accept the config
- * write, so we do config reads until we receive a non-Config Request Retry
- * Status, then do the config write.
- *
- * To avoid hitting the erratum when doing the config reads, we disable ACS
- * SV around this process.
+ * write, and the issue affects resets of the switch as well as enumeration,
+ * so disable use of ACS SV for these devices altogether.
  */
-int pci_idt_bus_quirk(struct pci_bus *bus, int devfn, u32 *l, int timeout)
+void pci_disable_broken_acs_cap(struct pci_dev *pdev)
 {
-	int pos;
-	u16 ctrl = 0;
-	bool found;
-	struct pci_dev *bridge = bus->self;
-
-	pos = bridge->acs_cap;
-
-	/* Disable ACS SV before initial config reads */
-	if (pos) {
-		pci_read_config_word(bridge, pos + PCI_ACS_CTRL, &ctrl);
-		if (ctrl & PCI_ACS_SV)
-			pci_write_config_word(bridge, pos + PCI_ACS_CTRL,
-					      ctrl & ~PCI_ACS_SV);
+	if (pdev->vendor == PCI_VENDOR_ID_IDT &&
+	    (pdev->device == 0x80b5 || pdev->device == 0x8090)) {
+		pci_info(pdev, "Disabling broken ACS SV; downstream device isolation reduced\n");
+		pdev->acs_capabilities &= ~PCI_ACS_SV;
 	}
-
-	found = pci_bus_generic_read_dev_vendor_id(bus, devfn, l, timeout);
-
-	/* Write Vendor ID (read-only) so the endpoint latches its bus/dev */
-	if (found)
-		pci_bus_write_config_word(bus, devfn, PCI_VENDOR_ID, 0);
-
-	/* Re-enable ACS_SV if it was previously enabled */
-	if (ctrl & PCI_ACS_SV)
-		pci_write_config_word(bridge, pos + PCI_ACS_CTRL, ctrl);
-
-	return found;
 }
 
 /*
@@ -6445,7 +6562,6 @@ DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_XILINX, 0x5020, of_pci_make_dev_node);
 DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_XILINX, 0x5021, of_pci_make_dev_node);
 DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_REDHAT, 0x0005, of_pci_make_dev_node);
 DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_EFAR, 0x9660, of_pci_make_dev_node);
-DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_RPI, PCI_DEVICE_ID_RPI_RP1_C0, of_pci_make_dev_node);
 
 /*
  * Devices known to require a longer delay before first config space access

@@ -1290,7 +1290,7 @@ static int dspi_setup(struct spi_device *spi)
 	/* Only alloc on first setup */
 	chip = spi_get_ctldata(spi);
 	if (chip == NULL) {
-		chip = kzalloc(sizeof(struct chip_data), GFP_KERNEL);
+		chip = kzalloc_obj(struct chip_data);
 		if (!chip)
 			return -ENOMEM;
 	}
@@ -1460,7 +1460,6 @@ static int dspi_init(struct fsl_dspi *dspi)
 	return 0;
 }
 
-#ifdef CONFIG_PM_SLEEP
 static int dspi_suspend(struct device *dev)
 {
 	struct fsl_dspi *dspi = dev_get_drvdata(dev);
@@ -1515,9 +1514,8 @@ disable_clk:
 	clk_disable_unprepare(dspi->clk);
 	return ret;
 }
-#endif /* CONFIG_PM_SLEEP */
 
-static SIMPLE_DEV_PM_OPS(dspi_pm, dspi_suspend, dspi_resume);
+static DEFINE_SIMPLE_DEV_PM_OPS(dspi_pm, dspi_suspend, dspi_resume);
 
 static int dspi_target_abort(struct spi_controller *host)
 {
@@ -1570,7 +1568,6 @@ static int dspi_probe(struct platform_device *pdev)
 
 	ctlr->setup = dspi_setup;
 	ctlr->transfer_one_message = dspi_transfer_one_message;
-	ctlr->dev.of_node = pdev->dev.of_node;
 
 	ctlr->cleanup = dspi_cleanup;
 	ctlr->target_abort = dspi_target_abort;
@@ -1731,6 +1728,8 @@ static void dspi_remove(struct platform_device *pdev)
 	dspi_release_dma(dspi);
 	if (dspi->irq)
 		free_irq(dspi->irq, dspi);
+
+	spi_controller_put(dspi->ctlr);
 }
 
 static void dspi_shutdown(struct platform_device *pdev)
@@ -1741,7 +1740,7 @@ static void dspi_shutdown(struct platform_device *pdev)
 static struct platform_driver fsl_dspi_driver = {
 	.driver.name		= DRIVER_NAME,
 	.driver.of_match_table	= fsl_dspi_dt_ids,
-	.driver.pm		= &dspi_pm,
+	.driver.pm		= pm_sleep_ptr(&dspi_pm),
 	.probe			= dspi_probe,
 	.remove			= dspi_remove,
 	.shutdown		= dspi_shutdown,

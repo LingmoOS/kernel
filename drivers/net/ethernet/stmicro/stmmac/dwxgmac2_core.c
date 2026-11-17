@@ -23,38 +23,29 @@ static void dwxgmac2_core_init(struct mac_device_info *hw,
 	tx = readl(ioaddr + XGMAC_TX_CONFIG);
 	rx = readl(ioaddr + XGMAC_RX_CONFIG);
 
-	tx |= XGMAC_CORE_INIT_TX;
-	rx |= XGMAC_CORE_INIT_RX;
-
-	if (hw->ps) {
-		tx |= XGMAC_CONFIG_TE;
-		tx &= ~hw->link.speed_mask;
-
-		switch (hw->ps) {
-		case SPEED_10000:
-			tx |= hw->link.xgmii.speed10000;
-			break;
-		case SPEED_2500:
-			tx |= hw->link.speed2500;
-			break;
-		case SPEED_1000:
-		default:
-			tx |= hw->link.speed1000;
-			break;
-		}
-	}
-
-	writel(tx, ioaddr + XGMAC_TX_CONFIG);
-	writel(rx, ioaddr + XGMAC_RX_CONFIG);
+	writel(tx | XGMAC_CORE_INIT_TX, ioaddr + XGMAC_TX_CONFIG);
+	writel(rx | XGMAC_CORE_INIT_RX, ioaddr + XGMAC_RX_CONFIG);
 	writel(XGMAC_INT_DEFAULT_EN, ioaddr + XGMAC_INT_EN);
+}
+
+static void dwxgmac2_irq_modify(struct mac_device_info *hw, u32 disable,
+				u32 enable)
+{
+	void __iomem *int_mask = hw->pcsr + XGMAC_INT_EN;
+	unsigned long flags;
+	u32 value;
+
+	spin_lock_irqsave(&hw->irq_ctrl_lock, flags);
+	value = readl(int_mask) & ~disable;
+	value |= enable;
+	writel(value, int_mask);
+	spin_unlock_irqrestore(&hw->irq_ctrl_lock, flags);
 }
 
 static void dwxgmac2_update_caps(struct stmmac_priv *priv)
 {
 	if (!priv->dma_cap.mbps_10_100)
 		priv->hw->link.caps &= ~(MAC_10 | MAC_100);
-	else if (!priv->dma_cap.half_duplex)
-		priv->hw->link.caps &= ~(MAC_10HD | MAC_100HD);
 }
 
 static void dwxgmac2_set_mac(void __iomem *ioaddr, bool enable)
@@ -305,10 +296,10 @@ static void dwxgmac2_dump_regs(struct mac_device_info *hw, u32 *reg_space)
 		reg_space[i] = readl(ioaddr + i * 4);
 }
 
-static int dwxgmac2_host_irq_status(struct mac_device_info *hw,
+static int dwxgmac2_host_irq_status(struct stmmac_priv *priv,
 				    struct stmmac_extra_stats *x)
 {
-	void __iomem *ioaddr = hw->pcsr;
+	void __iomem *ioaddr = priv->hw->pcsr;
 	u32 stat, en;
 	int ret = 0;
 
@@ -364,10 +355,10 @@ static int dwxgmac2_host_mtl_irq_status(struct stmmac_priv *priv,
 
 static void dwxgmac2_flow_ctrl(struct mac_device_info *hw, unsigned int duplex,
 			       unsigned int fc, unsigned int pause_time,
-			       u32 tx_cnt)
+			       u8 tx_cnt)
 {
 	void __iomem *ioaddr = hw->pcsr;
-	u32 i;
+	u8 i;
 
 	if (fc & FLOW_RX)
 		writel(XGMAC_RFE, ioaddr + XGMAC_RX_FLOW_CTRL);
@@ -1171,8 +1162,6 @@ static int dwxgmac2_flex_pps_config(void __iomem *ioaddr, int index,
 	u32 val = readl(ioaddr + XGMAC_PPS_CONTROL);
 	u64 period;
 
-	if (!cfg->available)
-		return -EINVAL;
 	if (tnsec & XGMAC_TRGTBUSY0)
 		return -EBUSY;
 	if (!sub_second_inc || !systime_flags)
@@ -1439,6 +1428,7 @@ static void dwxgmac2_set_arp_offload(struct mac_device_info *hw, bool en,
 
 const struct stmmac_ops dwxgmac210_ops = {
 	.core_init = dwxgmac2_core_init,
+	.irq_modify = dwxgmac2_irq_modify,
 	.update_caps = dwxgmac2_update_caps,
 	.set_mac = dwxgmac2_set_mac,
 	.rx_ipc = dwxgmac2_rx_ipc,
@@ -1494,6 +1484,7 @@ static void dwxlgmac2_rx_queue_enable(struct mac_device_info *hw, u8 mode,
 
 const struct stmmac_ops dwxlgmac2_ops = {
 	.core_init = dwxgmac2_core_init,
+	.irq_modify = dwxgmac2_irq_modify,
 	.set_mac = dwxgmac2_set_mac,
 	.rx_ipc = dwxgmac2_rx_ipc,
 	.rx_queue_enable = dwxlgmac2_rx_queue_enable,
@@ -1562,12 +1553,9 @@ int dwxgmac2_setup(struct stmmac_priv *priv)
 
 	mac->mii.addr = XGMAC_MDIO_ADDR;
 	mac->mii.data = XGMAC_MDIO_DATA;
-	mac->mii.addr_shift = 16;
-	mac->mii.addr_mask = GENMASK(20, 16);
-	mac->mii.reg_shift = 0;
-	mac->mii.reg_mask = GENMASK(15, 0);
-	mac->mii.clk_csr_shift = 19;
-	mac->mii.clk_csr_mask = GENMASK(21, 19);
+	mac->mii.addr_mask = GENMASK_U32(20, 16);
+	mac->mii.reg_mask = GENMASK_U32(15, 0);
+	mac->mii.clk_csr_mask = GENMASK_U32(21, 19);
 	mac->num_vlan = stmmac_get_num_vlan(priv->ioaddr);
 
 	return 0;
@@ -1605,12 +1593,9 @@ int dwxlgmac2_setup(struct stmmac_priv *priv)
 
 	mac->mii.addr = XGMAC_MDIO_ADDR;
 	mac->mii.data = XGMAC_MDIO_DATA;
-	mac->mii.addr_shift = 16;
-	mac->mii.addr_mask = GENMASK(20, 16);
-	mac->mii.reg_shift = 0;
-	mac->mii.reg_mask = GENMASK(15, 0);
-	mac->mii.clk_csr_shift = 19;
-	mac->mii.clk_csr_mask = GENMASK(21, 19);
+	mac->mii.addr_mask = GENMASK_U32(20, 16);
+	mac->mii.reg_mask = GENMASK_U32(15, 0);
+	mac->mii.clk_csr_mask = GENMASK_U32(21, 19);
 
 	return 0;
 }

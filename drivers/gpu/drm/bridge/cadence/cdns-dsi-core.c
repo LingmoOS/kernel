@@ -591,7 +591,7 @@ cdns_dsi_bridge_mode_valid(struct drm_bridge *bridge,
 }
 
 static void cdns_dsi_bridge_atomic_post_disable(struct drm_bridge *bridge,
-						struct drm_atomic_state *state)
+						struct drm_atomic_commit *state)
 {
 	struct cdns_dsi_input *input = bridge_to_cdns_dsi_input(bridge);
 	struct cdns_dsi *dsi = input_to_dsi(input);
@@ -701,7 +701,7 @@ static void cdns_dsi_init_link(struct cdns_dsi *dsi)
 }
 
 static void cdns_dsi_bridge_atomic_pre_enable(struct drm_bridge *bridge,
-					      struct drm_atomic_state *state)
+					      struct drm_atomic_commit *state)
 {
 	struct cdns_dsi_input *input = bridge_to_cdns_dsi_input(bridge);
 	struct cdns_dsi *dsi = input_to_dsi(input);
@@ -902,7 +902,7 @@ static u32 *cdns_dsi_bridge_get_input_bus_fmts(struct drm_bridge *bridge,
 
 	*num_input_fmts = 0;
 
-	input_fmts = kzalloc(sizeof(*input_fmts), GFP_KERNEL);
+	input_fmts = kzalloc_obj(*input_fmts);
 	if (!input_fmts)
 		return NULL;
 
@@ -985,7 +985,7 @@ cdns_dsi_bridge_atomic_duplicate_state(struct drm_bridge *bridge)
 	bridge_state = drm_priv_to_bridge_state(bridge->base.state);
 	old_dsi_state = to_cdns_dsi_bridge_state(bridge_state);
 
-	dsi_state = kzalloc(sizeof(*dsi_state), GFP_KERNEL);
+	dsi_state = kzalloc_obj(*dsi_state);
 	if (!dsi_state)
 		return NULL;
 
@@ -1009,16 +1009,15 @@ cdns_dsi_bridge_atomic_destroy_state(struct drm_bridge *bridge,
 }
 
 static struct drm_bridge_state *
-cdns_dsi_bridge_atomic_reset(struct drm_bridge *bridge)
+cdns_dsi_bridge_atomic_create_state(struct drm_bridge *bridge)
 {
 	struct cdns_dsi_bridge_state *dsi_state;
 
-	dsi_state = kzalloc(sizeof(*dsi_state), GFP_KERNEL);
+	dsi_state = kzalloc_obj(*dsi_state);
 	if (!dsi_state)
 		return ERR_PTR(-ENOMEM);
 
-	memset(dsi_state, 0, sizeof(*dsi_state));
-	dsi_state->base.bridge = bridge;
+	__drm_atomic_helper_bridge_state_init(&dsi_state->base, bridge);
 
 	return &dsi_state->base;
 }
@@ -1029,7 +1028,7 @@ static const struct drm_bridge_funcs cdns_dsi_bridge_funcs = {
 	.atomic_pre_enable = cdns_dsi_bridge_atomic_pre_enable,
 	.atomic_post_disable = cdns_dsi_bridge_atomic_post_disable,
 	.atomic_check = cdns_dsi_bridge_atomic_check,
-	.atomic_reset = cdns_dsi_bridge_atomic_reset,
+	.atomic_create_state = cdns_dsi_bridge_atomic_create_state,
 	.atomic_duplicate_state = cdns_dsi_bridge_atomic_duplicate_state,
 	.atomic_destroy_state = cdns_dsi_bridge_atomic_destroy_state,
 	.atomic_get_input_bus_fmts = cdns_dsi_bridge_get_input_bus_fmts,

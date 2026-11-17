@@ -3,7 +3,7 @@
  * Copyright (c) 2023-2024 Oracle.  All Rights Reserved.
  * Author: Darrick J. Wong <djwong@kernel.org>
  */
-#include "xfs.h"
+#include "xfs_platform.h"
 #include "xfs_fs.h"
 #include "xfs_shared.h"
 #include "xfs_format.h"
@@ -106,7 +106,7 @@ xchk_setup_dirtree(
 			return error;
 	}
 
-	dl = kvzalloc(sizeof(struct xchk_dirtree), XCHK_GFP_FLAGS);
+	dl = kvzalloc_obj(struct xchk_dirtree, XCHK_GFP_FLAGS);
 	if (!dl)
 		return -ENOMEM;
 	dl->sc = sc;
@@ -175,7 +175,7 @@ xchk_dirpath_append(
 	if (error)
 		return error;
 
-	error = xino_bitmap_set(&path->seen_inodes, ip->i_ino);
+	error = xino_bitmap_set(&path->seen_inodes, I_INO(ip));
 	if (error)
 		return error;
 
@@ -238,7 +238,7 @@ xchk_dirtree_create_path(
 	 * Create a new xchk_path structure to remember this parent pointer
 	 * and record the first name step.
 	 */
-	path = kmalloc(sizeof(struct xchk_dirpath), XCHK_GFP_FLAGS);
+	path = kmalloc_obj(struct xchk_dirpath, XCHK_GFP_FLAGS);
 	if (!path)
 		return -ENOMEM;
 
@@ -429,7 +429,7 @@ xchk_dirpath_step_up(
 	 * The inode being scanned is its own distant ancestor!  Get rid of
 	 * this path.
 	 */
-	if (parent_ino == sc->ip->i_ino) {
+	if (parent_ino == I_INO(sc->ip)) {
 		xchk_dirpath_set_outcome(dl, path, XCHK_DIRPATH_DELETE);
 		error = 0;
 		goto out_scanlock;
@@ -560,7 +560,7 @@ xchk_dirpath_walk_upwards(
 	 * The inode being scanned is its own direct ancestor!
 	 * Get rid of this path.
 	 */
-	if (be64_to_cpu(dl->pptr_rec.p_ino) == sc->ip->i_ino) {
+	if (be64_to_cpu(dl->pptr_rec.p_ino) == I_INO(sc->ip)) {
 		xchk_dirpath_set_outcome(dl, path, XCHK_DIRPATH_DELETE);
 		return 0;
 	}
@@ -637,7 +637,7 @@ xchk_dirpath_step_is_stale(
 	 * If the parent and child being updated are not the ones mentioned in
 	 * this path step, the scan data is still ok.
 	 */
-	if (p->ip->i_ino != child_ino || p->dp->i_ino != *cursor)
+	if (I_INO(p->ip) != child_ino || I_INO(p->dp) != *cursor)
 		return 0;
 
 	/*
@@ -659,13 +659,13 @@ xchk_dirpath_step_is_stale(
 	 * If the update comes from the repair code itself, walk the state
 	 * machine forward.
 	 */
-	if (p->ip->i_ino == dl->scan_ino &&
+	if (I_INO(p->ip) == dl->scan_ino &&
 	    path->outcome == XREP_DIRPATH_ADOPTING) {
 		xchk_dirpath_set_outcome(dl, path, XREP_DIRPATH_ADOPTED);
 		return 0;
 	}
 
-	if (p->ip->i_ino == dl->scan_ino &&
+	if (I_INO(p->ip) == dl->scan_ino &&
 	    path->outcome == XREP_DIRPATH_DELETING) {
 		xchk_dirpath_set_outcome(dl, path, XREP_DIRPATH_DELETED);
 		return 0;
@@ -696,7 +696,7 @@ xchk_dirpath_is_stale(
 	 * The child being updated has not been seen by this path at all; this
 	 * path cannot be stale.
 	 */
-	if (!xino_bitmap_test(&path->seen_inodes, p->ip->i_ino))
+	if (!xino_bitmap_test(&path->seen_inodes, I_INO(p->ip)))
 		return 0;
 
 	ret = xchk_dirpath_step_is_stale(dl, path, 0, idx, p, &cursor);
@@ -956,7 +956,7 @@ xchk_dirtree(
 	 * released during teardown.
 	 */
 	dl->root_ino = xchk_inode_rootdir_inum(sc->ip);
-	dl->scan_ino = sc->ip->i_ino;
+	dl->scan_ino = I_INO(sc->ip);
 
 	trace_xchk_dirtree_start(sc->ip, sc->sm, 0);
 
@@ -1023,7 +1023,7 @@ out:
 	return error;
 }
 
-/* Does the directory targetted by this scrub have no parents? */
+/* Does the directory targeted by this scrub have no parents? */
 bool
 xchk_dirtree_parentless(const struct xchk_dirtree *dl)
 {

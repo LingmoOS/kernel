@@ -59,6 +59,7 @@
 #include <linux/string.h>
 #include <linux/list.h>
 #include <linux/uaccess.h>
+#include <linux/uio.h>
 
 #include <linux/kernel.h>
 #include <linux/spinlock.h>
@@ -684,7 +685,7 @@ static struct l2tp_tunnel *pppol2tp_tunnel_get(struct net *net,
 
 /* connect() handler. Attach a PPPoX socket to a tunnel UDP socket
  */
-static int pppol2tp_connect(struct socket *sock, struct sockaddr *uservaddr,
+static int pppol2tp_connect(struct socket *sock, struct sockaddr_unsized *uservaddr,
 			    int sockaddr_len, int flags)
 {
 	struct sock *sk = sock->sk;
@@ -787,11 +788,12 @@ static int pppol2tp_connect(struct socket *sock, struct sockaddr *uservaddr,
 		goto out_no_ppp;
 	}
 
-	/* The only header we need to worry about is the L2TP
-	 * header. This size is different depending on whether
-	 * sequence numbers are enabled for the data channel.
+	/* Reserve enough headroom for the L2TP header with sequence numbers,
+	 * which is the largest possible. This is used by the PPP layer to set
+	 * the net device's hard_header_len at registration, which must be
+	 * sufficient regardless of whether sequence numbers are enabled later.
 	 */
-	po->chan.hdrlen = PPPOL2TP_L2TP_HDR_SIZE_NOSEQ;
+	po->chan.hdrlen = PPPOL2TP_L2TP_HDR_SIZE_SEQ;
 
 	po->chan.private = sk;
 	po->chan.ops	 = &pppol2tp_chan_ops;
@@ -1193,15 +1195,7 @@ static int pppol2tp_session_setsockopt(struct sock *sk,
 			err = -EINVAL;
 			break;
 		}
-		session->send_seq = !!val;
-		{
-			struct pppox_sock *po = pppox_sk(sk);
-
-			po->chan.hdrlen = val ? PPPOL2TP_L2TP_HDR_SIZE_SEQ :
-				PPPOL2TP_L2TP_HDR_SIZE_NOSEQ;
-		}
-		l2tp_session_set_header_len(session, session->tunnel->version,
-					    session->tunnel->encap);
+		WRITE_ONCE(session->send_seq, !!val);
 		break;
 
 	case PPPOL2TP_SO_LNSMODE:
@@ -1311,7 +1305,7 @@ static int pppol2tp_session_getsockopt(struct sock *sk,
 		break;
 
 	case PPPOL2TP_SO_SENDSEQ:
-		*val = session->send_seq;
+		*val = READ_ONCE(session->send_seq);
 		break;
 
 	case PPPOL2TP_SO_LNSMODE:
@@ -1340,7 +1334,7 @@ static int pppol2tp_session_getsockopt(struct sock *sk,
  * or the special tunnel type.
  */
 static int pppol2tp_getsockopt(struct socket *sock, int level, int optname,
-			       char __user *optval, int __user *optlen)
+			       sockopt_t *opt)
 {
 	struct sock *sk = sock->sk;
 	struct l2tp_session *session;
@@ -1351,9 +1345,7 @@ static int pppol2tp_getsockopt(struct socket *sock, int level, int optname,
 	if (level != SOL_PPPOL2TP)
 		return -EINVAL;
 
-	if (get_user(len, optlen))
-		return -EFAULT;
-
+	len = opt->optlen;
 	if (len < 0)
 		return -EINVAL;
 
@@ -1381,14 +1373,9 @@ static int pppol2tp_getsockopt(struct socket *sock, int level, int optname,
 			goto end_put_sess;
 	}
 
-	err = -EFAULT;
-	if (put_user(len, optlen))
-		goto end_put_sess;
-
-	if (copy_to_user((void __user *)optval, &val, len))
-		goto end_put_sess;
-
-	err = 0;
+	opt->optlen = len;
+	if (copy_to_iter(&val, len, &opt->iter_out) != len)
+		err = -EFAULT;
 
 end_put_sess:
 	l2tp_session_put(session);
@@ -1557,7 +1544,7 @@ static void pppol2tp_seq_session_show(struct seq_file *m, void *v)
 		   state, user_data_ok);
 	seq_printf(m, "   0/0/%c/%c/%s %08x %u\n",
 		   session->recv_seq ? 'R' : '-',
-		   session->send_seq ? 'S' : '-',
+		   READ_ONCE(session->send_seq) ? 'S' : '-',
 		   session->lns_mode ? "LNS" : "LAC",
 		   0,
 		   jiffies_to_msecs(session->reorder_timeout));
@@ -1707,7 +1694,7 @@ static const struct proto_ops pppol2tp_ops = {
 	.listen		= sock_no_listen,
 	.shutdown	= sock_no_shutdown,
 	.setsockopt	= pppol2tp_setsockopt,
-	.getsockopt	= pppol2tp_getsockopt,
+	.getsockopt_iter = pppol2tp_getsockopt,
 	.sendmsg	= pppol2tp_sendmsg,
 	.recvmsg	= pppol2tp_recvmsg,
 	.mmap		= sock_no_mmap,

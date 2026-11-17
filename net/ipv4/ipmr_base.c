@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /* Linux multicast routing support
  * Common logic shared by IPv4 [ipmr] and IPv6 [ip6mr] implementation
  */
@@ -26,7 +27,6 @@ void vif_device_init(struct vif_device *v,
 	else
 		v->link = dev->ifindex;
 }
-EXPORT_SYMBOL(vif_device_init);
 
 static void __mr_free_table(struct work_struct *work)
 {
@@ -39,7 +39,7 @@ static void __mr_free_table(struct work_struct *work)
 
 void mr_table_free(struct mr_table *mrt)
 {
-	queue_rcu_work(system_unbound_wq, &mrt->work);
+	queue_rcu_work(system_dfl_wq, &mrt->work);
 }
 
 struct mr_table *
@@ -52,7 +52,7 @@ mr_table_alloc(struct net *net, u32 id,
 	struct mr_table *mrt;
 	int err;
 
-	mrt = kzalloc(sizeof(*mrt), GFP_KERNEL_ACCOUNT);
+	mrt = kzalloc_obj(*mrt, GFP_KERNEL_ACCOUNT);
 	if (!mrt)
 		return ERR_PTR(-ENOMEM);
 	mrt->id = id;
@@ -75,7 +75,6 @@ mr_table_alloc(struct net *net, u32 id,
 	table_set(mrt, net);
 	return mrt;
 }
-EXPORT_SYMBOL(mr_table_alloc);
 
 void *mr_mfc_find_parent(struct mr_table *mrt, void *hasharg, int parent)
 {
@@ -89,7 +88,6 @@ void *mr_mfc_find_parent(struct mr_table *mrt, void *hasharg, int parent)
 
 	return NULL;
 }
-EXPORT_SYMBOL(mr_mfc_find_parent);
 
 void *mr_mfc_find_any_parent(struct mr_table *mrt, int vifi)
 {
@@ -104,7 +102,6 @@ void *mr_mfc_find_any_parent(struct mr_table *mrt, int vifi)
 
 	return NULL;
 }
-EXPORT_SYMBOL(mr_mfc_find_any_parent);
 
 void *mr_mfc_find_any(struct mr_table *mrt, int vifi, void *hasharg)
 {
@@ -124,7 +121,6 @@ void *mr_mfc_find_any(struct mr_table *mrt, int vifi, void *hasharg)
 
 	return mr_mfc_find_any_parent(mrt, vifi);
 }
-EXPORT_SYMBOL(mr_mfc_find_any);
 
 #ifdef CONFIG_PROC_FS
 void *mr_vif_seq_idx(struct net *net, struct mr_vif_iter *iter, loff_t pos)
@@ -139,7 +135,6 @@ void *mr_vif_seq_idx(struct net *net, struct mr_vif_iter *iter, loff_t pos)
 	}
 	return NULL;
 }
-EXPORT_SYMBOL(mr_vif_seq_idx);
 
 void *mr_vif_seq_next(struct seq_file *seq, void *v, loff_t *pos)
 {
@@ -158,7 +153,6 @@ void *mr_vif_seq_next(struct seq_file *seq, void *v, loff_t *pos)
 	}
 	return NULL;
 }
-EXPORT_SYMBOL(mr_vif_seq_next);
 
 void *mr_mfc_seq_idx(struct net *net,
 		     struct mr_mfc_iter *it, loff_t pos)
@@ -183,7 +177,6 @@ void *mr_mfc_seq_idx(struct net *net,
 	it->cache = NULL;
 	return NULL;
 }
-EXPORT_SYMBOL(mr_mfc_seq_idx);
 
 void *mr_mfc_seq_next(struct seq_file *seq, void *v,
 		      loff_t *pos)
@@ -218,7 +211,6 @@ end_of_list:
 
 	return NULL;
 }
-EXPORT_SYMBOL(mr_mfc_seq_next);
 #endif
 
 int mr_fill_mroute(struct mr_table *mrt, struct sk_buff *skb,
@@ -239,7 +231,7 @@ int mr_fill_mroute(struct mr_table *mrt, struct sk_buff *skb,
 
 	rcu_read_lock();
 	vif_dev = rcu_dereference(mrt->vif_table[c->mfc_parent].dev);
-	if (vif_dev && nla_put_u32(skb, RTA_IIF, vif_dev->ifindex) < 0) {
+	if (vif_dev && nla_put_u32(skb, RTA_IIF, READ_ONCE(vif_dev->ifindex)) < 0) {
 		rcu_read_unlock();
 		return -EMSGSIZE;
 	}
@@ -268,7 +260,7 @@ int mr_fill_mroute(struct mr_table *mrt, struct sk_buff *skb,
 
 			nhp->rtnh_flags = 0;
 			nhp->rtnh_hops = c->mfc_un.res.ttls[ct];
-			nhp->rtnh_ifindex = vif_dev->ifindex;
+			nhp->rtnh_ifindex = READ_ONCE(vif_dev->ifindex);
 			nhp->rtnh_len = sizeof(*nhp);
 		}
 	}
@@ -290,7 +282,6 @@ int mr_fill_mroute(struct mr_table *mrt, struct sk_buff *skb,
 	rtm->rtm_type = RTN_MULTICAST;
 	return 1;
 }
-EXPORT_SYMBOL(mr_fill_mroute);
 
 static bool mr_mfc_uses_dev(const struct mr_table *mrt,
 			    const struct mr_mfc *c,
@@ -362,7 +353,6 @@ out:
 	cb->args[1] = e;
 	return err;
 }
-EXPORT_SYMBOL(mr_table_dump);
 
 int mr_rtm_dumproute(struct sk_buff *skb, struct netlink_callback *cb,
 		     struct mr_table *(*iter)(struct net *net,
@@ -405,7 +395,6 @@ next_table:
 
 	return skb->len;
 }
-EXPORT_SYMBOL(mr_rtm_dumproute);
 
 int mr_dump(struct net *net, struct notifier_block *nb, unsigned short family,
 	    int (*rules_dump)(struct net *net,
@@ -459,4 +448,3 @@ int mr_dump(struct net *net, struct notifier_block *nb, unsigned short family,
 
 	return 0;
 }
-EXPORT_SYMBOL(mr_dump);

@@ -1,9 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
   FUSE: Filesystem in Userspace
   Copyright (C) 2001-2018  Miklos Szeredi <miklos@szeredi.hu>
-
-  This program can be distributed under the terms of the GNU GPL.
-  See the file COPYING.
 */
 
 
@@ -57,7 +55,7 @@ static void fuse_add_dirent_to_cache(struct file *file,
 	}
 	version = fi->rdc.version;
 	size = fi->rdc.size;
-	offset = size & ~PAGE_MASK;
+	offset = offset_in_page(size);
 	index = size >> PAGE_SHIFT;
 	/* Dirent doesn't fit in current page?  Jump to next page. */
 	if (offset + reclen > PAGE_SIZE) {
@@ -165,7 +163,6 @@ static int fuse_direntplus_link(struct file *file,
 	struct inode *dir = d_inode(parent);
 	struct fuse_conn *fc;
 	struct inode *inode;
-	DECLARE_WAIT_QUEUE_HEAD_ONSTACK(wq);
 	int epoch;
 
 	if (!o->nodeid) {
@@ -202,7 +199,7 @@ static int fuse_direntplus_link(struct file *file,
 	dentry = d_lookup(parent, &name);
 	if (!dentry) {
 retry:
-		dentry = d_alloc_parallel(parent, &name, &wq);
+		dentry = d_alloc_parallel(parent, &name);
 		if (IS_ERR(dentry))
 			return PTR_ERR(dentry);
 	}
@@ -263,7 +260,7 @@ retry:
 	}
 	if (fc->readdirplus_auto)
 		set_bit(FUSE_I_INIT_RDPLUS, &get_fuse_inode(inode)->state);
-	dentry->d_time = epoch;
+	fuse_dentry_set_epoch(dentry, epoch);
 	fuse_change_entry_timeout(dentry, o);
 
 	dput(dentry);
@@ -339,7 +336,7 @@ static int parse_dirplusfile(char *buf, size_t nbytes, struct file *file,
 static struct page **fuse_readdir_alloc_buf(struct fuse_args_pages *ap, size_t *bufsize)
 {
 	unsigned int i, nr_alloc, nr_pages = DIV_ROUND_UP(*bufsize, PAGE_SIZE);
-	struct page **pages = kcalloc(nr_pages, sizeof(*pages), GFP_KERNEL);
+	struct page **pages = kzalloc_objs(*pages, nr_pages);
 
 	if (!pages)
 		return NULL;
@@ -445,7 +442,7 @@ static enum fuse_parse_result fuse_parse_cache(struct fuse_file *ff,
 					       void *addr, unsigned int size,
 					       struct dir_context *ctx)
 {
-	unsigned int offset = ff->readdir.cache_off & ~PAGE_MASK;
+	unsigned int offset = offset_in_page(ff->readdir.cache_off);
 	enum fuse_parse_result res = FOUND_NONE;
 
 	WARN_ON(offset >= size);
@@ -491,6 +488,7 @@ static void fuse_rdc_reset(struct inode *inode)
 	fi->rdc.version++;
 	fi->rdc.size = 0;
 	fi->rdc.pos = 0;
+	fi->rdc.epoch = 0;
 }
 
 #define UNCACHED 1
@@ -532,6 +530,7 @@ retry_locked:
 		if (!ctx->pos && !fi->rdc.size) {
 			fi->rdc.mtime = inode_get_mtime(inode);
 			fi->rdc.iversion = inode_query_iversion(inode);
+			fi->rdc.epoch = atomic_read(&fc->epoch);
 		}
 		spin_unlock(&fi->rdc.lock);
 		return UNCACHED;
@@ -545,7 +544,8 @@ retry_locked:
 		struct timespec64 mtime = inode_get_mtime(inode);
 
 		if (inode_peek_iversion(inode) != fi->rdc.iversion ||
-		    !timespec64_equal(&fi->rdc.mtime, &mtime)) {
+		    !timespec64_equal(&fi->rdc.mtime, &mtime) ||
+		    fi->rdc.epoch != atomic_read(&fc->epoch)) {
 			fuse_rdc_reset(inode);
 			goto retry_locked;
 		}
@@ -571,13 +571,13 @@ retry_locked:
 	index = ff->readdir.cache_off >> PAGE_SHIFT;
 
 	if (index == (fi->rdc.size >> PAGE_SHIFT))
-		size = fi->rdc.size & ~PAGE_MASK;
+		size = offset_in_page(fi->rdc.size);
 	else
 		size = PAGE_SIZE;
 	spin_unlock(&fi->rdc.lock);
 
 	/* EOF? */
-	if ((ff->readdir.cache_off & ~PAGE_MASK) == size)
+	if (offset_in_page(ff->readdir.cache_off) == size)
 		return 0;
 
 	page = find_get_page_flags(file->f_mapping, index,

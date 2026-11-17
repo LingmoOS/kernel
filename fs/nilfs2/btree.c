@@ -10,7 +10,7 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/errno.h>
-#include <linux/pagevec.h>
+#include <linux/folio_batch.h>
 #include "nilfs.h"
 #include "page.h"
 #include "btnode.h"
@@ -341,7 +341,8 @@ static int nilfs_btree_node_broken(const struct nilfs_btree_node *node,
 				   sector_t blocknr)
 {
 	int level, flags, nchildren;
-	int ret = 0;
+	__u64 key, prev_key;
+	int i;
 
 	level = nilfs_btree_node_get_level(node);
 	flags = nilfs_btree_node_get_flags(node);
@@ -353,12 +354,24 @@ static int nilfs_btree_node_broken(const struct nilfs_btree_node *node,
 		     nchildren <= 0 ||
 		     nchildren > NILFS_BTREE_NODE_NCHILDREN_MAX(size))) {
 		nilfs_crit(inode->i_sb,
-			   "bad btree node (ino=%lu, blocknr=%llu): level = %d, flags = 0x%x, nchildren = %d",
+			   "bad btree node (ino=%llu, blocknr=%llu): level = %d, flags = 0x%x, nchildren = %d",
 			   inode->i_ino, (unsigned long long)blocknr, level,
 			   flags, nchildren);
-		ret = 1;
+		return 1;
 	}
-	return ret;
+
+	for (i = 1, prev_key = nilfs_btree_node_get_key(node, 0);
+	     i < nchildren; i++, prev_key = key) {
+		key = nilfs_btree_node_get_key(node, i);
+		if (unlikely(key <= prev_key)) {
+			nilfs_crit(inode->i_sb,
+				"bad btree node (ino=%llu, blocknr=%llu): unsorted keys at index %d (%llu) and %d (%llu)",
+				inode->i_ino, (unsigned long long)blocknr,
+				i - 1, prev_key, i, key);
+			return 1;
+		}
+	}
+	return 0;
 }
 
 /**
@@ -384,7 +397,7 @@ static int nilfs_btree_root_broken(const struct nilfs_btree_node *node,
 		     nchildren > NILFS_BTREE_ROOT_NCHILDREN_MAX ||
 		     (nchildren == 0 && level > NILFS_BTREE_LEVEL_NODE_MIN))) {
 		nilfs_crit(inode->i_sb,
-			   "bad btree root (ino=%lu): level = %d, flags = 0x%x, nchildren = %d",
+			   "bad btree root (ino=%llu): level = %d, flags = 0x%x, nchildren = %d",
 			   inode->i_ino, level, flags, nchildren);
 		ret = 1;
 	}
@@ -453,7 +466,7 @@ static int nilfs_btree_bad_node(const struct nilfs_bmap *btree,
 	if (unlikely(nilfs_btree_node_get_level(node) != level)) {
 		dump_stack();
 		nilfs_crit(btree->b_inode->i_sb,
-			   "btree level mismatch (ino=%lu): %d != %d",
+			   "btree level mismatch (ino=%llu): %d != %d",
 			   btree->b_inode->i_ino,
 			   nilfs_btree_node_get_level(node), level);
 		return 1;
@@ -521,7 +534,7 @@ static int __nilfs_btree_get_block(const struct nilfs_bmap *btree, __u64 ptr,
  out_no_wait:
 	if (!buffer_uptodate(bh)) {
 		nilfs_err(btree->b_inode->i_sb,
-			  "I/O error reading b-tree node block (ino=%lu, blocknr=%llu)",
+			  "I/O error reading b-tree node block (ino=%llu, blocknr=%llu)",
 			  btree->b_inode->i_ino, (unsigned long long)ptr);
 		brelse(bh);
 		return -EIO;
@@ -2129,7 +2142,7 @@ static int nilfs_btree_propagate(struct nilfs_bmap *btree,
 	if (ret < 0) {
 		if (unlikely(ret == -ENOENT)) {
 			nilfs_crit(btree->b_inode->i_sb,
-				   "writing node/leaf block does not appear in b-tree (ino=%lu) at key=%llu, level=%d",
+				   "writing node/leaf block does not appear in b-tree (ino=%llu) at key=%llu, level=%d",
 				   btree->b_inode->i_ino,
 				   (unsigned long long)key, level);
 			ret = -EINVAL;
@@ -2171,7 +2184,7 @@ static void nilfs_btree_add_dirty_buffer(struct nilfs_bmap *btree,
 	    level >= NILFS_BTREE_LEVEL_MAX) {
 		dump_stack();
 		nilfs_warn(btree->b_inode->i_sb,
-			   "invalid btree level: %d (key=%llu, ino=%lu, blocknr=%llu)",
+			   "invalid btree level: %d (key=%llu, ino=%llu, blocknr=%llu)",
 			   level, (unsigned long long)key,
 			   btree->b_inode->i_ino,
 			   (unsigned long long)bh->b_blocknr);

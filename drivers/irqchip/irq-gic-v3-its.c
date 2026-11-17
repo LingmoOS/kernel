@@ -163,7 +163,7 @@ struct event_lpi_map {
 
 /*
  * The ITS view of a device - belongs to an ITS, owns an interrupt
- * translation table, and a list of interrupts.  If it some of its
+ * translation table, and a list of interrupts.  If some of its
  * LPIs are injected into a guest (GICv4), the event_map.vm field
  * indicates which one.
  */
@@ -1926,8 +1926,8 @@ static int its_vlpi_map(struct irq_data *d, struct its_cmd_info *info)
 	if (!its_dev->event_map.vm) {
 		struct its_vlpi_map *maps;
 
-		maps = kcalloc(its_dev->event_map.nr_lpis, sizeof(*maps),
-			       GFP_ATOMIC);
+		maps = kzalloc_objs(*maps, its_dev->event_map.nr_lpis,
+				    GFP_ATOMIC);
 		if (!maps)
 			return -ENOMEM;
 
@@ -2108,7 +2108,7 @@ static struct lpi_range *mk_lpi_range(u32 base, u32 span)
 {
 	struct lpi_range *range;
 
-	range = kmalloc(sizeof(*range), GFP_KERNEL);
+	range = kmalloc_obj(*range);
 	if (range) {
 		range->base_id = base;
 		range->span = span;
@@ -2501,10 +2501,7 @@ static bool its_parse_indirect_baser(struct its_node *its,
 
 	/* No need to enable Indirection if memory requirement < (psz*2)bytes */
 	if ((esz << ids) > (psz * 2)) {
-		/*
-		 * Find out whether hw supports a single or two-level table by
-		 * table by reading bit at offset '62' after writing '1' to it.
-		 */
+		 /* Find out whether the hardware supports a single or two-level table */
 		its_write_baser(its, baser, val | GITS_BASER_INDIRECT);
 		indirect = !!(baser->val & GITS_BASER_INDIRECT);
 
@@ -2927,7 +2924,7 @@ static int allocate_vpe_l1_table(void)
 	if (val & GICR_VPROPBASER_4_1_VALID)
 		goto out;
 
-	gic_data_rdist()->vpe_table_mask = kzalloc(sizeof(cpumask_t), GFP_ATOMIC);
+	gic_data_rdist()->vpe_table_mask = kzalloc_obj(cpumask_t, GFP_ATOMIC);
 	if (!gic_data_rdist()->vpe_table_mask)
 		return -ENOMEM;
 
@@ -3025,8 +3022,7 @@ static int its_alloc_collections(struct its_node *its)
 {
 	int i;
 
-	its->collections = kcalloc(nr_cpu_ids, sizeof(*its->collections),
-				   GFP_KERNEL);
+	its->collections = kzalloc_objs(*its->collections, nr_cpu_ids);
 	if (!its->collections)
 		return -ENOMEM;
 
@@ -3488,14 +3484,14 @@ static struct its_device *its_create_device(struct its_node *its, u32 dev_id,
 	 * Also honor the ITS's own EID limit.
 	 */
 	id_bits = FIELD_GET(GITS_TYPER_IDBITS, its->typer) + 1;
-	nvecs = min_t(unsigned int, nvecs, BIT(id_bits));
+	nvecs = min_t(u64, nvecs, BIT_ULL(id_bits));
 	nr_ites = max(2, nvecs);
 	sz = nr_ites * (FIELD_GET(GITS_TYPER_ITT_ENTRY_SIZE, its->typer) + 1);
 	sz = max(sz, ITS_ITT_ALIGN);
 
 	itt = itt_alloc_pool(its->numa_node, sz);
 
-	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+	dev = kzalloc_obj(*dev);
 
 	if (alloc_lpis) {
 		lpi_map = its_lpi_alloc(nvecs, &lpi_base, &nr_lpis);
@@ -4792,8 +4788,7 @@ static bool __maybe_unused its_enable_quirk_cavium_22375(void *data)
 	struct its_node *its = data;
 
 	/* erratum 22375: only alloc 8MB table size (20 bits) */
-	its->typer &= ~GITS_TYPER_DEVBITS;
-	its->typer |= FIELD_PREP(GITS_TYPER_DEVBITS, 20 - 1);
+	FIELD_MODIFY(GITS_TYPER_DEVBITS, &its->typer, 20 - 1);
 	its->flags |= ITS_FLAGS_WORKAROUND_CAVIUM_22375;
 
 	return true;
@@ -4813,8 +4808,7 @@ static bool __maybe_unused its_enable_quirk_qdf2400_e0065(void *data)
 	struct its_node *its = data;
 
 	/* On QDF2400, the size of the ITE is 16Bytes */
-	its->typer &= ~GITS_TYPER_ITT_ENTRY_SIZE;
-	its->typer |= FIELD_PREP(GITS_TYPER_ITT_ENTRY_SIZE, 16 - 1);
+	FIELD_MODIFY(GITS_TYPER_ITT_ENTRY_SIZE, &its->typer, 16 - 1);
 
 	return true;
 }
@@ -4848,10 +4842,8 @@ static bool __maybe_unused its_enable_quirk_socionext_synquacer(void *data)
 		its->get_msi_base = its_irq_get_msi_base_pre_its;
 
 		ids = ilog2(pre_its_window[1]) - 2;
-		if (device_ids(its) > ids) {
-			its->typer &= ~GITS_TYPER_DEVBITS;
-			its->typer |= FIELD_PREP(GITS_TYPER_DEVBITS, ids - 1);
-		}
+		if (device_ids(its) > ids)
+			FIELD_MODIFY(GITS_TYPER_DEVBITS, &its->typer, ids - 1);
 
 		/* the pre-ITS breaks isolation, so disable MSI remapping */
 		its->msi_domain_flags &= ~IRQ_DOMAIN_FLAG_ISOLATED_MSI;
@@ -4902,10 +4894,22 @@ static bool __maybe_unused its_enable_quirk_hip09_162100801(void *data)
 	return true;
 }
 
-static bool __maybe_unused its_enable_rk3568002(void *data)
+static const char * const dma_32bit_impaired_platforms[] = {
+#ifdef CONFIG_RENESAS_ERRATUM_GEN4GICITS1
+	"renesas,r8a779f0",
+	"renesas,r8a779g0",
+	"renesas,r8a779h0",
+#endif
+#ifdef CONFIG_ROCKCHIP_ERRATUM_3568002
+	"rockchip,rk3566",
+	"rockchip,rk3568",
+#endif
+	NULL,
+};
+
+static bool its_enable_dma32(void *data)
 {
-	if (!of_machine_is_compatible("rockchip,rk3566") &&
-	    !of_machine_is_compatible("rockchip,rk3568"))
+	if (!of_machine_compatible_match(dma_32bit_impaired_platforms))
 		return false;
 
 	gfp_flags_quirk |= GFP_DMA32;
@@ -4980,14 +4984,12 @@ static const struct gic_quirk its_quirks[] = {
 		.property = "dma-noncoherent",
 		.init   = its_set_non_coherent,
 	},
-#ifdef CONFIG_ROCKCHIP_ERRATUM_3568002
 	{
-		.desc   = "ITS: Rockchip erratum RK3568002",
+		.desc   = "ITS: Broken GIC600 integration limited to 32bit PA",
 		.iidr   = 0x0201743b,
 		.mask   = 0xffffffff,
-		.init   = its_enable_rk3568002,
+		.init   = its_enable_dma32,
 	},
-#endif
 	{
 	}
 };
@@ -5150,7 +5152,7 @@ static int its_init_domain(struct its_node *its)
 	};
 	struct msi_domain_info *info;
 
-	info = kzalloc(sizeof(*info), GFP_KERNEL);
+	info = kzalloc_obj(*info);
 	if (!info)
 		return -ENOMEM;
 
@@ -5180,8 +5182,7 @@ static int its_init_vpe_domain(void)
 	its = list_first_entry(&its_nodes, struct its_node, entry);
 
 	entries = roundup_pow_of_two(nr_cpu_ids);
-	vpe_proxy.vpes = kcalloc(entries, sizeof(*vpe_proxy.vpes),
-				 GFP_KERNEL);
+	vpe_proxy.vpes = kzalloc_objs(*vpe_proxy.vpes, entries);
 	if (!vpe_proxy.vpes)
 		return -ENOMEM;
 
@@ -5527,7 +5528,7 @@ static struct its_node __init *its_node_init(struct resource *res,
 
 	pr_info("ITS %pR\n", res);
 
-	its = kzalloc(sizeof(*its), GFP_KERNEL);
+	its = kzalloc_obj(*its);
 	if (!its)
 		goto out_unmap;
 
@@ -5693,8 +5694,7 @@ static void __init acpi_table_parse_srat_its(void)
 	if (count <= 0)
 		return;
 
-	its_srat_maps = kmalloc_array(count, sizeof(struct its_srat_map),
-				      GFP_KERNEL);
+	its_srat_maps = kmalloc_objs(struct its_srat_map, count);
 	if (!its_srat_maps)
 		return;
 

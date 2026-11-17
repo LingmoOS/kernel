@@ -189,7 +189,7 @@ static int mall_change(struct net *net, struct sk_buff *in_skb,
 			return -EINVAL;
 	}
 
-	new = kzalloc(sizeof(*new), GFP_KERNEL_ACCOUNT);
+	new = kzalloc_obj(*new, GFP_KERNEL_ACCOUNT);
 	if (!new)
 		return -ENOBUFS;
 

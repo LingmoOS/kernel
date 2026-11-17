@@ -27,7 +27,6 @@
 #include <linux/tty_flip.h>
 #include <linux/module.h>
 #include <linux/bitops.h>
-#include <linux/uaccess.h>
 #include <linux/usb.h>
 #include <linux/usb/cdc.h>
 #include <linux/usb/serial.h>
@@ -402,6 +401,7 @@ void usb_wwan_close(struct usb_serial_port *port)
 		urb = usb_get_from_anchor(&portdata->delayed);
 		if (!urb)
 			break;
+		usb_put_urb(urb);
 		unbusy_queued_urb(urb, portdata);
 		usb_autopm_put_interface_async(serial->interface);
 	}
@@ -449,7 +449,7 @@ int usb_wwan_port_probe(struct usb_serial_port *port)
 	if (!port->bulk_in_size || !port->bulk_out_size)
 		return -ENODEV;
 
-	portdata = kzalloc(sizeof(*portdata), GFP_KERNEL);
+	portdata = kzalloc_obj(*portdata);
 	if (!portdata)
 		return -ENOMEM;
 
@@ -578,6 +578,8 @@ static int usb_wwan_submit_delayed_urbs(struct usb_serial_port *port)
 		urb = usb_get_from_anchor(&portdata->delayed);
 		if (!urb)
 			break;
+
+		usb_put_urb(urb);
 
 		err = usb_submit_urb(urb, GFP_ATOMIC);
 		if (err) {

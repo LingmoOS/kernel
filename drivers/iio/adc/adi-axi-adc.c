@@ -13,7 +13,6 @@
 #include <linux/err.h>
 #include <linux/io.h>
 #include <linux/delay.h>
-#include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
@@ -620,17 +619,12 @@ static int axi_adc_create_platform_device(struct adi_axi_adc_state *st,
 	    .size_data = st->info->pdata_sz,
 	};
 	struct platform_device *pdev;
-	int ret;
 
 	pdev = platform_device_register_full(&pi);
 	if (IS_ERR(pdev))
 		return PTR_ERR(pdev);
 
-	ret = devm_add_action_or_reset(st->dev, axi_adc_child_remove, pdev);
-	if (ret)
-		return ret;
-
-	return 0;
+	return devm_add_action_or_reset(st->dev, axi_adc_child_remove, pdev);
 }
 
 static const struct iio_backend_ops adi_axi_adc_ops = {
@@ -655,6 +649,8 @@ static const struct iio_backend_ops adi_axi_adc_ops = {
 static const struct iio_backend_info adi_axi_adc_generic = {
 	.name = "axi-adc",
 	.ops = &adi_axi_adc_ops,
+	.caps = IIO_BACKEND_CAP_CALIBRATION | IIO_BACKEND_CAP_BUFFER |
+		IIO_BACKEND_CAP_ENABLE,
 };
 
 static const struct iio_backend_ops adi_ad485x_ops = {
@@ -679,6 +675,8 @@ static const struct iio_backend_ops adi_ad485x_ops = {
 static const struct iio_backend_info axi_ad485x = {
 	.name = "axi-ad485x",
 	.ops = &adi_ad485x_ops,
+	.caps = IIO_BACKEND_CAP_CALIBRATION | IIO_BACKEND_CAP_BUFFER |
+		IIO_BACKEND_CAP_ENABLE,
 };
 
 static const struct iio_backend_ops adi_ad408x_ops = {
@@ -700,6 +698,7 @@ static const struct iio_backend_ops adi_ad408x_ops = {
 static const struct iio_backend_info axi_ad408x = {
 	.name = "axi-ad408x",
 	.ops = &adi_ad408x_ops,
+	.caps = IIO_BACKEND_CAP_BUFFER | IIO_BACKEND_CAP_ENABLE,
 };
 
 static int adi_axi_adc_probe(struct platform_device *pdev)

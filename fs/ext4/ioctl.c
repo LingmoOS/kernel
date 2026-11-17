@@ -26,6 +26,7 @@
 #include <linux/fsmap.h>
 #include "fsmap.h"
 #include <trace/events/ext4.h>
+#include <linux/fserror.h>
 
 typedef void ext4_update_sb_callback(struct ext4_sb_info *sbi,
 				     struct ext4_super_block *es,
@@ -476,7 +477,7 @@ static long swap_inode_boot_loader(struct super_block *sb,
 	if (err < 0) {
 		/* No need to update quota information. */
 		ext4_warning(inode->i_sb,
-			"couldn't mark inode #%lu dirty (err %d)",
+			"couldn't mark inode #%llu dirty (err %d)",
 			inode->i_ino, err);
 		/* Revert all changes: */
 		swap_inode_data(inode, inode_bl);
@@ -492,7 +493,7 @@ static long swap_inode_boot_loader(struct super_block *sb,
 	if (err < 0) {
 		/* No need to update quota information. */
 		ext4_warning(inode_bl->i_sb,
-			"couldn't mark inode #%lu dirty (err %d)",
+			"couldn't mark inode #%llu dirty (err %d)",
 			inode_bl->i_ino, err);
 		goto revert;
 	}
@@ -850,6 +851,7 @@ int ext4_force_shutdown(struct super_block *sb, u32 flags)
 		return -EINVAL;
 	}
 	clear_opt(sb, DISCARD);
+	fserror_report_shutdown(sb, GFP_KERNEL);
 	return 0;
 }
 
@@ -1360,7 +1362,8 @@ static void ext4_sb_setparams(struct ext4_sb_info *sbi,
 		es->s_encoding = cpu_to_le16(params->encoding);
 	if (params->set_flags & EXT4_TUNE_FL_ENCODING_FLAGS)
 		es->s_encoding_flags = cpu_to_le16(params->encoding_flags);
-	strscpy_pad(es->s_mount_opts, params->mount_opts);
+	if (params->set_flags & EXT4_TUNE_FL_MOUNT_OPTS)
+		strscpy_pad(es->s_mount_opts, params->mount_opts);
 	if (params->set_flags & EXT4_TUNE_FL_EDIT_FEATURES) {
 		es->s_feature_compat |=
 			cpu_to_le32(params->set_feature_compat_mask);

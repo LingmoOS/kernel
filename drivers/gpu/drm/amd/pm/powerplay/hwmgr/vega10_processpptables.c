@@ -701,20 +701,28 @@ static int get_mm_clock_voltage_table(
 		const ATOM_Vega10_MM_Dependency_Table *mm_dependency_table)
 {
 	uint32_t i;
+	uint32_t num_entries;
 	const ATOM_Vega10_MM_Dependency_Record *mm_dependency_record;
 	phm_ppt_v1_mm_clock_voltage_dependency_table *mm_table;
 
 	PP_ASSERT_WITH_CODE((mm_dependency_table->ucNumEntries != 0),
 			"Invalid PowerPlay Table!", return -1);
 
-	mm_table = kzalloc(struct_size(mm_table, entries, mm_dependency_table->ucNumEntries),
-			   GFP_KERNEL);
+	num_entries = min_t(uint32_t, mm_dependency_table->ucNumEntries,
+			    pp_entries_max(hwmgr, mm_dependency_table,
+					   sizeof(*mm_dependency_table),
+					   sizeof(ATOM_Vega10_MM_Dependency_Record)));
+	if (num_entries < mm_dependency_table->ucNumEntries)
+		pr_warn("amdgpu: Vega10 MM dependency table: clamping ucNumEntries %u -> %u\n",
+			mm_dependency_table->ucNumEntries, num_entries);
+
+	mm_table = kzalloc_flex(*mm_table, entries, num_entries);
 	if (!mm_table)
 		return -ENOMEM;
 
-	mm_table->count = mm_dependency_table->ucNumEntries;
+	mm_table->count = num_entries;
 
-	for (i = 0; i < mm_dependency_table->ucNumEntries; i++) {
+	for (i = 0; i < num_entries; i++) {
 		mm_dependency_record = &mm_dependency_table->entries[i];
 		mm_table->entries[i].vddcInd = mm_dependency_record->ucVddcInd;
 		mm_table->entries[i].samclock =
@@ -925,19 +933,27 @@ static int get_socclk_voltage_dependency_table(
 		const ATOM_Vega10_SOCCLK_Dependency_Table *clk_dep_table)
 {
 	uint32_t i;
+	uint32_t num_entries;
 	phm_ppt_v1_clock_voltage_dependency_table *clk_table;
 
 	PP_ASSERT_WITH_CODE(clk_dep_table->ucNumEntries,
 		"Invalid PowerPlay Table!", return -1);
 
-	clk_table = kzalloc(struct_size(clk_table, entries, clk_dep_table->ucNumEntries),
-			    GFP_KERNEL);
+	num_entries = min_t(uint32_t, clk_dep_table->ucNumEntries,
+			    pp_entries_max(hwmgr, clk_dep_table,
+					   sizeof(*clk_dep_table),
+					   sizeof(ATOM_Vega10_CLK_Dependency_Record)));
+	if (num_entries < clk_dep_table->ucNumEntries)
+		pr_warn("amdgpu: Vega10 SOCCLK dependency table: clamping ucNumEntries %u -> %u\n",
+			clk_dep_table->ucNumEntries, num_entries);
+
+	clk_table = kzalloc_flex(*clk_table, entries, num_entries);
 	if (!clk_table)
 		return -ENOMEM;
 
-	clk_table->count = (uint32_t)clk_dep_table->ucNumEntries;
+	clk_table->count = num_entries;
 
-	for (i = 0; i < clk_dep_table->ucNumEntries; i++) {
+	for (i = 0; i < num_entries; i++) {
 		clk_table->entries[i].vddInd =
 				clk_dep_table->entries[i].ucVddInd;
 		clk_table->entries[i].clk =
@@ -955,19 +971,27 @@ static int get_mclk_voltage_dependency_table(
 		const ATOM_Vega10_MCLK_Dependency_Table *mclk_dep_table)
 {
 	uint32_t i;
+	uint32_t num_entries;
 	phm_ppt_v1_clock_voltage_dependency_table *mclk_table;
 
 	PP_ASSERT_WITH_CODE(mclk_dep_table->ucNumEntries,
 		"Invalid PowerPlay Table!", return -1);
 
-	mclk_table = kzalloc(struct_size(mclk_table, entries, mclk_dep_table->ucNumEntries),
-			    GFP_KERNEL);
+	num_entries = min_t(uint32_t, mclk_dep_table->ucNumEntries,
+			    pp_entries_max(hwmgr, mclk_dep_table,
+					   sizeof(*mclk_dep_table),
+					   sizeof(ATOM_Vega10_MCLK_Dependency_Record)));
+	if (num_entries < mclk_dep_table->ucNumEntries)
+		pr_warn("amdgpu: Vega10 MCLK dependency table: clamping ucNumEntries %u -> %u\n",
+			mclk_dep_table->ucNumEntries, num_entries);
+
+	mclk_table = kzalloc_flex(*mclk_table, entries, num_entries);
 	if (!mclk_table)
 		return -ENOMEM;
 
-	mclk_table->count = (uint32_t)mclk_dep_table->ucNumEntries;
+	mclk_table->count = num_entries;
 
-	for (i = 0; i < mclk_dep_table->ucNumEntries; i++) {
+	for (i = 0; i < num_entries; i++) {
 		mclk_table->entries[i].vddInd =
 				mclk_dep_table->entries[i].ucVddInd;
 		mclk_table->entries[i].vddciInd =
@@ -990,6 +1014,7 @@ static int get_gfxclk_voltage_dependency_table(
 		const ATOM_Vega10_GFXCLK_Dependency_Table *clk_dep_table)
 {
 	uint32_t i;
+	uint32_t num_entries;
 	struct phm_ppt_v1_clock_voltage_dependency_table
 				*clk_table;
 	ATOM_Vega10_GFXCLK_Dependency_Record_V2 *patom_record_v2;
@@ -997,15 +1022,34 @@ static int get_gfxclk_voltage_dependency_table(
 	PP_ASSERT_WITH_CODE((clk_dep_table->ucNumEntries != 0),
 			"Invalid PowerPlay Table!", return -1);
 
-	clk_table = kzalloc(struct_size(clk_table, entries, clk_dep_table->ucNumEntries),
-			    GFP_KERNEL);
+	if (clk_dep_table->ucRevId == 0) {
+		num_entries = min_t(uint32_t, clk_dep_table->ucNumEntries,
+				    pp_entries_max(hwmgr, clk_dep_table,
+						   sizeof(*clk_dep_table),
+						   sizeof(ATOM_Vega10_GFXCLK_Dependency_Record)));
+	} else if (clk_dep_table->ucRevId == 1) {
+		num_entries = min_t(uint32_t, clk_dep_table->ucNumEntries,
+				    pp_entries_max(hwmgr, clk_dep_table,
+						   sizeof(*clk_dep_table),
+						   sizeof(ATOM_Vega10_GFXCLK_Dependency_Record_V2)));
+	} else {
+		PP_ASSERT_WITH_CODE(false,
+			"Unsupported GFXClockDependencyTable Revision!",
+			return -EINVAL);
+	}
+
+	if (num_entries < clk_dep_table->ucNumEntries)
+		pr_warn("amdgpu: Vega10 GFXCLK dependency table: clamping ucNumEntries %u -> %u\n",
+			clk_dep_table->ucNumEntries, num_entries);
+
+	clk_table = kzalloc_flex(*clk_table, entries, num_entries);
 	if (!clk_table)
 		return -ENOMEM;
 
-	clk_table->count = clk_dep_table->ucNumEntries;
+	clk_table->count = num_entries;
 
 	if (clk_dep_table->ucRevId == 0) {
-		for (i = 0; i < clk_table->count; i++) {
+		for (i = 0; i < num_entries; i++) {
 			clk_table->entries[i].vddInd =
 				clk_dep_table->entries[i].ucVddInd;
 			clk_table->entries[i].clk =
@@ -1018,9 +1062,9 @@ static int get_gfxclk_voltage_dependency_table(
 			clk_table->entries[i].sclk_offset =
 				le16_to_cpu(clk_dep_table->entries[i].usAVFSOffset);
 		}
-	} else if (clk_dep_table->ucRevId == 1) {
+	} else {
 		patom_record_v2 = (ATOM_Vega10_GFXCLK_Dependency_Record_V2 *)clk_dep_table->entries;
-		for (i = 0; i < clk_table->count; i++) {
+		for (i = 0; i < num_entries; i++) {
 			clk_table->entries[i].vddInd =
 					patom_record_v2->ucVddInd;
 			clk_table->entries[i].clk =
@@ -1034,11 +1078,6 @@ static int get_gfxclk_voltage_dependency_table(
 					le16_to_cpu(patom_record_v2->usAVFSOffset);
 			patom_record_v2++;
 		}
-	} else {
-		kfree(clk_table);
-		PP_ASSERT_WITH_CODE(false,
-			"Unsupported GFXClockDependencyTable Revision!",
-			return -EINVAL);
 	}
 
 	*pp_vega10_clk_dep_table = clk_table;
@@ -1053,20 +1092,28 @@ static int get_pix_clk_voltage_dependency_table(
 		const  ATOM_Vega10_PIXCLK_Dependency_Table *clk_dep_table)
 {
 	uint32_t i;
+	uint32_t num_entries;
 	struct phm_ppt_v1_clock_voltage_dependency_table
 				*clk_table;
 
 	PP_ASSERT_WITH_CODE((clk_dep_table->ucNumEntries != 0),
 			"Invalid PowerPlay Table!", return -1);
 
-	clk_table = kzalloc(struct_size(clk_table, entries, clk_dep_table->ucNumEntries),
-			    GFP_KERNEL);
+	num_entries = min_t(uint32_t, clk_dep_table->ucNumEntries,
+			    pp_entries_max(hwmgr, clk_dep_table,
+					   sizeof(*clk_dep_table),
+					   sizeof(ATOM_Vega10_CLK_Dependency_Record)));
+	if (num_entries < clk_dep_table->ucNumEntries)
+		pr_warn("amdgpu: Vega10 PIXCLK dependency table: clamping ucNumEntries %u -> %u\n",
+			clk_dep_table->ucNumEntries, num_entries);
+
+	clk_table = kzalloc_flex(*clk_table, entries, num_entries);
 	if (!clk_table)
 		return -ENOMEM;
 
-	clk_table->count = clk_dep_table->ucNumEntries;
+	clk_table->count = num_entries;
 
-	for (i = 0; i < clk_table->count; i++) {
+	for (i = 0; i < num_entries; i++) {
 		clk_table->entries[i].vddInd =
 				clk_dep_table->entries[i].ucVddInd;
 		clk_table->entries[i].clk =
@@ -1085,6 +1132,7 @@ static int get_dcefclk_voltage_dependency_table(
 		const ATOM_Vega10_DCEFCLK_Dependency_Table *clk_dep_table)
 {
 	uint32_t i;
+	uint32_t safe_entries;
 	uint8_t num_entries;
 	struct phm_ppt_v1_clock_voltage_dependency_table
 				*clk_table;
@@ -1095,6 +1143,14 @@ static int get_dcefclk_voltage_dependency_table(
 	PP_ASSERT_WITH_CODE((clk_dep_table->ucNumEntries != 0),
 			"Invalid PowerPlay Table!", return -1);
 
+	safe_entries = min_t(uint32_t, clk_dep_table->ucNumEntries,
+			     pp_entries_max(hwmgr, clk_dep_table,
+					    sizeof(*clk_dep_table),
+					    sizeof(ATOM_Vega10_CLK_Dependency_Record)));
+	if (safe_entries < clk_dep_table->ucNumEntries)
+		pr_warn("amdgpu: Vega10 DCEFCLK dependency table: clamping ucNumEntries %u -> %u\n",
+			clk_dep_table->ucNumEntries, safe_entries);
+
 /*
  * workaround needed to add another DPM level for pioneer cards
  * as VBIOS is locked down.
@@ -1104,22 +1160,21 @@ static int get_dcefclk_voltage_dependency_table(
 	dev_id = adev->pdev->device;
 	rev_id = adev->pdev->revision;
 
-	if (dev_id == 0x6863 && rev_id == 0 &&
-		clk_dep_table->entries[clk_dep_table->ucNumEntries - 1].ulClk < 90000)
-		num_entries = clk_dep_table->ucNumEntries + 1 > NUM_DSPCLK_LEVELS ?
-				NUM_DSPCLK_LEVELS : clk_dep_table->ucNumEntries + 1;
+	if (dev_id == 0x6863 && rev_id == 0 && safe_entries > 0 &&
+		clk_dep_table->entries[safe_entries - 1].ulClk < 90000)
+		num_entries = safe_entries + 1 > NUM_DSPCLK_LEVELS ?
+				NUM_DSPCLK_LEVELS : safe_entries + 1;
 	else
-		num_entries = clk_dep_table->ucNumEntries;
+		num_entries = safe_entries;
 
 
-	clk_table = kzalloc(struct_size(clk_table, entries, num_entries),
-			    GFP_KERNEL);
+	clk_table = kzalloc_flex(*clk_table, entries, num_entries);
 	if (!clk_table)
 		return -ENOMEM;
 
 	clk_table->count = (uint32_t)num_entries;
 
-	for (i = 0; i < clk_dep_table->ucNumEntries; i++) {
+	for (i = 0; i < safe_entries; i++) {
 		clk_table->entries[i].vddInd =
 				clk_dep_table->entries[i].ucVddInd;
 		clk_table->entries[i].clk =
@@ -1151,8 +1206,8 @@ static int get_pcie_table(struct pp_hwmgr *hwmgr,
 			"Invalid PowerPlay Table!",
 			return 0);
 
-	pcie_table = kzalloc(struct_size(pcie_table, entries, atom_pcie_table->ucNumEntries),
-			     GFP_KERNEL);
+	pcie_table = kzalloc_flex(*pcie_table, entries,
+				  atom_pcie_table->ucNumEntries);
 	if (!pcie_table)
 		return -ENOMEM;
 
@@ -1210,8 +1265,7 @@ static int get_valid_clk(
 	PP_ASSERT_WITH_CODE(clk_volt_pp_table->count,
 			"Invalid PowerPlay Table!", return -1);
 
-	table = kzalloc(struct_size(table, values, clk_volt_pp_table->count),
-			GFP_KERNEL);
+	table = kzalloc_flex(*table, values, clk_volt_pp_table->count);
 	if (!table)
 		return -ENOMEM;
 
@@ -1406,18 +1460,28 @@ static int get_vddc_lookup_table(
 		uint32_t max_levels)
 {
 	uint32_t i;
+	uint32_t num_entries;
 	phm_ppt_v1_voltage_lookup_table *table;
 
 	PP_ASSERT_WITH_CODE((vddc_lookup_pp_tables->ucNumEntries != 0),
 			"Invalid SOC_VDDD Lookup Table!", return 1);
 
-	table = kzalloc(struct_size(table, entries, max_levels), GFP_KERNEL);
+	num_entries = min_t(uint32_t, vddc_lookup_pp_tables->ucNumEntries,
+			    min_t(uint32_t, max_levels,
+				  pp_entries_max(hwmgr, vddc_lookup_pp_tables,
+						 sizeof(*vddc_lookup_pp_tables),
+						 sizeof(ATOM_Vega10_Voltage_Lookup_Record))));
+	if (num_entries < vddc_lookup_pp_tables->ucNumEntries)
+		pr_warn("amdgpu: Vega10 VddcLookup table: clamping ucNumEntries %u -> %u\n",
+			vddc_lookup_pp_tables->ucNumEntries, num_entries);
+
+	table = kzalloc_flex(*table, entries, num_entries);
 	if (!table)
 		return -ENOMEM;
 
-	table->count = vddc_lookup_pp_tables->ucNumEntries;
+	table->count = num_entries;
 
-	for (i = 0; i < vddc_lookup_pp_tables->ucNumEntries; i++)
+	for (i = 0; i < num_entries; i++)
 		table->entries[i].us_vdd =
 				le16_to_cpu(vddc_lookup_pp_tables->entries[i].usVdd);
 
@@ -1528,7 +1592,7 @@ static int vega10_pp_tables_initialize(struct pp_hwmgr *hwmgr)
 	int result = 0;
 	const ATOM_Vega10_POWERPLAYTABLE *powerplay_table;
 
-	hwmgr->pptable = kzalloc(sizeof(struct phm_ppt_v2_information), GFP_KERNEL);
+	hwmgr->pptable = kzalloc_obj(struct phm_ppt_v2_information);
 
 	PP_ASSERT_WITH_CODE((hwmgr->pptable != NULL),
 			    "Failed to allocate hwmgr->pptable!", return -ENOMEM);

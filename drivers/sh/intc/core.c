@@ -204,7 +204,7 @@ int __init register_intc_controller(struct intc_desc *desc)
 	pr_info("Registered controller '%s' with %u IRQs\n",
 		desc->name, hw->nr_vectors);
 
-	d = kzalloc(sizeof(*d), GFP_NOWAIT);
+	d = kzalloc_obj(*d, GFP_NOWAIT);
 	if (!d)
 		goto err0;
 
@@ -217,8 +217,7 @@ int __init register_intc_controller(struct intc_desc *desc)
 
 	if (desc->num_resources) {
 		d->nr_windows = desc->num_resources;
-		d->window = kcalloc(d->nr_windows, sizeof(*d->window),
-				    GFP_NOWAIT);
+		d->window = kzalloc_objs(*d->window, d->nr_windows, GFP_NOWAIT);
 		if (!d->window)
 			goto err1;
 
@@ -267,8 +266,7 @@ int __init register_intc_controller(struct intc_desc *desc)
 	}
 
 	if (hw->prio_regs) {
-		d->prio = kcalloc(hw->nr_vectors, sizeof(*d->prio),
-				  GFP_NOWAIT);
+		d->prio = kzalloc_objs(*d->prio, hw->nr_vectors, GFP_NOWAIT);
 		if (!d->prio)
 			goto err4;
 
@@ -277,22 +275,15 @@ int __init register_intc_controller(struct intc_desc *desc)
 			k += save_reg(d, k, hw->prio_regs[i].set_reg, smp);
 			k += save_reg(d, k, hw->prio_regs[i].clr_reg, smp);
 		}
-
-		sort(d->prio, hw->nr_prio_regs, sizeof(*d->prio),
-		     intc_handle_int_cmp, NULL);
 	}
 
 	if (hw->sense_regs) {
-		d->sense = kcalloc(hw->nr_vectors, sizeof(*d->sense),
-				   GFP_NOWAIT);
+		d->sense = kzalloc_objs(*d->sense, hw->nr_vectors, GFP_NOWAIT);
 		if (!d->sense)
 			goto err5;
 
 		for (i = 0; i < hw->nr_sense_regs; i++)
 			k += save_reg(d, k, hw->sense_regs[i].reg, 0);
-
-		sort(d->sense, hw->nr_sense_regs, sizeof(*d->sense),
-		     intc_handle_int_cmp, NULL);
 	}
 
 	if (hw->subgroups)
@@ -359,6 +350,11 @@ int __init register_intc_controller(struct intc_desc *desc)
 							 (void *)irq);
 		}
 	}
+
+	sort(d->prio, d->nr_prio, sizeof(*d->prio),
+	     intc_handle_int_cmp, NULL);
+	sort(d->sense, d->nr_sense, sizeof(*d->sense),
+	     intc_handle_int_cmp, NULL);
 
 	intc_subgroup_init(desc, d);
 

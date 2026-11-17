@@ -621,7 +621,7 @@ static int carminefb_probe(struct pci_dev *dev, const struct pci_device_id *ent)
 		return ret;
 
 	ret = -ENOMEM;
-	hw = kzalloc(sizeof *hw, GFP_KERNEL);
+	hw = kzalloc_obj(*hw);
 	if (!hw)
 		goto err_enable_pci;
 
@@ -754,9 +754,8 @@ static void carminefb_remove(struct pci_dev *dev)
 
 #define PCI_VENDOR_ID_FUJITU_LIMITED 0x10cf
 static struct pci_device_id carmine_devices[] = {
-{
-	PCI_DEVICE(PCI_VENDOR_ID_FUJITU_LIMITED, 0x202b)},
-	{0, 0, 0, 0, 0, 0, 0}
+	{ PCI_DEVICE(PCI_VENDOR_ID_FUJITU_LIMITED, 0x202b) },
+	{ }
 };
 
 MODULE_DEVICE_TABLE(pci, carmine_devices);

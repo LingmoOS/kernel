@@ -143,7 +143,6 @@ else
 	email="${user}@${buildhost}"
 fi
 maintainer="${name} <${email}>"
-maintainer=${KDEB_MAINTAINER:-"Lingmo OS Team <team@lingmo.org>"}
 
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -165,8 +164,7 @@ else
 	debian_revision=$("${srctree}/scripts/build-version")
 	packageversion=${upstream_version}-${debian_revision}
 fi
-packageversion=${packageversion}+lingmo5u1
-sourcename=${KDEB_SOURCENAME:-linux}
+sourcename=${KDEB_SOURCENAME:-linux-upstream}
 
 if [ "$ARCH" = "um" ] ; then
 	packagename=user-mode-linux
@@ -177,8 +175,17 @@ fi
 debarch=
 set_debarch
 
-# Distribution for the generated changelog; callers can override it.
-distribution=${KDEB_CHANGELOG_DIST:-lithium}
+# Try to determine distribution
+if [ "${KDEB_CHANGELOG_DIST:+set}" ]; then
+        distribution=$KDEB_CHANGELOG_DIST
+# In some cases lsb_release returns the codename as n/a, which breaks dpkg-parsechangelog
+elif distribution=$(lsb_release -cs 2>/dev/null) && [ -n "$distribution" ] && [ "$distribution" != "n/a" ]; then
+        : # nothing to do in this case
+else
+        distribution="unstable"
+        echo >&2 "Using default distribution of 'unstable' in the changelog"
+        echo >&2 "Install lsb-release or set \$KDEB_CHANGELOG_DIST explicitly"
+fi
 
 echo $debarch > debian/arch
 
@@ -200,7 +207,7 @@ Section: kernel
 Priority: optional
 Maintainer: $maintainer
 Rules-Requires-Root: no
-Build-Depends: debhelper-compat (= 12), openssl, zstd
+Build-Depends: debhelper-compat (= 12)
 Build-Depends-Arch: bc, bison, flex,
  gcc-${host_gnu} <!pkg.${sourcename}.nokernelheaders>,
  kmod, libdw-dev:native, libelf-dev:native,
@@ -242,7 +249,7 @@ EOF
 fi
 fi
 
-if is_enabled CONFIG_DEBUG_INFO && [ "${DEB_DEBUG_PKG:-}" ]; then
+if is_enabled CONFIG_DEBUG_INFO; then
 cat <<EOF >> debian/control
 
 Package: linux-image-${KERNELRELEASE}-dbg

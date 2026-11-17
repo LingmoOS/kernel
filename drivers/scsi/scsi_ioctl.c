@@ -9,6 +9,7 @@
 #include <linux/blkdev.h>
 #include <linux/interrupt.h>
 #include <linux/errno.h>
+#include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/sched.h>
 #include <linux/mm.h>
@@ -176,10 +177,13 @@ static int scsi_ioctl_get_pci(struct scsi_device *sdev, void __user *arg)
 
 	name = dev_name(dev);
 
-	/* compatibility with old ioctl which only returned
-	 * 20 characters */
-        return copy_to_user(arg, name, min(strlen(name), (size_t)20))
-		? -EFAULT: 0;
+	/*
+	 * Compatibility with old ioctl which only returned 20 characters.
+	 */
+	if (copy_to_user(arg, name, strnlen(name, 20)))
+		return -EFAULT;
+
+	return 0;
 }
 
 static int sg_get_version(int __user *p)
@@ -192,10 +196,14 @@ static int sg_set_timeout(struct scsi_device *sdev, int __user *p)
 {
 	int timeout, err = get_user(timeout, p);
 
-	if (!err)
-		sdev->sg_timeout = clock_t_to_jiffies(timeout);
+	if (err)
+		return err;
+	if (timeout < 0)
+		return -EIO;
 
-	return err;
+	sdev->sg_timeout = min(clock_t_to_jiffies(timeout),
+			       min(UINT_MAX, MAX_JIFFY_OFFSET));
+	return 0;
 }
 
 static int sg_get_reserved_size(struct scsi_device *sdev, int __user *p)

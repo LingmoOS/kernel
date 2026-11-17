@@ -624,7 +624,7 @@ int cx8802_register_driver(struct cx8802_driver *drv)
 			dev->core->boardnr);
 
 		/* Bring up a new struct for each driver instance */
-		driver = kzalloc(sizeof(*drv), GFP_KERNEL);
+		driver = kzalloc_obj(*drv);
 		if (!driver) {
 			err = -ENOMEM;
 			goto out;
@@ -721,7 +721,7 @@ static int cx8802_probe(struct pci_dev *pci_dev,
 		goto fail_core;
 
 	err = -ENOMEM;
-	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+	dev = kzalloc_obj(*dev);
 	if (!dev)
 		goto fail_core;
 	dev->pci = pci_dev;
@@ -793,10 +793,7 @@ static void cx8802_remove(struct pci_dev *pci_dev)
 
 static const struct pci_device_id cx8802_pci_tbl[] = {
 	{
-		.vendor       = 0x14f1,
-		.device       = 0x8802,
-		.subvendor    = PCI_ANY_ID,
-		.subdevice    = PCI_ANY_ID,
+		PCI_DEVICE(0x14f1, 0x8802),
 	}, {
 		/* --- end of list --- */
 	}

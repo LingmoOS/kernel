@@ -57,7 +57,28 @@
  */
 
 static bool use_acpi_alarm;
-module_param(use_acpi_alarm, bool, 0444);
+static bool use_acpi_alarm_explicit;
+
+static int set_use_acpi_alarm(const char *val, const struct kernel_param *kp)
+{
+	int ret;
+
+	ret = param_set_bool(val, kp);
+	if (!ret)
+		use_acpi_alarm_explicit = true;
+
+	return ret;
+}
+
+static const struct kernel_param_ops use_acpi_alarm_ops = {
+	.flags = KERNEL_PARAM_OPS_FL_NOARG,
+	.set = set_use_acpi_alarm,
+	.get = param_get_bool,
+};
+
+param_check_bool(use_acpi_alarm, &use_acpi_alarm);
+module_param_cb(use_acpi_alarm, &use_acpi_alarm_ops, &use_acpi_alarm, 0444);
+__MODULE_PARM_TYPE(use_acpi_alarm, "bool");
 
 static inline int cmos_use_acpi_alarm(void)
 {
@@ -216,6 +237,11 @@ static inline void cmos_write_bank2(unsigned char val, unsigned char addr)
 
 /*----------------------------------------------------------------*/
 
+static bool cmos_no_alarm(struct cmos_rtc *cmos)
+{
+	return !is_valid_irq(cmos->irq) && !cmos_use_acpi_alarm();
+}
+
 static int cmos_read_time(struct device *dev, struct rtc_time *t)
 {
 	int ret;
@@ -287,7 +313,7 @@ static int cmos_read_alarm(struct device *dev, struct rtc_wkalrm *t)
 	};
 
 	/* This not only a rtc_op, but also called directly */
-	if (!is_valid_irq(cmos->irq))
+	if (cmos_no_alarm(cmos))
 		return -ETIMEDOUT;
 
 	/* Basic alarms only support hour, minute, and seconds fields.
@@ -520,7 +546,7 @@ static int cmos_set_alarm(struct device *dev, struct rtc_wkalrm *t)
 	int ret;
 
 	/* This not only a rtc_op, but also called directly */
-	if (!is_valid_irq(cmos->irq))
+	if (cmos_no_alarm(cmos))
 		return -EIO;
 
 	ret = cmos_validate_alarm(dev, t);
@@ -753,7 +779,9 @@ static u32 rtc_handler(void *context)
 	unsigned char rtc_intr;
 	unsigned long flags;
 
-
+	/* Quiesce this event before rtc->irqwork can arm the next one. */
+	acpi_clear_event(ACPI_EVENT_RTC);
+	acpi_disable_event(ACPI_EVENT_RTC, 0);
 	/*
 	 * Always update rtc irq when ACPI is used as RTC Alarm.
 	 * Or else, ACPI SCI is enabled during suspend/resume only,
@@ -776,8 +804,6 @@ static u32 rtc_handler(void *context)
 	}
 
 	pm_wakeup_hard_event(dev);
-	acpi_clear_event(ACPI_EVENT_RTC);
-	acpi_disable_event(ACPI_EVENT_RTC, 0);
 	return ACPI_INTERRUPT_HANDLED;
 }
 
@@ -817,6 +843,12 @@ static void rtc_wake_off(struct device *dev)
 #ifdef CONFIG_X86
 static void use_acpi_alarm_quirks(void)
 {
+	if (use_acpi_alarm_explicit)
+		return;
+
+	if (acpi_gbl_FADT.flags & ACPI_FADT_FIXED_RTC)
+		return;
+
 	switch (boot_cpu_data.x86_vendor) {
 	case X86_VENDOR_INTEL:
 		if (dmi_get_bios_year() < 2015)
@@ -830,8 +862,6 @@ static void use_acpi_alarm_quirks(void)
 	default:
 		return;
 	}
-	if (!is_hpet_enabled())
-		return;
 
 	use_acpi_alarm = true;
 }
@@ -1097,7 +1127,7 @@ cmos_do_probe(struct device *dev, struct resource *ports, int rtc_irq)
 			dev_dbg(dev, "IRQ %d is already in use\n", rtc_irq);
 			goto cleanup1;
 		}
-	} else {
+	} else if (!cmos_use_acpi_alarm()) {
 		clear_bit(RTC_FEATURE_ALARM, cmos_rtc.rtc->features);
 	}
 
@@ -1122,7 +1152,7 @@ cmos_do_probe(struct device *dev, struct resource *ports, int rtc_irq)
 		acpi_rtc_event_setup(dev);
 
 	dev_info(dev, "%s%s, %d bytes nvram%s\n",
-		 !is_valid_irq(rtc_irq) ? "no alarms" :
+		 cmos_no_alarm(&cmos_rtc) ? "no alarms" :
 		 cmos_rtc.mon_alrm ? "alarms up to one year" :
 		 cmos_rtc.day_alrm ? "alarms up to one month" :
 		 "alarms up to one day",
@@ -1152,7 +1182,7 @@ cleanup0:
 static void cmos_do_shutdown(int rtc_irq)
 {
 	spin_lock_irq(&rtc_lock);
-	if (is_valid_irq(rtc_irq))
+	if (!cmos_no_alarm(&cmos_rtc))
 		cmos_irq_disable(&cmos_rtc, RTC_IRQMASK);
 	spin_unlock_irq(&rtc_lock);
 }
@@ -1376,85 +1406,6 @@ static int __maybe_unused cmos_resume(struct device *dev)
 
 static SIMPLE_DEV_PM_OPS(cmos_pm_ops, cmos_suspend, cmos_resume);
 
-/*----------------------------------------------------------------*/
-
-/* On non-x86 systems, a "CMOS" RTC lives most naturally on platform_bus.
- * ACPI systems always list these as PNPACPI devices, and pre-ACPI PCs
- * probably list them in similar PNPBIOS tables; so PNP is more common.
- *
- * We don't use legacy "poke at the hardware" probing.  Ancient PCs that
- * predate even PNPBIOS should set up platform_bus devices.
- */
-
-#ifdef	CONFIG_PNP
-
-#include <linux/pnp.h>
-
-static int cmos_pnp_probe(struct pnp_dev *pnp, const struct pnp_device_id *id)
-{
-	int irq;
-
-	if (pnp_port_start(pnp, 0) == 0x70 && !pnp_irq_valid(pnp, 0)) {
-		irq = 0;
-#ifdef CONFIG_X86
-		/* Some machines contain a PNP entry for the RTC, but
-		 * don't define the IRQ. It should always be safe to
-		 * hardcode it on systems with a legacy PIC.
-		 */
-		if (nr_legacy_irqs())
-			irq = RTC_IRQ;
-#endif
-	} else {
-		irq = pnp_irq(pnp, 0);
-	}
-
-	return cmos_do_probe(&pnp->dev, pnp_get_resource(pnp, IORESOURCE_IO, 0), irq);
-}
-
-static void cmos_pnp_remove(struct pnp_dev *pnp)
-{
-	cmos_do_remove(&pnp->dev);
-}
-
-static void cmos_pnp_shutdown(struct pnp_dev *pnp)
-{
-	struct device *dev = &pnp->dev;
-	struct cmos_rtc	*cmos = dev_get_drvdata(dev);
-
-	if (system_state == SYSTEM_POWER_OFF) {
-		int retval = cmos_poweroff(dev);
-
-		if (cmos_aie_poweroff(dev) < 0 && !retval)
-			return;
-	}
-
-	cmos_do_shutdown(cmos->irq);
-}
-
-static const struct pnp_device_id rtc_ids[] = {
-	{ .id = "PNP0b00", },
-	{ .id = "PNP0b01", },
-	{ .id = "PNP0b02", },
-	{ },
-};
-MODULE_DEVICE_TABLE(pnp, rtc_ids);
-
-static struct pnp_driver cmos_pnp_driver = {
-	.name		= driver_name,
-	.id_table	= rtc_ids,
-	.probe		= cmos_pnp_probe,
-	.remove		= cmos_pnp_remove,
-	.shutdown	= cmos_pnp_shutdown,
-
-	/* flag ensures resume() gets called, and stops syslog spam */
-	.flags		= PNP_DRIVER_RES_DO_NOT_CHANGE,
-	.driver		= {
-			.pm = &cmos_pm_ops,
-	},
-};
-
-#endif	/* CONFIG_PNP */
-
 #ifdef CONFIG_OF
 static const struct of_device_id of_cmos_match[] = {
 	{
@@ -1558,45 +1509,27 @@ static struct platform_driver cmos_platform_driver = {
 	}
 };
 
-#ifdef CONFIG_PNP
-static bool pnp_driver_registered;
-#endif
 static bool platform_driver_registered;
 
 static int __init cmos_init(void)
 {
-	int retval = 0;
+	int retval;
 
-#ifdef	CONFIG_PNP
-	retval = pnp_register_driver(&cmos_pnp_driver);
-	if (retval == 0)
-		pnp_driver_registered = true;
-#endif
-
-	if (!cmos_rtc.dev) {
-		retval = platform_driver_probe(&cmos_platform_driver,
-					       cmos_platform_probe);
-		if (retval == 0)
-			platform_driver_registered = true;
-	}
-
-	if (retval == 0)
+	if (cmos_rtc.dev)
 		return 0;
 
-#ifdef	CONFIG_PNP
-	if (pnp_driver_registered)
-		pnp_unregister_driver(&cmos_pnp_driver);
-#endif
-	return retval;
+	retval = platform_driver_probe(&cmos_platform_driver, cmos_platform_probe);
+	if (retval)
+		return retval;
+
+	platform_driver_registered = true;
+
+	return 0;
 }
 module_init(cmos_init);
 
 static void __exit cmos_exit(void)
 {
-#ifdef	CONFIG_PNP
-	if (pnp_driver_registered)
-		pnp_unregister_driver(&cmos_pnp_driver);
-#endif
 	if (platform_driver_registered)
 		platform_driver_unregister(&cmos_platform_driver);
 }

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 /*
- * Copyright (C) 2024-2025 Intel Corporation
+ * Copyright (C) 2024-2026 Intel Corporation
  */
 #include <linux/rtnetlink.h>
 #include <net/mac80211.h>
@@ -212,6 +212,7 @@ static const struct iwl_hcmd_names iwl_mld_reg_and_nvm_names[] = {
 	HCMD_NAME(TAS_CONFIG),
 	HCMD_NAME(SAR_OFFSET_MAPPING_TABLE_CMD),
 	HCMD_NAME(MCC_ALLOWED_AP_TYPE_CMD),
+	HCMD_NAME(PNVM_INIT_COMPLETE_NTFY),
 };
 
 /* Please keep this array *SORTED* by hex value.
@@ -234,6 +235,13 @@ static const struct iwl_hcmd_names iwl_mld_mac_conf_names[] = {
 	HCMD_NAME(AUX_STA_CMD),
 	HCMD_NAME(STA_REMOVE_CMD),
 	HCMD_NAME(ROC_CMD),
+	HCMD_NAME(NAN_CFG_CMD),
+	HCMD_NAME(NAN_SCHEDULE_CMD),
+	HCMD_NAME(NAN_PEER_CMD),
+	HCMD_NAME(NAN_ULW_ATTR_NOTIF),
+	HCMD_NAME(NAN_SCHED_UPDATE_COMPLETED_NOTIF),
+	HCMD_NAME(NAN_DW_END_NOTIF),
+	HCMD_NAME(NAN_JOINED_CLUSTER_NOTIF),
 	HCMD_NAME(MISSED_BEACONS_NOTIF),
 	HCMD_NAME(EMLSR_TRANS_FAIL_NOTIF),
 	HCMD_NAME(ROC_NOTIF),
@@ -255,10 +263,12 @@ static const struct iwl_hcmd_names iwl_mld_data_path_names[] = {
 	HCMD_NAME(RX_BAID_ALLOCATION_CONFIG_CMD),
 	HCMD_NAME(SCD_QUEUE_CONFIG_CMD),
 	HCMD_NAME(SEC_KEY_CMD),
+	HCMD_NAME(RSC_NOTIF),
 	HCMD_NAME(ESR_MODE_NOTIF),
 	HCMD_NAME(MONITOR_NOTIF),
 	HCMD_NAME(TLC_MNG_UPDATE_NOTIF),
 	HCMD_NAME(BEACON_FILTER_IN_NOTIF),
+	HCMD_NAME(PHY_AIR_SNIFFER_NOTIF),
 	HCMD_NAME(MU_GROUP_MGMT_NOTIF),
 };
 
@@ -406,14 +416,9 @@ iwl_op_mode_mld_start(struct iwl_trans *trans, const struct iwl_rf_cfg *cfg,
 
 	iwl_construct_mld(mld, trans, cfg, fw, hw, dbgfs_dir);
 
-	/* we'll verify later it matches between commands */
-	mld->fw_rates_ver_3 = iwl_fw_lookup_cmd_ver(mld->fw, TX_CMD, 0) >= 11;
-
 	iwl_mld_construct_fw_runtime(mld, trans, fw, dbgfs_dir);
 
 	iwl_mld_get_bios_tables(mld);
-	iwl_uefi_get_sgom_table(trans, &mld->fwrt);
-	mld->bios_enable_puncturing = iwl_uefi_get_puncturing(&mld->fwrt);
 
 	iwl_mld_hw_set_regulatory(mld);
 

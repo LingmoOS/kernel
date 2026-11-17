@@ -91,7 +91,7 @@ static int lan966x_fdma_rx_alloc_page_pool(struct lan966x_rx *rx)
 		pp_params.dma_dir = DMA_BIDIRECTIONAL;
 
 	rx->page_pool = page_pool_create(&pp_params);
-	if (unlikely(IS_ERR(rx->page_pool)))
+	if (IS_ERR(rx->page_pool))
 		return PTR_ERR(rx->page_pool);
 
 	for (int i = 0; i < lan966x->num_phys_ports; ++i) {
@@ -106,7 +106,7 @@ static int lan966x_fdma_rx_alloc_page_pool(struct lan966x_rx *rx)
 					   rx->page_pool);
 	}
 
-	return PTR_ERR_OR_ZERO(rx->page_pool);
+	return 0;
 }
 
 static int lan966x_fdma_rx_alloc(struct lan966x_rx *rx)
@@ -115,8 +115,9 @@ static int lan966x_fdma_rx_alloc(struct lan966x_rx *rx)
 	struct fdma *fdma = &rx->fdma;
 	int err;
 
-	if (lan966x_fdma_rx_alloc_page_pool(rx))
-		return PTR_ERR(rx->page_pool);
+	err = lan966x_fdma_rx_alloc_page_pool(rx);
+	if (err)
+		return err;
 
 	err = fdma_alloc_coherent(lan966x->dev, fdma);
 	if (err) {
@@ -204,8 +205,7 @@ static int lan966x_fdma_tx_alloc(struct lan966x_tx *tx)
 	struct fdma *fdma = &tx->fdma;
 	int err;
 
-	tx->dcbs_buf = kcalloc(fdma->n_dcbs, sizeof(struct lan966x_tx_dcb_buf),
-			       GFP_KERNEL);
+	tx->dcbs_buf = kzalloc_objs(struct lan966x_tx_dcb_buf, fdma->n_dcbs);
 	if (!tx->dcbs_buf)
 		return -ENOMEM;
 

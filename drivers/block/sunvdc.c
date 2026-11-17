@@ -1016,7 +1016,7 @@ static int vdc_port_probe(struct vio_dev *vdev, const struct vio_device_id *id)
 		goto err_out_release_mdesc;
 	}
 
-	port = kzalloc(sizeof(*port), GFP_KERNEL);
+	port = kzalloc_obj(*port);
 	if (!port) {
 		err = -ENOMEM;
 		goto err_out_release_mdesc;

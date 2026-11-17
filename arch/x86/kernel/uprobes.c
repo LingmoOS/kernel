@@ -17,6 +17,7 @@
 #include <linux/kdebug.h>
 #include <asm/processor.h>
 #include <asm/insn.h>
+#include <asm/insn-eval.h>
 #include <asm/mmu_context.h>
 #include <asm/nops.h>
 
@@ -258,9 +259,8 @@ static volatile u32 good_2byte_insns[256 / 32] = {
 static bool is_prefix_bad(struct insn *insn)
 {
 	insn_byte_t p;
-	int i;
 
-	for_each_insn_prefix(insn, i, p) {
+	for_each_insn_prefix(insn, p) {
 		insn_attr_t attr;
 
 		attr = inat_get_opcode_attribute(p);
@@ -625,11 +625,6 @@ static struct vm_special_mapping tramp_mapping = {
 	.pages  = tramp_mapping_pages,
 };
 
-struct uprobe_trampoline {
-	struct hlist_node	node;
-	unsigned long		vaddr;
-};
-
 
 #define LEA_INSN_SIZE		5
 #define OPT_INSN_SIZE		(LEA_INSN_SIZE + CALL_INSN_SIZE)
@@ -696,83 +691,32 @@ static unsigned long find_nearest_trampoline(unsigned long vaddr)
 	return high_tramp;
 }
 
-static struct uprobe_trampoline *create_uprobe_trampoline(unsigned long vaddr)
+static struct vm_area_struct *get_uprobe_trampoline(struct mm_struct *mm, unsigned long vaddr,
+						    bool *new_mapping)
 {
-	struct pt_regs *regs = task_pt_regs(current);
-	struct mm_struct *mm = current->mm;
-	struct uprobe_trampoline *tramp;
+	VMA_ITERATOR(vmi, mm, 0);
 	struct vm_area_struct *vma;
 
-	if (!user_64bit_mode(regs))
-		return NULL;
+	*new_mapping = false;
+
+	if (vaddr > TASK_SIZE || vaddr < PAGE_SIZE)
+		return ERR_PTR(-EINVAL);
+
+	for_each_vma(vmi, vma) {
+		if (!vma_is_special_mapping(vma, &tramp_mapping))
+			continue;
+		if (is_reachable_by_call(vma->vm_start, vaddr))
+			return vma;
+	}
 
 	vaddr = find_nearest_trampoline(vaddr);
 	if (IS_ERR_VALUE(vaddr))
-		return NULL;
+		return ERR_PTR(vaddr);
 
-	tramp = kzalloc(sizeof(*tramp), GFP_KERNEL);
-	if (unlikely(!tramp))
-		return NULL;
-
-	tramp->vaddr = vaddr;
-	vma = _install_special_mapping(mm, tramp->vaddr, PAGE_SIZE,
-				VM_READ|VM_EXEC|VM_MAYEXEC|VM_MAYREAD|VM_DONTCOPY|VM_IO,
+	*new_mapping = true;
+	return _install_special_mapping(mm, vaddr, PAGE_SIZE,
+				VM_READ|VM_EXEC|VM_MAYEXEC|VM_MAYREAD|VM_IO,
 				&tramp_mapping);
-	if (IS_ERR(vma)) {
-		kfree(tramp);
-		return NULL;
-	}
-	return tramp;
-}
-
-static struct uprobe_trampoline *get_uprobe_trampoline(unsigned long vaddr, bool *new)
-{
-	struct uprobes_state *state = &current->mm->uprobes_state;
-	struct uprobe_trampoline *tramp = NULL;
-
-	if (vaddr > TASK_SIZE || vaddr < PAGE_SIZE)
-		return NULL;
-
-	hlist_for_each_entry(tramp, &state->head_tramps, node) {
-		if (is_reachable_by_call(tramp->vaddr, vaddr)) {
-			*new = false;
-			return tramp;
-		}
-	}
-
-	tramp = create_uprobe_trampoline(vaddr);
-	if (!tramp)
-		return NULL;
-
-	*new = true;
-	hlist_add_head(&tramp->node, &state->head_tramps);
-	return tramp;
-}
-
-static void destroy_uprobe_trampoline(struct uprobe_trampoline *tramp)
-{
-	/*
-	 * We do not unmap and release uprobe trampoline page itself,
-	 * because there's no easy way to make sure none of the threads
-	 * is still inside the trampoline.
-	 */
-	hlist_del(&tramp->node);
-	kfree(tramp);
-}
-
-void arch_uprobe_init_state(struct mm_struct *mm)
-{
-	INIT_HLIST_HEAD(&mm->uprobes_state.head_tramps);
-}
-
-void arch_uprobe_clear_state(struct mm_struct *mm)
-{
-	struct uprobes_state *state = &mm->uprobes_state;
-	struct uprobe_trampoline *tramp;
-	struct hlist_node *n;
-
-	hlist_for_each_entry_safe(tramp, n, &state->head_tramps, node)
-		destroy_uprobe_trampoline(tramp);
 }
 
 static bool __in_uprobe_trampoline(struct mm_struct *mm, unsigned long ip)
@@ -1225,21 +1169,23 @@ int set_orig_insn(struct arch_uprobe *auprobe, struct vm_area_struct *vma,
 static int __arch_uprobe_optimize(struct arch_uprobe *auprobe, struct mm_struct *mm,
 				  unsigned long vaddr)
 {
-	struct uprobe_trampoline *tramp;
-	struct vm_area_struct *vma;
-	bool new = false;
-	int err = 0;
+	struct pt_regs *regs = task_pt_regs(current);
+	struct vm_area_struct *vma, *tramp;
+	bool new_mapping;
+	int ret;
 
+	if (!user_64bit_mode(regs))
+		return -EINVAL;
 	vma = find_vma(mm, vaddr);
 	if (!vma)
 		return -EINVAL;
-	tramp = get_uprobe_trampoline(vaddr, &new);
-	if (!tramp)
-		return -EINVAL;
-	err = swbp_optimize(auprobe, vma, vaddr, tramp->vaddr);
-	if (WARN_ON_ONCE(err) && new)
-		destroy_uprobe_trampoline(tramp);
-	return err;
+	tramp = get_uprobe_trampoline(mm, vaddr, &new_mapping);
+	if (IS_ERR(tramp))
+		return PTR_ERR(tramp);
+	ret = swbp_optimize(auprobe, vma, vaddr, tramp->vm_start);
+	if (WARN_ON_ONCE(ret) && new_mapping)
+		WARN_ON_ONCE(do_munmap(mm, tramp->vm_start, PAGE_SIZE, NULL));
+	return ret;
 }
 
 void arch_uprobe_optimize(struct arch_uprobe *auprobe, unsigned long vaddr)
@@ -1272,29 +1218,6 @@ unlock:
 	mmap_write_unlock(mm);
 }
 
-static bool insn_is_nop(struct insn *insn)
-{
-	return insn->opcode.nbytes == 1 && insn->opcode.bytes[0] == 0x90;
-}
-
-static bool insn_is_nopl(struct insn *insn)
-{
-	if (insn->opcode.nbytes != 2)
-		return false;
-
-	if (insn->opcode.bytes[0] != 0x0f || insn->opcode.bytes[1] != 0x1f)
-		return false;
-
-	if (!insn->modrm.nbytes)
-		return false;
-
-	if (X86_MODRM_REG(insn->modrm.bytes[0]) != 0)
-		return false;
-
-	/* 0f 1f /0 - NOPL */
-	return true;
-}
-
 static bool is_optimizable_nop10(struct insn *insn)
 {
 	static const u8 nop10_prefix[] = {
@@ -1307,7 +1230,7 @@ static bool is_optimizable_nop10(struct insn *insn)
 	 * displacement in those bytes, so other NOP encodings are not safe.
 	 */
 	return insn->length == OPT_INSN_SIZE &&
-	       (insn_is_nop(insn) || insn_is_nopl(insn)) &&
+	       insn_is_nop(insn) &&
 	       !memcmp(insn->kaddr, nop10_prefix, ARRAY_SIZE(nop10_prefix));
 }
 
@@ -1566,19 +1489,14 @@ static int branch_setup_xol_ops(struct arch_uprobe *auprobe, struct insn *insn)
 {
 	u8 opc1 = OPCODE1(insn);
 	insn_byte_t p;
-	int i;
 
-	/* x86_nops[insn->length]; same as jmp with .offs = 0 */
-	if (insn->length <= ASM_NOP_MAX &&
-	    !memcmp(insn->kaddr, x86_nops[insn->length], insn->length))
+	if (insn_is_nop(insn))
 		goto setup;
 
 	switch (opc1) {
 	case 0xeb:	/* jmp 8 */
 	case 0xe9:	/* jmp 32 */
 		break;
-	case 0x90:	/* prefix* + nop; same as jmp with .offs = 0 */
-		goto setup;
 
 	case 0xe8:	/* call relative */
 		branch_clear_offset(auprobe, insn);
@@ -1603,7 +1521,7 @@ static int branch_setup_xol_ops(struct arch_uprobe *auprobe, struct insn *insn)
 	 * Intel and AMD behavior differ in 64-bit mode: Intel ignores 66 prefix.
 	 * No one uses these insns, reject any branch insns with such prefix.
 	 */
-	for_each_insn_prefix(insn, i, p) {
+	for_each_insn_prefix(insn, p) {
 		if (p == 0x66)
 			return -ENOTSUPP;
 	}

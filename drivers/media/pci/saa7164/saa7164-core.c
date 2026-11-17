@@ -1263,7 +1263,7 @@ static int saa7164_initdev(struct pci_dev *pci_dev,
 	int err, i;
 	u32 version;
 
-	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+	dev = kzalloc_obj(*dev);
 	if (NULL == dev)
 		return -ENOMEM;
 
@@ -1537,10 +1537,7 @@ static void saa7164_finidev(struct pci_dev *pci_dev)
 static const struct pci_device_id saa7164_pci_tbl[] = {
 	{
 		/* SAA7164 */
-		.vendor       = 0x1131,
-		.device       = 0x7164,
-		.subvendor    = PCI_ANY_ID,
-		.subdevice    = PCI_ANY_ID,
+		PCI_DEVICE(0x1131, 0x7164),
 	}, {
 		/* --- end of list --- */
 	}

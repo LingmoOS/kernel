@@ -37,7 +37,7 @@ static int jumbo_frm(struct stmmac_tx_queue *tx_q, struct sk_buff *skb,
 
 	des2 = dma_map_single(priv->device, skb->data,
 			      buf_len, DMA_TO_DEVICE);
-	desc->des2 = cpu_to_le32(des2);
+	desc->des2 = cpu_to_le32(lower_32_bits(des2));
 	if (dma_mapping_error(priv->device, des2))
 		return -1;
 	tx_q->tx_skbuff_dma[entry].buf = des2;
@@ -55,7 +55,7 @@ static int jumbo_frm(struct stmmac_tx_queue *tx_q, struct sk_buff *skb,
 			des2 = dma_map_single(priv->device,
 					      (skb->data + bmax * i),
 					      bmax, DMA_TO_DEVICE);
-			desc->des2 = cpu_to_le32(des2);
+			desc->des2 = cpu_to_le32(lower_32_bits(des2));
 			if (dma_mapping_error(priv->device, des2))
 				return -1;
 			tx_q->tx_skbuff_dma[entry].buf = des2;
@@ -68,7 +68,7 @@ static int jumbo_frm(struct stmmac_tx_queue *tx_q, struct sk_buff *skb,
 			des2 = dma_map_single(priv->device,
 					      (skb->data + bmax * i), len,
 					      DMA_TO_DEVICE);
-			desc->des2 = cpu_to_le32(des2);
+			desc->des2 = cpu_to_le32(lower_32_bits(des2));
 			if (dma_mapping_error(priv->device, des2))
 				return -1;
 			tx_q->tx_skbuff_dma[entry].buf = des2;
@@ -85,14 +85,13 @@ static int jumbo_frm(struct stmmac_tx_queue *tx_q, struct sk_buff *skb,
 	return entry;
 }
 
-static unsigned int is_jumbo_frm(int len, int enh_desc)
+static bool is_jumbo_frm(unsigned int len, bool enh_desc)
 {
-	unsigned int ret = 0;
+	bool ret = false;
 
 	if ((enh_desc && (len > BUF_SIZE_8KiB)) ||
-	    (!enh_desc && (len > BUF_SIZE_2KiB))) {
-		ret = 1;
-	}
+	    (!enh_desc && (len > BUF_SIZE_2KiB)))
+		ret = true;
 
 	return ret;
 }

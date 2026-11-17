@@ -417,7 +417,7 @@ __smb2_find_mid(struct TCP_Server_Info *server, char *buf, bool dequeue)
 		if ((mid->mid == wire_mid) &&
 		    (mid->mid_state == MID_REQUEST_SUBMITTED) &&
 		    (mid->command == shdr->Command)) {
-			kref_get(&mid->refcount);
+			smb_get_mid(mid);
 			if (dequeue) {
 				list_del_init(&mid->qhead);
 				mid->deleted_from_q = true;
@@ -443,7 +443,7 @@ smb2_find_dequeue_mid(struct TCP_Server_Info *server, char *buf)
 }
 
 static void
-smb2_dump_detail(void *buf, struct TCP_Server_Info *server)
+smb2_dump_detail(void *buf, size_t buf_len, struct TCP_Server_Info *server)
 {
 #ifdef CONFIG_CIFS_DEBUG2
 	struct smb2_hdr *shdr = (struct smb2_hdr *)buf;
@@ -451,7 +451,7 @@ smb2_dump_detail(void *buf, struct TCP_Server_Info *server)
 	cifs_server_dbg(VFS, "Cmd: %d Err: 0x%x Flags: 0x%x Mid: %llu Pid: %d\n",
 		 shdr->Command, shdr->Status, shdr->Flags, shdr->MessageId,
 		 shdr->Id.SyncId.ProcessId);
-	if (!server->ops->check_message(buf, server->total_read, server)) {
+	if (!server->ops->check_message(buf, buf_len, server->total_read, server)) {
 		cifs_server_dbg(VFS, "smb buf %p len %u\n", buf,
 				server->ops->calc_smb_size(buf));
 	}
@@ -635,8 +635,8 @@ parse_server_interfaces(struct network_interface_info_ioctl_rsp *buf,
 	struct network_interface_info_ioctl_rsp *p;
 	struct sockaddr_in *addr4;
 	struct sockaddr_in6 *addr6;
-	struct iface_info_ipv4 *p4;
-	struct iface_info_ipv6 *p6;
+	struct smb_sockaddr_in *p4;
+	struct smb_sockaddr_in6 *p6;
 	struct cifs_server_iface *info = NULL, *iface = NULL, *niface = NULL;
 	struct cifs_server_iface tmp_iface;
 	__be16 port;
@@ -698,7 +698,7 @@ parse_server_interfaces(struct network_interface_info_ioctl_rsp *buf,
 		 */
 		case INTERNETWORK:
 			addr4 = (struct sockaddr_in *)&tmp_iface.sockaddr;
-			p4 = (struct iface_info_ipv4 *)p->Buffer;
+			p4 = (struct smb_sockaddr_in *)p->Buffer;
 			addr4->sin_family = AF_INET;
 			memcpy(&addr4->sin_addr, &p4->IPv4Address, 4);
 
@@ -710,7 +710,7 @@ parse_server_interfaces(struct network_interface_info_ioctl_rsp *buf,
 			break;
 		case INTERNETWORKV6:
 			addr6 =	(struct sockaddr_in6 *)&tmp_iface.sockaddr;
-			p6 = (struct iface_info_ipv6 *)p->Buffer;
+			p6 = (struct smb_sockaddr_in6 *)p->Buffer;
 			addr6->sin6_family = AF_INET6;
 			memcpy(&addr6->sin6_addr, &p6->IPv6Address, 16);
 
@@ -752,8 +752,7 @@ parse_server_interfaces(struct network_interface_info_ioctl_rsp *buf,
 		spin_unlock(&ses->iface_lock);
 
 		/* no match. insert the entry in the list */
-		info = kmalloc(sizeof(struct cifs_server_iface),
-			       GFP_KERNEL);
+		info = kmalloc_obj(struct cifs_server_iface);
 		if (!info) {
 			rc = -ENOMEM;
 			goto out;
@@ -1065,7 +1064,8 @@ move_smb2_ea_to_cifs(char *dst, size_t dst_size,
 
 		if (src_size < 8 + name_len + 1 + value_len) {
 			cifs_dbg(FYI, "EA entry goes beyond length of list\n");
-			rc = -EIO;
+			rc = smb_EIO2(smb_eio_trace_ea_overrun,
+				      src_size, 8 + name_len + 1 + value_len);
 			goto out;
 		}
 
@@ -1231,7 +1231,7 @@ replay_again:
 
 	ea = NULL;
 	resp_buftype[0] = resp_buftype[1] = resp_buftype[2] = CIFS_NO_BUFFER;
-	vars = kzalloc(sizeof(*vars), GFP_KERNEL);
+	vars = kzalloc_obj(*vars);
 	if (!vars) {
 		rc = -ENOMEM;
 		goto out_free_path;
@@ -1490,6 +1490,8 @@ smb2_set_fid(struct cifsFileInfo *cfile, struct cifs_fid *fid, __u32 oplock)
 	struct cifsInodeInfo *cinode = CIFS_I(d_inode(cfile->dentry));
 	struct TCP_Server_Info *server = tlink_tcon(cfile->tlink)->ses->server;
 
+	lockdep_assert_held(&cinode->open_file_lock);
+
 	cfile->fid.persistent_fid = fid->persistent_fid;
 	cfile->fid.volatile_fid = fid->volatile_fid;
 	cfile->fid.access = fid->access;
@@ -1555,7 +1557,7 @@ SMB2_request_res_key(const unsigned int xid, struct cifs_tcon *tcon,
 {
 	int rc;
 	unsigned int ret_data_len;
-	struct resume_key_req *res_key;
+	struct resume_key_ioctl_rsp *res_key;
 
 	rc = SMB2_ioctl(xid, tcon, persistent_fid, volatile_fid,
 			FSCTL_SRV_REQUEST_RESUME_KEY, NULL, 0 /* no input */,
@@ -1568,7 +1570,7 @@ SMB2_request_res_key(const unsigned int xid, struct cifs_tcon *tcon,
 		cifs_tcon_dbg(VFS, "refcpy ioctl error %d getting resume key\n", rc);
 		goto req_res_key_exit;
 	}
-	if (ret_data_len < sizeof(struct resume_key_req)) {
+	if (ret_data_len < sizeof(struct resume_key_ioctl_rsp)) {
 		cifs_tcon_dbg(VFS, "Invalid refcopy resume key length\n");
 		rc = -EINVAL;
 		goto req_res_key_exit;
@@ -1576,7 +1578,7 @@ SMB2_request_res_key(const unsigned int xid, struct cifs_tcon *tcon,
 	memcpy(pcchunk->SourceKey, res_key->ResumeKey, COPY_CHUNK_RES_KEY_SIZE);
 
 req_res_key_exit:
-	kfree(res_key);
+	kfree_sensitive(res_key);
 	return rc;
 }
 
@@ -1617,7 +1619,7 @@ replay_again:
 	oplock = SMB2_OPLOCK_LEVEL_NONE;
 	server = cifs_pick_channel(ses);
 
-	vars = kzalloc(sizeof(*vars), GFP_ATOMIC);
+	vars = kzalloc_obj(*vars, GFP_ATOMIC);
 	if (vars == NULL)
 		return -ENOMEM;
 	rqst = &vars->rqst[0];
@@ -1635,7 +1637,7 @@ replay_again:
 	}
 
 	if (!ses || !server) {
-		rc = -EIO;
+		rc = smb_EIO(smb_eio_trace_null_pointers);
 		goto free_vars;
 	}
 
@@ -1962,7 +1964,7 @@ retry:
 		goto out;
 	}
 
-	cc_req = kzalloc(struct_size(cc_req, Chunks, chunk_count), GFP_KERNEL);
+	cc_req = kzalloc_flex(*cc_req, Chunks, chunk_count);
 	if (!cc_req) {
 		rc = -ENOMEM;
 		goto out;
@@ -2034,7 +2036,7 @@ retry:
 		if (unlikely(ret_data_len != sizeof(*cc_rsp))) {
 			cifs_tcon_dbg(VFS, "Copychunk invalid response: size %u/%zu\n",
 				      ret_data_len, sizeof(*cc_rsp));
-			rc = -EIO;
+			rc = smb_EIO1(smb_eio_trace_copychunk_inv_rsp, ret_data_len);
 			goto out;
 		}
 
@@ -2044,11 +2046,18 @@ retry:
 
 		if (rc == 0) {
 			/* Check if server claimed to write more than we asked */
-			if (unlikely(!bytes_written || bytes_written > copy_bytes ||
-				     !chunks_written || chunks_written > chunks)) {
-				cifs_tcon_dbg(VFS, "Copychunk invalid response: bytes written %u/%u, chunks written %u/%u\n",
-					      bytes_written, copy_bytes, chunks_written, chunks);
-				rc = -EIO;
+			if (unlikely(!bytes_written || bytes_written > copy_bytes)) {
+				cifs_tcon_dbg(VFS, "Copychunk invalid response: bytes written %u/%u\n",
+					      bytes_written, copy_bytes);
+				rc = smb_EIO2(smb_eio_trace_copychunk_overcopy_b,
+					      bytes_written, copy_bytes);
+				goto out;
+			}
+			if (unlikely(!chunks_written || chunks_written > chunks)) {
+				cifs_tcon_dbg(VFS, "Copychunk invalid response: chunks written %u/%u\n",
+					      chunks_written, chunks);
+				rc = smb_EIO2(smb_eio_trace_copychunk_overcopy_c,
+					      chunks_written, chunks);
 				goto out;
 			}
 
@@ -2359,10 +2368,10 @@ duplicate_extents_out:
 
 static int
 smb2_set_compression(const unsigned int xid, struct cifs_tcon *tcon,
-		   struct cifsFileInfo *cfile)
+		   struct cifsFileInfo *cfile, __u16 compression_state)
 {
 	return SMB2_set_compression(xid, tcon, cfile->fid.persistent_fid,
-			    cfile->fid.volatile_fid);
+			    cfile->fid.volatile_fid, compression_state);
 }
 
 static int
@@ -2821,16 +2830,19 @@ smb2_is_network_name_deleted(char *buf, struct TCP_Server_Info *server)
 	return false;
 }
 
-static int
-smb2_oplock_response(struct cifs_tcon *tcon, __u64 persistent_fid,
-		__u64 volatile_fid, __u16 net_fid, struct cifsInodeInfo *cinode)
+static int smb2_oplock_response(struct cifs_tcon *tcon, __u64 persistent_fid,
+				__u64 volatile_fid, __u16 net_fid,
+				struct cifsInodeInfo *cinode, unsigned int oplock)
 {
+	unsigned int sbflags = cifs_sb_flags(CIFS_SB(cinode));
+	__u8 op;
+
 	if (tcon->ses->server->capabilities & SMB2_GLOBAL_CAP_LEASING)
 		return SMB2_lease_break(0, tcon, cinode->lease_key,
-					smb2_get_lease_state(cinode));
+					smb2_get_lease_state(cinode, oplock));
 
-	return SMB2_oplock_break(0, tcon, persistent_fid, volatile_fid,
-				 CIFS_CACHE_READ(cinode) ? 1 : 0);
+	op = !!((oplock & CIFS_CACHE_READ_FLG) || (sbflags & CIFS_MOUNT_RO_CACHE));
+	return SMB2_oplock_break(0, tcon, persistent_fid, volatile_fid, op);
 }
 
 void
@@ -2980,7 +2992,7 @@ replay_again:
 		flags |= CIFS_TRANSFORM_REQ;
 
 	resp_buftype[0] = resp_buftype[1] = resp_buftype[2] = CIFS_NO_BUFFER;
-	vars = kzalloc(sizeof(*vars), GFP_KERNEL);
+	vars = kzalloc_obj(*vars);
 	if (!vars) {
 		rc = -ENOMEM;
 		goto out_free_path;
@@ -3293,7 +3305,7 @@ smb2_get_dfs_refer(const unsigned int xid, struct cifs_ses *ses,
 	}
 
 	if (!rc && !dfs_rsp)
-		rc = -EIO;
+		rc = smb_EIO(smb_eio_trace_dfsref_no_rsp);
 	if (rc) {
 		if (!is_retryable_error(rc) && rc != -ENOENT && rc != -EOPNOTSUPP)
 			cifs_tcon_dbg(FYI, "%s: ioctl error: rc=%d\n", __func__, rc);
@@ -3313,8 +3325,6 @@ smb2_get_dfs_refer(const unsigned int xid, struct cifs_ses *ses,
 	if (tcon && !tcon->ipc) {
 		/* ipc tcons are not refcounted */
 		cifs_put_tcon(tcon, netfs_trace_tcon_ref_put_dfs_refer);
-		trace_smb3_tcon_ref(tcon->debug_id, tcon->tc_count,
-				    netfs_trace_tcon_ref_dec_dfs_refer);
 	}
 	kfree(utf16_path);
 	kfree(dfs_req);
@@ -3485,7 +3495,7 @@ get_smb2_acl(struct cifs_sb_info *cifs_sb,
 	struct cifsFileInfo *open_file = NULL;
 
 	if (inode && !(info & SACL_SECINFO))
-		open_file = find_readable_file(CIFS_I(inode), true);
+		open_file = find_readable_file(CIFS_I(inode), FIND_FSUID_ONLY);
 	if (!open_file || (info & SACL_SECINFO))
 		return get_smb2_acl_by_path(cifs_sb, path, pacllen, info);
 
@@ -3535,7 +3545,7 @@ static long smb3_zero_range(struct file *file, struct cifs_tcon *tcon,
 	struct inode *inode = file_inode(file);
 	struct cifsInodeInfo *cifsi = CIFS_I(inode);
 	struct cifsFileInfo *cfile = file->private_data;
-	unsigned long long i_size, new_size, remote_i_size;
+	unsigned long long i_size, new_size, remote_i_size, zero_point;
 	long rc;
 	unsigned int xid;
 
@@ -3553,7 +3563,7 @@ static long smb3_zero_range(struct file *file, struct cifs_tcon *tcon,
 
 	filemap_invalidate_lock(inode->i_mapping);
 
-	i_size = i_size_read(inode);
+	netfs_read_sizes(inode, &i_size, &remote_i_size, &zero_point);
 
 	rc = filemap_write_and_wait_range(inode->i_mapping, offset,
 					  offset + len - 1);
@@ -3581,6 +3591,9 @@ static long smb3_zero_range(struct file *file, struct cifs_tcon *tcon,
 		}
 	}
 
+	fscache_invalidate(cifs_inode_cookie(inode), NULL,
+			   i_size_read(inode), 0);
+
 	rc = smb3_zero_data(file, tcon, offset, len, xid);
 	if (rc < 0)
 		goto zero_range_exit;
@@ -3593,9 +3606,11 @@ static long smb3_zero_range(struct file *file, struct cifs_tcon *tcon,
 				  cfile->fid.volatile_fid, cfile->pid, new_size);
 		if (rc >= 0) {
 			truncate_setsize(inode, new_size);
+			spin_lock(&inode->i_lock);
 			netfs_resize_file(&cifsi->netfs, new_size, true);
-			if (offset < cifsi->netfs.zero_point)
-				cifsi->netfs.zero_point = offset;
+			if (offset < cifsi->netfs._zero_point)
+				netfs_write_zero_point(inode, offset);
+			spin_unlock(&inode->i_lock);
 			fscache_resize_cookie(cifs_inode_cookie(inode), new_size);
 		}
 	}
@@ -3619,7 +3634,7 @@ static long smb3_punch_hole(struct file *file, struct cifs_tcon *tcon,
 	struct inode *inode = file_inode(file);
 	struct cifsFileInfo *cfile = file->private_data;
 	struct file_zero_data_information fsctl_buf;
-	unsigned long long end = offset + len, i_size, remote_i_size;
+	unsigned long long end = offset + len, i_size, remote_i_size, zero_point;
 	long rc;
 	unsigned int xid;
 	__u8 set_sparse = 1;
@@ -3648,6 +3663,8 @@ static long smb3_punch_hole(struct file *file, struct cifs_tcon *tcon,
 	 */
 	truncate_pagecache_range(inode, offset, offset + len - 1);
 	netfs_wait_for_outstanding_io(inode);
+	fscache_invalidate(cifs_inode_cookie(inode), NULL,
+			   i_size_read(inode), 0);
 
 	cifs_dbg(FYI, "Offset %lld len %lld\n", offset, len);
 
@@ -3669,14 +3686,17 @@ static long smb3_punch_hole(struct file *file, struct cifs_tcon *tcon,
 	 * that we locally hole-punch the tail of the dirty data, the proposed
 	 * EOF update will end up in the wrong place.
 	 */
-	i_size = i_size_read(inode);
-	remote_i_size = netfs_inode(inode)->remote_i_size;
+	netfs_read_sizes(inode, &i_size, &remote_i_size, &zero_point);
+
 	if (end > remote_i_size && i_size > remote_i_size) {
 		unsigned long long extend_to = umin(end, i_size);
 		rc = SMB2_set_eof(xid, tcon, cfile->fid.persistent_fid,
 				  cfile->fid.volatile_fid, cfile->pid, extend_to);
-		if (rc >= 0)
-			netfs_inode(inode)->remote_i_size = extend_to;
+		if (rc >= 0) {
+			spin_lock(&inode->i_lock);
+			netfs_write_remote_i_size(inode, extend_to);
+			spin_unlock(&inode->i_lock);
+		}
 	}
 
 unlock:
@@ -3855,7 +3875,7 @@ static long smb3_simple_falloc(struct file *file, struct cifs_tcon *tcon,
 	struct cifsFileInfo *cfile = file->private_data;
 	long rc = -EOPNOTSUPP;
 	unsigned int xid;
-	loff_t old_eof, new_eof;
+	loff_t old_eof, new_eof, local_eof;
 	struct smb2_file_all_info file_inf;
 	u64 asize;
 	int qrc;
@@ -3864,7 +3884,7 @@ static long smb3_simple_falloc(struct file *file, struct cifs_tcon *tcon,
 
 	inode = d_inode(cfile->dentry);
 	cifsi = CIFS_I(inode);
-	old_eof = i_size_read(inode);
+	old_eof = local_eof = i_size_read(inode);
 
 	trace_smb3_falloc_enter(xid, cfile->fid.persistent_fid, tcon->tid,
 				tcon->ses->Suid, off, len);
@@ -3881,16 +3901,18 @@ static long smb3_simple_falloc(struct file *file, struct cifs_tcon *tcon,
 		}
 		netfs_wait_for_outstanding_io(inode);
 
-		rc = SMB2_query_info(xid, tcon, cfile->fid.persistent_fid,
-				     cfile->fid.volatile_fid, &file_inf);
+		rc = query_server_eof(xid, tcon, cfile, &server_eof);
 		if (rc) {
 			trace_smb3_falloc_err(xid, cfile->fid.persistent_fid,
 				tcon->tid, tcon->ses->Suid, off, len, rc);
 			free_xid(xid);
 			return rc;
 		}
-		server_eof = le64_to_cpu(file_inf.EndOfFile);
-		/* Only use the larger EOF to decide whether we're extending. */
+		/*
+		 * Only use the larger EOF to decide whether we're extending.
+		 * The pagecache zeroing below must still key off the local
+		 * i_size, so keep local_eof for that.
+		 */
 		old_eof = max_t(loff_t, old_eof, server_eof);
 	}
 
@@ -3925,7 +3947,7 @@ static long smb3_simple_falloc(struct file *file, struct cifs_tcon *tcon,
 			}
 
 			new_eof = off + len;
-			cifs_resize_file_locked(inode, old_eof, new_eof);
+			cifs_resize_file_locked(inode, local_eof, new_eof);
 
 			qrc = SMB2_query_info(xid, tcon,
 					      cfile->fid.persistent_fid,
@@ -3945,12 +3967,35 @@ static long smb3_simple_falloc(struct file *file, struct cifs_tcon *tcon,
 			smb2_set_sparse(xid, tcon, cfile, inode, false);
 
 		new_eof = off + len;
+
+		qrc = SMB2_query_info(xid, tcon,
+				      cfile->fid.persistent_fid,
+				      cfile->fid.volatile_fid, &file_inf);
+		if (qrc == 0)
+			asize = le64_to_cpu(file_inf.AllocationSize);
+
+		/*
+		 * FILE_ALLOCATION_INFORMATION can only describe allocation up to
+		 * new_eof. Some servers may accept it without allocating blocks,
+		 * so refresh AllocationSize before updating i_blocks.
+		 */
+		if (off == 0 || off == old_eof) {
+			if (qrc || asize < new_eof) {
+				rc = SMB2_set_allocation(xid, tcon,
+							 cfile->fid.persistent_fid,
+							 cfile->fid.volatile_fid,
+							 cfile->pid, new_eof);
+				if (rc)
+					goto out;
+			}
+		}
+
 		rc = SMB2_set_eof(xid, tcon, cfile->fid.persistent_fid,
 				  cfile->fid.volatile_fid, cfile->pid, new_eof);
 		if (rc)
 			goto out;
 
-		cifs_resize_file_locked(inode, old_eof, new_eof);
+		cifs_resize_file_locked(inode, local_eof, new_eof);
 
 		qrc = SMB2_query_info(xid, tcon,
 				      cfile->fid.persistent_fid,
@@ -4053,7 +4098,6 @@ static long smb3_collapse_range(struct file *file, struct cifs_tcon *tcon,
 	struct inode *inode = file_inode(file);
 	struct cifsInodeInfo *cifsi = CIFS_I(inode);
 	struct cifsFileInfo *cfile = file->private_data;
-	struct netfs_inode *ictx = &cifsi->netfs;
 	loff_t old_eof, new_eof;
 
 	xid = get_xid();
@@ -4066,13 +4110,23 @@ static long smb3_collapse_range(struct file *file, struct cifs_tcon *tcon,
 	}
 
 	filemap_invalidate_lock(inode->i_mapping);
-	rc = filemap_write_and_wait_range(inode->i_mapping, off, old_eof - 1);
+	rc = filemap_write_and_wait_range(inode->i_mapping,
+					  round_down(off, PAGE_SIZE),
+					  old_eof - 1);
 	if (rc < 0)
 		goto out_2;
 
-	truncate_pagecache_range(inode, off, old_eof);
-	ictx->zero_point = old_eof;
 	netfs_wait_for_outstanding_io(inode);
+	/*
+	 * Invalidate cached folios from the page containing off to EOF before
+	 * moving data on the server, so subsequent reads do not see stale data.
+	 */
+	truncate_pagecache_range(inode, round_down(off, PAGE_SIZE), -1);
+	fscache_invalidate(cifs_inode_cookie(inode), NULL, old_eof, 0);
+
+	spin_lock(&inode->i_lock);
+	netfs_write_zero_point(inode, old_eof);
+	spin_unlock(&inode->i_lock);
 
 	rc = __smb2_copychunk_range(xid, cfile, cfile, off + len,
 				    old_eof - off - len, off);
@@ -4088,8 +4142,10 @@ static long smb3_collapse_range(struct file *file, struct cifs_tcon *tcon,
 	rc = 0;
 
 	truncate_setsize(inode, new_eof);
+	spin_lock(&inode->i_lock);
 	netfs_resize_file(&cifsi->netfs, new_eof, true);
-	ictx->zero_point = new_eof;
+	netfs_write_zero_point(inode, new_eof);
+	spin_unlock(&inode->i_lock);
 	fscache_resize_cookie(cifs_inode_cookie(inode), new_eof);
 out_2:
 	filemap_invalidate_unlock(inode->i_mapping);
@@ -4130,11 +4186,18 @@ static long smb3_insert_range(struct file *file, struct cifs_tcon *tcon,
 		goto out;
 
 	filemap_invalidate_lock(inode->i_mapping);
-	rc = filemap_write_and_wait_range(inode->i_mapping, off, new_eof - 1);
+	rc = filemap_write_and_wait_range(inode->i_mapping,
+					  round_down(off, PAGE_SIZE),
+					  old_eof - 1);
 	if (rc < 0)
 		goto out_2;
-	truncate_pagecache_range(inode, off, old_eof);
 	netfs_wait_for_outstanding_io(inode);
+	/*
+	 * Invalidate cached folios from the page containing off to EOF before
+	 * moving data on the server, so subsequent reads do not see stale data.
+	 */
+	truncate_pagecache_range(inode, round_down(off, PAGE_SIZE), -1);
+	fscache_invalidate(cifs_inode_cookie(inode), NULL, old_eof, 0);
 
 	rc = SMB2_set_eof(xid, tcon, cfile->fid.persistent_fid,
 			  cfile->fid.volatile_fid, cfile->pid, new_eof);
@@ -4142,7 +4205,9 @@ static long smb3_insert_range(struct file *file, struct cifs_tcon *tcon,
 		goto out_2;
 
 	truncate_setsize(inode, new_eof);
+	spin_lock(&inode->i_lock);
 	netfs_resize_file(&cifsi->netfs, i_size_read(inode), true);
+	spin_unlock(&inode->i_lock);
 	fscache_resize_cookie(cifs_inode_cookie(inode), i_size_read(inode));
 
 	/*
@@ -4153,7 +4218,9 @@ static long smb3_insert_range(struct file *file, struct cifs_tcon *tcon,
 				    off + len);
 	if (rc < 0)
 		goto out_2;
-	cifsi->netfs.zero_point = new_eof;
+	spin_lock(&inode->i_lock);
+	netfs_write_zero_point(inode, new_eof);
+	spin_unlock(&inode->i_lock);
 
 	rc = smb3_zero_data(file, tcon, off, len, xid);
 	if (rc < 0)
@@ -4194,7 +4261,7 @@ static loff_t smb3_llseek(struct file *file, struct cifs_tcon *tcon, loff_t offs
 	 * some servers (Windows2016) will not reflect recent writes in
 	 * QUERY_ALLOCATED_RANGES until SMB2_flush is called.
 	 */
-	wrcfile = find_writable_file(cifsi, FIND_WR_ANY);
+	wrcfile = find_writable_file(cifsi, FIND_ANY);
 	if (wrcfile) {
 		filemap_write_and_wait(inode->i_mapping);
 		smb2_flush_file(xid, tcon, &wrcfile->fid);
@@ -4366,7 +4433,7 @@ static long smb3_fallocate(struct file *file, struct cifs_tcon *tcon, int mode,
 		return smb3_collapse_range(file, tcon, off, len);
 	else if (mode == FALLOC_FL_INSERT_RANGE)
 		return smb3_insert_range(file, tcon, off, len);
-	else if (mode == 0)
+	else if (mode == FALLOC_FL_ALLOCATE_RANGE)
 		return smb3_simple_falloc(file, tcon, off, len, false);
 
 	return -EOPNOTSUPP;
@@ -4377,6 +4444,7 @@ smb2_downgrade_oplock(struct TCP_Server_Info *server,
 		      struct cifsInodeInfo *cinode, __u32 oplock,
 		      __u16 epoch, bool *purge_cache)
 {
+	lockdep_assert_held(&cinode->open_file_lock);
 	server->ops->set_oplock_level(cinode, oplock, 0, NULL);
 }
 
@@ -4417,19 +4485,19 @@ smb2_set_oplock_level(struct cifsInodeInfo *cinode, __u32 oplock,
 	if (oplock == SMB2_OPLOCK_LEVEL_NOCHANGE)
 		return;
 	if (oplock == SMB2_OPLOCK_LEVEL_BATCH) {
-		cinode->oplock = CIFS_CACHE_RHW_FLG;
+		WRITE_ONCE(cinode->oplock, CIFS_CACHE_RHW_FLG);
 		cifs_dbg(FYI, "Batch Oplock granted on inode %p\n",
 			 &cinode->netfs.inode);
 	} else if (oplock == SMB2_OPLOCK_LEVEL_EXCLUSIVE) {
-		cinode->oplock = CIFS_CACHE_RW_FLG;
+		WRITE_ONCE(cinode->oplock, CIFS_CACHE_RW_FLG);
 		cifs_dbg(FYI, "Exclusive Oplock granted on inode %p\n",
 			 &cinode->netfs.inode);
 	} else if (oplock == SMB2_OPLOCK_LEVEL_II) {
-		cinode->oplock = CIFS_CACHE_READ_FLG;
+		WRITE_ONCE(cinode->oplock, CIFS_CACHE_READ_FLG);
 		cifs_dbg(FYI, "Level II Oplock granted on inode %p\n",
 			 &cinode->netfs.inode);
 	} else
-		cinode->oplock = 0;
+		WRITE_ONCE(cinode->oplock, 0);
 }
 
 static void
@@ -4464,7 +4532,7 @@ smb21_set_oplock_level(struct cifsInodeInfo *cinode, __u32 oplock,
 	if (!new_oplock)
 		strscpy(message, "None");
 
-	cinode->oplock = new_oplock;
+	WRITE_ONCE(cinode->oplock, new_oplock);
 	cifs_dbg(FYI, "%s Lease granted on inode %p\n", message,
 		 &cinode->netfs.inode);
 }
@@ -4473,30 +4541,32 @@ static void
 smb3_set_oplock_level(struct cifsInodeInfo *cinode, __u32 oplock,
 		      __u16 epoch, bool *purge_cache)
 {
-	unsigned int old_oplock = cinode->oplock;
+	unsigned int old_oplock = READ_ONCE(cinode->oplock);
+	unsigned int new_oplock;
 
 	smb21_set_oplock_level(cinode, oplock, epoch, purge_cache);
+	new_oplock = READ_ONCE(cinode->oplock);
 
 	if (purge_cache) {
 		*purge_cache = false;
 		if (old_oplock == CIFS_CACHE_READ_FLG) {
-			if (cinode->oplock == CIFS_CACHE_READ_FLG &&
+			if (new_oplock == CIFS_CACHE_READ_FLG &&
 			    (epoch - cinode->epoch > 0))
 				*purge_cache = true;
-			else if (cinode->oplock == CIFS_CACHE_RH_FLG &&
+			else if (new_oplock == CIFS_CACHE_RH_FLG &&
 				 (epoch - cinode->epoch > 1))
 				*purge_cache = true;
-			else if (cinode->oplock == CIFS_CACHE_RHW_FLG &&
+			else if (new_oplock == CIFS_CACHE_RHW_FLG &&
 				 (epoch - cinode->epoch > 1))
 				*purge_cache = true;
-			else if (cinode->oplock == 0 &&
+			else if (new_oplock == 0 &&
 				 (epoch - cinode->epoch > 0))
 				*purge_cache = true;
 		} else if (old_oplock == CIFS_CACHE_RH_FLG) {
-			if (cinode->oplock == CIFS_CACHE_RH_FLG &&
+			if (new_oplock == CIFS_CACHE_RH_FLG &&
 			    (epoch - cinode->epoch > 0))
 				*purge_cache = true;
-			else if (cinode->oplock == CIFS_CACHE_RHW_FLG &&
+			else if (new_oplock == CIFS_CACHE_RHW_FLG &&
 				 (epoch - cinode->epoch > 1))
 				*purge_cache = true;
 		}
@@ -4537,7 +4607,7 @@ smb2_create_lease_buf(u8 *lease_key, u8 oplock, u8 *parent_lease_key, __le32 fla
 {
 	struct create_lease *buf;
 
-	buf = kzalloc(sizeof(struct create_lease), GFP_KERNEL);
+	buf = kzalloc_obj(struct create_lease);
 	if (!buf)
 		return NULL;
 
@@ -4563,7 +4633,7 @@ smb3_create_lease_buf(u8 *lease_key, u8 oplock, u8 *parent_lease_key, __le32 fla
 {
 	struct create_lease_v2 *buf;
 
-	buf = kzalloc(sizeof(struct create_lease_v2), GFP_KERNEL);
+	buf = kzalloc_obj(struct create_lease_v2);
 	if (!buf)
 		return NULL;
 
@@ -4801,7 +4871,7 @@ crypt_message(struct TCP_Server_Info *server, int num_rqst,
 		rc = crypto_aead_setkey(tfm, key, SMB3_GCM256_CRYPTKEY_SIZE);
 	else
 		rc = crypto_aead_setkey(tfm, key, SMB3_GCM128_CRYPTKEY_SIZE);
-
+	memzero_explicit(key, sizeof(key));
 	if (rc) {
 		cifs_server_dbg(VFS, "%s: Failed to set aead key %d\n", __func__, rc);
 		return rc;
@@ -4848,61 +4918,6 @@ crypt_message(struct TCP_Server_Info *server, int num_rqst,
 }
 
 /*
- * Clear a read buffer, discarding the folios which have the 1st mark set.
- */
-static void cifs_clear_folioq_buffer(struct folio_queue *buffer)
-{
-	struct folio_queue *folioq;
-
-	while ((folioq = buffer)) {
-		for (int s = 0; s < folioq_count(folioq); s++)
-			if (folioq_is_marked(folioq, s))
-				folio_put(folioq_folio(folioq, s));
-		buffer = folioq->next;
-		kfree(folioq);
-	}
-}
-
-/*
- * Allocate buffer space into a folio queue.
- */
-static struct folio_queue *cifs_alloc_folioq_buffer(ssize_t size)
-{
-	struct folio_queue *buffer = NULL, *tail = NULL, *p;
-	struct folio *folio;
-	unsigned int slot;
-
-	do {
-		if (!tail || folioq_full(tail)) {
-			p = kmalloc(sizeof(*p), GFP_NOFS);
-			if (!p)
-				goto nomem;
-			folioq_init(p, 0);
-			if (tail) {
-				tail->next = p;
-				p->prev = tail;
-			} else {
-				buffer = p;
-			}
-			tail = p;
-		}
-
-		folio = folio_alloc(GFP_KERNEL|__GFP_HIGHMEM, 0);
-		if (!folio)
-			goto nomem;
-
-		slot = folioq_append_mark(tail, folio);
-		size -= folioq_folio_size(tail, slot);
-	} while (size > 0);
-
-	return buffer;
-
-nomem:
-	cifs_clear_folioq_buffer(buffer);
-	return NULL;
-}
-
-/*
  * Copy data from an iterator to the folios in a folio queue buffer.
  */
 static bool cifs_copy_iter_to_folioq(struct iov_iter *iter, size_t size,
@@ -4927,7 +4942,7 @@ void
 smb3_free_compound_rqst(int num_rqst, struct smb_rqst *rqst)
 {
 	for (int i = 0; i < num_rqst; i++)
-		cifs_clear_folioq_buffer(rqst[i].rq_buffer);
+		netfs_free_folioq_buffer(rqst[i].rq_buffer);
 }
 
 /*
@@ -4962,16 +4977,18 @@ smb3_init_transform_rq(struct TCP_Server_Info *server, int num_rqst,
 		new->rq_nvec = old->rq_nvec;
 
 		if (size > 0) {
-			buffer = cifs_alloc_folioq_buffer(size);
-			if (!buffer)
+			size_t cur_size = 0;
+			rc = netfs_alloc_folioq_buffer(NULL, &buffer, &cur_size,
+						       size, GFP_NOFS);
+			new->rq_buffer = buffer;
+			if (rc < 0)
 				goto err_free;
 
-			new->rq_buffer = buffer;
 			iov_iter_folio_queue(&new->rq_iter, ITER_SOURCE,
 					     buffer, 0, 0, size);
 
 			if (!cifs_copy_iter_to_folioq(&old->rq_iter, size, buffer)) {
-				rc = -EIO;
+				rc = smb_EIO1(smb_eio_trace_tx_copy_iter_to_buf, size);
 				goto err_free;
 			}
 		}
@@ -5065,18 +5082,31 @@ cifs_copy_folioq_to_iter(struct folio_queue *folioq, size_t data_size,
 {
 	for (; folioq; folioq = folioq->next) {
 		for (int s = 0; s < folioq_count(folioq); s++) {
-			struct folio *folio = folioq_folio(folioq, s);
-			size_t fsize = folio_size(folio);
-			size_t n, len = umin(fsize - skip, data_size);
+			struct folio *folio;
+			size_t fsize, n, len;
+
+			if (data_size == 0)
+				return 0;
+
+			folio = folioq_folio(folioq, s);
+			fsize = folio_size(folio);
+			len = umin(fsize - skip, data_size);
 
 			n = copy_folio_to_iter(folio, skip, len, iter);
 			if (n != len) {
 				cifs_dbg(VFS, "%s: something went wrong\n", __func__);
-				return -EIO;
+				return smb_EIO2(smb_eio_trace_rx_copy_to_iter,
+						n, len);
 			}
 			data_size -= n;
 			skip = 0;
 		}
+	}
+
+	if (data_size != 0) {
+		cifs_dbg(VFS, "%s: short copy, %zu bytes missing\n",
+			 __func__, data_size);
+		return smb_EIO2(smb_eio_trace_rx_copy_to_iter, 0, data_size);
 	}
 
 	return 0;
@@ -5089,6 +5119,7 @@ handle_read_data(struct TCP_Server_Info *server, struct mid_q_entry *mid,
 {
 	unsigned int data_offset;
 	unsigned int data_len;
+	unsigned int end_off;
 	unsigned int cur_off;
 	unsigned int cur_page_idx;
 	unsigned int pad_len;
@@ -5132,7 +5163,7 @@ handle_read_data(struct TCP_Server_Info *server, struct mid_q_entry *mid,
 		if (is_offloaded)
 			mid->mid_state = MID_RESPONSE_RECEIVED;
 		else
-			dequeue_mid(mid, false);
+			dequeue_mid(server, mid, false);
 		return 0;
 	}
 
@@ -5155,11 +5186,11 @@ handle_read_data(struct TCP_Server_Info *server, struct mid_q_entry *mid,
 		/* data_offset is beyond the end of smallbuf */
 		cifs_dbg(FYI, "%s: data offset (%u) beyond end of smallbuf\n",
 			 __func__, data_offset);
-		rdata->result = -EIO;
+		rdata->result = smb_EIO1(smb_eio_trace_rx_overlong, data_offset);
 		if (is_offloaded)
 			mid->mid_state = MID_RESPONSE_MALFORMED;
 		else
-			dequeue_mid(mid, rdata->result);
+			dequeue_mid(server, mid, rdata->result);
 		return 0;
 	}
 
@@ -5174,21 +5205,21 @@ handle_read_data(struct TCP_Server_Info *server, struct mid_q_entry *mid,
 			/* data offset is beyond the 1st page of response */
 			cifs_dbg(FYI, "%s: data offset (%u) beyond 1st page of response\n",
 				 __func__, data_offset);
-			rdata->result = -EIO;
+			rdata->result = smb_EIO1(smb_eio_trace_rx_overpage, data_offset);
 			if (is_offloaded)
 				mid->mid_state = MID_RESPONSE_MALFORMED;
 			else
-				dequeue_mid(mid, rdata->result);
+				dequeue_mid(server, mid, rdata->result);
 			return 0;
 		}
 
 		if (data_len > buffer_len - pad_len) {
 			/* data_len is corrupt -- discard frame */
-			rdata->result = -EIO;
+			rdata->result = smb_EIO1(smb_eio_trace_rx_bad_datalen, data_len);
 			if (is_offloaded)
 				mid->mid_state = MID_RESPONSE_MALFORMED;
 			else
-				dequeue_mid(mid, rdata->result);
+				dequeue_mid(server, mid, rdata->result);
 			return 0;
 		}
 
@@ -5199,33 +5230,34 @@ handle_read_data(struct TCP_Server_Info *server, struct mid_q_entry *mid,
 			if (is_offloaded)
 				mid->mid_state = MID_RESPONSE_MALFORMED;
 			else
-				dequeue_mid(mid, rdata->result);
+				dequeue_mid(server, mid, rdata->result);
 			return 0;
 		}
 		rdata->got_bytes = data_len;
 
-	} else if (buf_len >= data_offset + data_len) {
+	} else if (!check_add_overflow(data_offset, data_len, &end_off) &&
+		   buf_len >= end_off) {
 		/* read response payload is in buf */
 		WARN_ONCE(buffer, "read data can be either in buf or in buffer");
 		copied = copy_to_iter(buf + data_offset, data_len, &rdata->subreq.io_iter);
 		if (copied == 0)
-			return -EIO;
+			return smb_EIO2(smb_eio_trace_rx_copy_to_iter, copied, data_len);
 		rdata->got_bytes = copied;
 	} else {
 		/* read response payload cannot be in both buf and pages */
 		WARN_ONCE(1, "buf can not contain only a part of read data");
-		rdata->result = -EIO;
+		rdata->result = smb_EIO(smb_eio_trace_rx_both_buf);
 		if (is_offloaded)
 			mid->mid_state = MID_RESPONSE_MALFORMED;
 		else
-			dequeue_mid(mid, rdata->result);
+			dequeue_mid(server, mid, rdata->result);
 		return 0;
 	}
 
 	if (is_offloaded)
 		mid->mid_state = MID_RESPONSE_RECEIVED;
 	else
-		dequeue_mid(mid, false);
+		dequeue_mid(server, mid, false);
 	return 0;
 }
 
@@ -5256,9 +5288,10 @@ static void smb2_decrypt_offload(struct work_struct *work)
 
 	dw->server->lstrp = jiffies;
 	mid = smb2_find_dequeue_mid(dw->server, dw->buf);
-	if (mid == NULL)
+	if (mid == NULL) {
 		cifs_dbg(FYI, "mid not found\n");
-	else {
+		smb2_add_credits_from_hdr(dw->buf, dw->server);
+	} else {
 		mid->decrypted = true;
 		rc = handle_read_data(dw->server, mid, dw->buf,
 				      dw->server->vals->read_rsp_size,
@@ -5272,7 +5305,7 @@ static void smb2_decrypt_offload(struct work_struct *work)
 				dw->server->ops->is_network_name_deleted(dw->buf,
 									 dw->server);
 
-			mid_execute_callback(mid);
+			mid_execute_callback(dw->server, mid);
 		} else {
 			spin_lock(&dw->server->srv_lock);
 			if (dw->server->tcpStatus == CifsNeedReconnect) {
@@ -5280,7 +5313,7 @@ static void smb2_decrypt_offload(struct work_struct *work)
 				mid->mid_state = MID_RETRY_NEEDED;
 				spin_unlock(&dw->server->mid_queue_lock);
 				spin_unlock(&dw->server->srv_lock);
-				mid_execute_callback(mid);
+				mid_execute_callback(dw->server, mid);
 			} else {
 				spin_lock(&dw->server->mid_queue_lock);
 				mid->mid_state = MID_REQUEST_SUBMITTED;
@@ -5291,11 +5324,11 @@ static void smb2_decrypt_offload(struct work_struct *work)
 				spin_unlock(&dw->server->srv_lock);
 			}
 		}
-		release_mid(mid);
+		release_mid(dw->server, mid);
 	}
 
 free_pages:
-	cifs_clear_folioq_buffer(dw->buffer);
+	netfs_free_folioq_buffer(dw->buffer);
 	cifs_small_buf_release(dw->buf);
 	kfree(dw);
 }
@@ -5313,7 +5346,7 @@ receive_encrypted_read(struct TCP_Server_Info *server, struct mid_q_entry **mid,
 	int rc;
 	struct smb2_decrypt_work *dw;
 
-	dw = kzalloc(sizeof(struct smb2_decrypt_work), GFP_KERNEL);
+	dw = kzalloc_obj(struct smb2_decrypt_work);
 	if (!dw)
 		return -ENOMEM;
 	INIT_WORK(&dw->decrypt, smb2_decrypt_offload);
@@ -5328,14 +5361,22 @@ receive_encrypted_read(struct TCP_Server_Info *server, struct mid_q_entry **mid,
 		goto free_dw;
 	server->total_read += rc;
 
+	if (le32_to_cpu(tr_hdr->OriginalMessageSize) <
+	    server->vals->read_rsp_size) {
+		cifs_server_dbg(VFS, "OriginalMessageSize %u too small for read response (%zu)\n",
+			le32_to_cpu(tr_hdr->OriginalMessageSize),
+			server->vals->read_rsp_size);
+		rc = -EINVAL;
+		goto discard_data;
+	}
 	len = le32_to_cpu(tr_hdr->OriginalMessageSize) -
 		server->vals->read_rsp_size;
 	dw->len = len;
 	len = round_up(dw->len, PAGE_SIZE);
 
-	rc = -ENOMEM;
-	dw->buffer = cifs_alloc_folioq_buffer(len);
-	if (!dw->buffer)
+	size_t cur_size = 0;
+	rc = netfs_alloc_folioq_buffer(NULL, &dw->buffer, &cur_size, len, GFP_NOFS);
+	if (rc < 0)
 		goto discard_data;
 
 	iov_iter_folio_queue(&iter, ITER_DEST, dw->buffer, 0, 0, len);
@@ -5381,6 +5422,7 @@ receive_encrypted_read(struct TCP_Server_Info *server, struct mid_q_entry **mid,
 	*mid = smb2_find_mid(server, buf);
 	if (*mid == NULL) {
 		cifs_dbg(FYI, "mid not found\n");
+		smb2_add_credits_from_hdr(buf, server);
 		rc = -1;
 	} else {
 		cifs_dbg(FYI, "mid found\n");
@@ -5397,7 +5439,7 @@ receive_encrypted_read(struct TCP_Server_Info *server, struct mid_q_entry **mid,
 	}
 
 free_pages:
-	cifs_clear_folioq_buffer(dw->buffer);
+	netfs_free_folioq_buffer(dw->buffer);
 free_dw:
 	kfree(dw);
 	return rc;
@@ -5725,7 +5767,7 @@ static int smb2_make_node(unsigned int xid, struct inode *inode,
 			  struct dentry *dentry, struct cifs_tcon *tcon,
 			  const char *full_path, umode_t mode, dev_t dev)
 {
-	struct cifs_sb_info *cifs_sb = CIFS_SB(inode->i_sb);
+	unsigned int sbflags = cifs_sb_flags(CIFS_SB(inode));
 	int rc = -EOPNOTSUPP;
 
 	/*
@@ -5734,7 +5776,7 @@ static int smb2_make_node(unsigned int xid, struct inode *inode,
 	 * supports block and char device, socket & fifo,
 	 * and was used by default in earlier versions of Windows
 	 */
-	if (cifs_sb_flags(cifs_sb) & CIFS_MOUNT_UNX_EMUL) {
+	if (sbflags & CIFS_MOUNT_UNX_EMUL) {
 		rc = cifs_sfu_make_node(xid, inode, dentry, tcon,
 					full_path, mode, dev);
 	} else if (CIFS_REPARSE_SUPPORT(tcon)) {
@@ -6193,7 +6235,6 @@ struct smb_version_values smb20_values = {
 	.shared_lock_type = SMB2_LOCKFLAG_SHARED,
 	.unlock_lock_type = SMB2_LOCKFLAG_UNLOCK,
 	.header_size = sizeof(struct smb2_hdr),
-	.header_preamble_size = 0,
 	.max_header_size = MAX_SMB2_HDR_SIZE,
 	.read_rsp_size = sizeof(struct smb2_read_rsp),
 	.lock_cmd = SMB2_LOCK,
@@ -6215,7 +6256,6 @@ struct smb_version_values smb21_values = {
 	.shared_lock_type = SMB2_LOCKFLAG_SHARED,
 	.unlock_lock_type = SMB2_LOCKFLAG_UNLOCK,
 	.header_size = sizeof(struct smb2_hdr),
-	.header_preamble_size = 0,
 	.max_header_size = MAX_SMB2_HDR_SIZE,
 	.read_rsp_size = sizeof(struct smb2_read_rsp),
 	.lock_cmd = SMB2_LOCK,
@@ -6236,7 +6276,6 @@ struct smb_version_values smb3any_values = {
 	.shared_lock_type = SMB2_LOCKFLAG_SHARED,
 	.unlock_lock_type = SMB2_LOCKFLAG_UNLOCK,
 	.header_size = sizeof(struct smb2_hdr),
-	.header_preamble_size = 0,
 	.max_header_size = MAX_SMB2_HDR_SIZE,
 	.read_rsp_size = sizeof(struct smb2_read_rsp),
 	.lock_cmd = SMB2_LOCK,
@@ -6257,7 +6296,6 @@ struct smb_version_values smbdefault_values = {
 	.shared_lock_type = SMB2_LOCKFLAG_SHARED,
 	.unlock_lock_type = SMB2_LOCKFLAG_UNLOCK,
 	.header_size = sizeof(struct smb2_hdr),
-	.header_preamble_size = 0,
 	.max_header_size = MAX_SMB2_HDR_SIZE,
 	.read_rsp_size = sizeof(struct smb2_read_rsp),
 	.lock_cmd = SMB2_LOCK,
@@ -6278,7 +6316,6 @@ struct smb_version_values smb30_values = {
 	.shared_lock_type = SMB2_LOCKFLAG_SHARED,
 	.unlock_lock_type = SMB2_LOCKFLAG_UNLOCK,
 	.header_size = sizeof(struct smb2_hdr),
-	.header_preamble_size = 0,
 	.max_header_size = MAX_SMB2_HDR_SIZE,
 	.read_rsp_size = sizeof(struct smb2_read_rsp),
 	.lock_cmd = SMB2_LOCK,
@@ -6299,7 +6336,6 @@ struct smb_version_values smb302_values = {
 	.shared_lock_type = SMB2_LOCKFLAG_SHARED,
 	.unlock_lock_type = SMB2_LOCKFLAG_UNLOCK,
 	.header_size = sizeof(struct smb2_hdr),
-	.header_preamble_size = 0,
 	.max_header_size = MAX_SMB2_HDR_SIZE,
 	.read_rsp_size = sizeof(struct smb2_read_rsp),
 	.lock_cmd = SMB2_LOCK,
@@ -6320,7 +6356,6 @@ struct smb_version_values smb311_values = {
 	.shared_lock_type = SMB2_LOCKFLAG_SHARED,
 	.unlock_lock_type = SMB2_LOCKFLAG_UNLOCK,
 	.header_size = sizeof(struct smb2_hdr),
-	.header_preamble_size = 0,
 	.max_header_size = MAX_SMB2_HDR_SIZE,
 	.read_rsp_size = sizeof(struct smb2_read_rsp),
 	.lock_cmd = SMB2_LOCK,

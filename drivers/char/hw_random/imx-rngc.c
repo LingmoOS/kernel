@@ -7,7 +7,6 @@
  */
 
 #include <linux/module.h>
-#include <linux/mod_devicetable.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/clk.h>
@@ -297,7 +296,7 @@ static int __init imx_rngc_probe(struct platform_device *pdev)
 			irq, imx_rngc_irq, 0, pdev->name, (void *)rngc);
 	if (ret) {
 		clk_disable_unprepare(rngc->clk);
-		return dev_err_probe(&pdev->dev, ret, "Can't get interrupt working.\n");
+		return ret;
 	}
 
 	if (self_test) {

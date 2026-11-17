@@ -18,7 +18,6 @@
 
 #include <asm/byteorder.h>
 #include <linux/uaccess.h>
-#include <linux/hfs_common.h>
 
 #include "hfs.h"
 
@@ -65,14 +64,22 @@ struct hfs_inode_info {
  * The HFS-specific part of a Linux (struct super_block)
  */
 struct hfs_sb_info {
+	struct mutex mdb_lock;			/* MDB operations lock */
 	struct buffer_head *mdb_bh;		/* The hfs_buffer
 						   holding the real
 						   superblock (aka VIB
 						   or MDB) */
-	struct hfs_mdb *mdb;
+	unsigned int mdb_offset;		/* byte offset of the MDB
+						   sector within mdb_bh's
+						   data */
+	struct hfs_mdb *mdb;			/* in-memory copy of the MDB */
 	struct buffer_head *alt_mdb_bh;		/* The hfs_buffer holding
 						   the alternate superblock */
-	struct hfs_mdb *alt_mdb;
+	unsigned int alt_mdb_offset;		/* byte offset of the alternate
+						   MDB sector within
+						   alt_mdb_bh's data */
+	struct hfs_mdb *alt_mdb;		/* in-memory copy of the
+						   alternate MDB */
 	__be32 *bitmap;				/* The page holding the
 						   allocation bitmap */
 	struct hfs_btree *ext_tree;			/* Information about
@@ -195,6 +202,8 @@ extern int hfs_get_block(struct inode *inode, sector_t block,
 extern const struct address_space_operations hfs_aops;
 extern const struct address_space_operations hfs_btree_aops;
 
+struct file_kattr;
+int hfs_fileattr_get(struct dentry *dentry, struct file_kattr *fa);
 int hfs_write_begin(const struct kiocb *iocb, struct address_space *mapping,
 		    loff_t pos, unsigned int len, struct folio **foliop,
 		    void **fsdata);
@@ -219,7 +228,7 @@ extern const struct xattr_handler * const hfs_xattr_handlers[];
 /* mdb.c */
 extern bool is_hfs_cnid_counts_valid(struct super_block *sb);
 extern int hfs_mdb_get(struct super_block *sb);
-extern void hfs_mdb_commit(struct super_block *sb);
+extern int hfs_mdb_commit(struct super_block *sb);
 extern void hfs_mdb_close(struct super_block *sb);
 extern void hfs_mdb_put(struct super_block *sb);
 

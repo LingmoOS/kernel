@@ -35,7 +35,7 @@ struct sm501_device {
 struct sm501_gpio;
 
 #ifdef CONFIG_MFD_SM501_GPIO
-#include <linux/gpio.h>
+#include <linux/gpio/consumer.h>
 
 struct sm501_gpio_chip {
 	struct gpio_chip	gpio;
@@ -1337,7 +1337,7 @@ static int sm501_plat_probe(struct platform_device *dev)
 	struct sm501_devdata *sm;
 	int ret;
 
-	sm = kzalloc(sizeof(*sm), GFP_KERNEL);
+	sm = kzalloc_obj(*sm);
 	if (!sm) {
 		ret = -ENOMEM;
 		goto err1;
@@ -1520,7 +1520,7 @@ static int sm501_pci_probe(struct pci_dev *dev,
 	struct sm501_devdata *sm;
 	int err;
 
-	sm = kzalloc(sizeof(*sm), GFP_KERNEL);
+	sm = kzalloc_obj(*sm);
 	if (!sm) {
 		err = -ENOMEM;
 		goto err1;
@@ -1642,8 +1642,8 @@ static void sm501_plat_remove(struct platform_device *dev)
 }
 
 static const struct pci_device_id sm501_pci_tbl[] = {
-	{ 0x126f, 0x0501, PCI_ANY_ID, PCI_ANY_ID, 0, 0, 0 },
-	{ 0, },
+	{ PCI_DEVICE(0x126f, 0x0501) },
+	{ },
 };
 
 MODULE_DEVICE_TABLE(pci, sm501_pci_tbl);

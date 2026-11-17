@@ -188,7 +188,7 @@ static int allocate_filesystem_keyring(struct super_block *sb)
 	if (sb->s_master_keys)
 		return 0;
 
-	keyring = kzalloc(sizeof(*keyring), GFP_KERNEL);
+	keyring = kzalloc_obj(*keyring);
 	if (!keyring)
 		return -ENOMEM;
 	spin_lock_init(&keyring->lock);
@@ -416,7 +416,7 @@ static int add_new_master_key(struct super_block *sb,
 	struct fscrypt_master_key *mk;
 	int err;
 
-	mk = kzalloc(sizeof(*mk), GFP_KERNEL);
+	mk = kzalloc_obj(*mk);
 	if (!mk)
 		return -ENOMEM;
 
@@ -497,7 +497,7 @@ static int do_add_master_key(struct super_block *sb,
 	struct fscrypt_master_key *mk;
 	int err;
 
-	mutex_lock(&fscrypt_add_key_mutex); /* serialize find + link */
+	guard(mutex)(&fscrypt_add_key_mutex); /* serialize find + link */
 
 	mk = fscrypt_find_master_key(sb, mk_spec);
 	if (!mk) {
@@ -524,7 +524,6 @@ static int do_add_master_key(struct super_block *sb,
 		}
 		fscrypt_put_master_key(mk);
 	}
-	mutex_unlock(&fscrypt_add_key_mutex);
 	return err;
 }
 
@@ -918,7 +917,7 @@ static void evict_dentries_for_decrypted_inodes(struct fscrypt_master_key *mk)
 	list_for_each_entry(ci, &mk->mk_decrypted_inodes, ci_master_key_link) {
 		inode = ci->ci_inode;
 		spin_lock(&inode->i_lock);
-		if (inode->i_state & (I_FREEING | I_WILL_FREE | I_NEW)) {
+		if (inode_state_read(inode) & (I_FREEING | I_WILL_FREE | I_NEW)) {
 			spin_unlock(&inode->i_lock);
 			continue;
 		}
@@ -942,8 +941,8 @@ static int check_for_busy_inodes(struct super_block *sb,
 {
 	struct list_head *pos;
 	size_t busy_count = 0;
-	unsigned long ino;
 	char ino_str[50] = "";
+	u64 ino;
 
 	spin_lock(&mk->mk_decrypted_inodes_lock);
 
@@ -967,7 +966,7 @@ static int check_for_busy_inodes(struct super_block *sb,
 
 	/* If the inode is currently being created, ino may still be 0. */
 	if (ino)
-		snprintf(ino_str, sizeof(ino_str), ", including ino %lu", ino);
+		snprintf(ino_str, sizeof(ino_str), ", including ino %llu", ino);
 
 	fscrypt_warn(NULL,
 		     "%s: %zu inode(s) still busy after removing key with %s %*phN%s",
@@ -1221,21 +1220,19 @@ out:
 }
 EXPORT_SYMBOL_GPL(fscrypt_ioctl_get_key_status);
 
-int __init fscrypt_init_keyring(void)
+void __init fscrypt_init_keyring(void)
 {
 	int err;
 
+	/*
+	 * Note that register_key_type() fails only if a key type with the same
+	 * name already exists, which should never happen here.
+	 */
 	err = register_key_type(&key_type_fscrypt_user);
 	if (err)
-		return err;
-
+		panic("failed to register .fscrypt key type (%d)", err);
 	err = register_key_type(&key_type_fscrypt_provisioning);
 	if (err)
-		goto err_unregister_fscrypt_user;
-
-	return 0;
-
-err_unregister_fscrypt_user:
-	unregister_key_type(&key_type_fscrypt_user);
-	return err;
+		panic("failed to register fscrypt-provisioning key type (%d)",
+		      err);
 }

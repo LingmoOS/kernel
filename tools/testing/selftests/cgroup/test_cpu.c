@@ -11,7 +11,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "../kselftest.h"
+#include "kselftest.h"
 #include "cgroup_util.h"
 
 enum hog_clock_type {
@@ -278,7 +278,7 @@ static int test_cpucg_nice(const char *root)
 		char buf[64];
 		snprintf(buf, sizeof(buf), "%d", getpid());
 		if (cg_write(cpucg, "cgroup.procs", buf))
-			goto cleanup;
+			exit(EXIT_FAILURE);
 
 		/* Try to keep niced CPU usage as constrained to hog_cpu as possible */
 		nice(1);
@@ -291,6 +291,8 @@ static int test_cpucg_nice(const char *root)
 
 		user_usec = cg_read_key_long(cpucg, "cpu.stat", "user_usec");
 		nice_usec = cg_read_key_long(cpucg, "cpu.stat", "nice_usec");
+		if (user_usec <= 0)
+			goto cleanup;
 		if (!values_close_report(nice_usec, expected_nice_usec, 1))
 			goto cleanup;
 
@@ -827,8 +829,9 @@ struct cpucg_test {
 int main(int argc, char *argv[])
 {
 	char root[PATH_MAX];
-	int i, ret = EXIT_SUCCESS;
+	int i;
 
+	ksft_print_header();
 	if (cg_find_unified_root(root, sizeof(root), NULL))
 		ksft_exit_skip("cgroup v2 isn't mounted\n");
 
@@ -836,6 +839,7 @@ int main(int argc, char *argv[])
 		if (cg_write(root, "cgroup.subtree_control", "+cpu"))
 			ksft_exit_skip("Failed to set cpu controller\n");
 
+	ksft_set_plan(ARRAY_SIZE(tests));
 	for (i = 0; i < ARRAY_SIZE(tests); i++) {
 		switch (tests[i].fn(root)) {
 		case KSFT_PASS:
@@ -845,11 +849,10 @@ int main(int argc, char *argv[])
 			ksft_test_result_skip("%s\n", tests[i].name);
 			break;
 		default:
-			ret = EXIT_FAILURE;
 			ksft_test_result_fail("%s\n", tests[i].name);
 			break;
 		}
 	}
 
-	return ret;
+	ksft_finished();
 }

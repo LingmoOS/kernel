@@ -233,7 +233,7 @@ static int ttm_buffer_object_transfer(struct ttm_buffer_object *bo,
 	struct ttm_transfer_obj *fbo;
 	int ret;
 
-	fbo = kmalloc(sizeof(*fbo), GFP_KERNEL);
+	fbo = kmalloc_obj(*fbo);
 	if (!fbo)
 		return -ENOMEM;
 
@@ -258,7 +258,7 @@ static int ttm_buffer_object_transfer(struct ttm_buffer_object *bo,
 	ret = dma_resv_trylock(&fbo->base.base._resv);
 	WARN_ON(!ret);
 
-	ret = dma_resv_reserve_fences(&fbo->base.base._resv, 1);
+	ret = dma_resv_reserve_fences(&fbo->base.base._resv, TTM_NUM_MOVE_FENCES);
 	if (ret) {
 		dma_resv_unlock(&fbo->base.base._resv);
 		kfree(fbo);
@@ -343,10 +343,7 @@ static int ttm_bo_kmap_ttm(struct ttm_buffer_object *bo,
 			   struct ttm_bo_kmap_obj *map)
 {
 	struct ttm_resource *mem = bo->resource;
-	struct ttm_operation_ctx ctx = {
-		.interruptible = false,
-		.no_wait_gpu = false
-	};
+	struct ttm_operation_ctx ctx = { };
 	struct ttm_tt *ttm = bo->ttm;
 	struct ttm_resource_manager *man =
 			ttm_manager_type(bo->bdev, mem->mem_type);
@@ -358,6 +355,10 @@ static int ttm_bo_kmap_ttm(struct ttm_buffer_object *bo,
 	ret = ttm_bo_populate(bo, &ctx);
 	if (ret)
 		return ret;
+
+	/* Imported sg tables only come with DMA addresses, no pages to map. */
+	if (!ttm->pages)
+		return -EINVAL;
 
 	if (num_pages == 1 && ttm->caching == ttm_cached &&
 	    !(man->use_tt && (ttm->page_flags & TTM_TT_FLAG_DECRYPTED))) {
@@ -422,7 +423,7 @@ EXPORT_SYMBOL(ttm_bo_kmap_try_from_panic);
  *
  * Returns
  * -ENOMEM: Out of memory.
- * -EINVAL: Invalid range.
+ * -EINVAL: Invalid range or the BO has no pages to map.
  */
 int ttm_bo_kmap(struct ttm_buffer_object *bo,
 		unsigned long start_page, unsigned long num_pages,
@@ -496,7 +497,7 @@ EXPORT_SYMBOL(ttm_bo_kunmap);
  *
  * Returns
  * -ENOMEM: Out of memory.
- * -EINVAL: Invalid range.
+ * -EINVAL: Invalid range or the BO has no pages to map.
  */
 int ttm_bo_vmap(struct ttm_buffer_object *bo, struct iosys_map *map)
 {
@@ -531,10 +532,7 @@ int ttm_bo_vmap(struct ttm_buffer_object *bo, struct iosys_map *map)
 		iosys_map_set_vaddr_iomem(map, vaddr_iomem);
 
 	} else {
-		struct ttm_operation_ctx ctx = {
-			.interruptible = false,
-			.no_wait_gpu = false
-		};
+		struct ttm_operation_ctx ctx = { };
 		struct ttm_tt *ttm = bo->ttm;
 		pgprot_t prot;
 		void *vaddr;
@@ -542,6 +540,9 @@ int ttm_bo_vmap(struct ttm_buffer_object *bo, struct iosys_map *map)
 		ret = ttm_bo_populate(bo, &ctx);
 		if (ret)
 			return ret;
+
+		if (!ttm->pages)
+			return -EINVAL;
 
 		/*
 		 * We need to use vmap to get the desired page protection
@@ -646,20 +647,44 @@ static void ttm_bo_move_pipeline_evict(struct ttm_buffer_object *bo,
 				       struct dma_fence *fence)
 {
 	struct ttm_resource_manager *from;
+	struct dma_fence *tmp;
+	int i;
 
 	from = ttm_manager_type(bo->bdev, bo->resource->mem_type);
 
 	/**
 	 * BO doesn't have a TTM we need to bind/unbind. Just remember
-	 * this eviction and free up the allocation
+	 * this eviction and free up the allocation.
+	 * The fence will be saved in the first free slot or in the slot
+	 * already used to store a fence from the same context. Since
+	 * drivers can't use more than TTM_NUM_MOVE_FENCES contexts for
+	 * evictions we should always find a slot to use.
 	 */
-	spin_lock(&from->move_lock);
-	if (!from->move || dma_fence_is_later(fence, from->move)) {
-		dma_fence_put(from->move);
-		from->move = dma_fence_get(fence);
+	spin_lock(&from->eviction_lock);
+	for (i = 0; i < TTM_NUM_MOVE_FENCES; i++) {
+		tmp = from->eviction_fences[i];
+		if (!tmp)
+			break;
+		if (fence->context != tmp->context)
+			continue;
+		if (dma_fence_is_later(fence, tmp)) {
+			dma_fence_put(tmp);
+			break;
+		}
+		goto unlock;
 	}
-	spin_unlock(&from->move_lock);
+	if (i < TTM_NUM_MOVE_FENCES) {
+		from->eviction_fences[i] = dma_fence_get(fence);
+	} else {
+		WARN(1, "not enough fence slots for all fence contexts");
+		spin_unlock(&from->eviction_lock);
+		dma_fence_wait(fence, false);
+		goto end;
+	}
 
+unlock:
+	spin_unlock(&from->eviction_lock);
+end:
 	ttm_resource_free(bo, &bo->resource);
 }
 
@@ -981,7 +1006,8 @@ __ttm_bo_lru_cursor_next(struct ttm_bo_lru_cursor *curs)
 		bo = res->bo;
 		if (ttm_lru_walk_trylock(curs, bo))
 			bo_locked = true;
-		else if (!arg->ticket || arg->ctx->no_wait_gpu || arg->trylock_only)
+		else if ((!arg->ticket && !arg->sleeping_lock) || arg->ctx->no_wait_gpu ||
+			 arg->trylock_only)
 			continue;
 
 		if (!ttm_bo_get_unless_zero(bo)) {

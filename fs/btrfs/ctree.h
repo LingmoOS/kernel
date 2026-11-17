@@ -86,6 +86,14 @@ struct btrfs_path {
 	struct btrfs_path *path_name __free(btrfs_free_path) = NULL
 
 /*
+ * This defines an on-stack path that will be auto released when exiting the scope.
+ *
+ * It is compatible with any existing manual btrfs_release_path() calls.
+ */
+#define BTRFS_PATH_AUTO_RELEASE(path_name)					\
+	struct btrfs_path path_name __free(btrfs_release_path) = { 0 }
+
+/*
  * The state of btrfs root
  */
 enum {
@@ -123,7 +131,6 @@ enum {
 	BTRFS_ROOT_ORPHAN_ITEM_INSERTED,
 	BTRFS_ROOT_DEFRAG_RUNNING,
 	BTRFS_ROOT_FORCE_COW,
-	BTRFS_ROOT_MULTI_LOG_TASKS,
 	BTRFS_ROOT_DIRTY,
 	BTRFS_ROOT_DELETING,
 
@@ -188,9 +195,7 @@ struct btrfs_root {
 	struct list_head log_ctxs[2];
 	/* Used only for log trees of subvolumes, not for the log root tree */
 	atomic_t log_writers;
-	atomic_t log_commit[2];
-	/* Used only for log trees of subvolumes, not for the log root tree */
-	atomic_t log_batch;
+	bool log_commit[2];
 	/*
 	 * Protected by the 'log_mutex' lock but can be read without holding
 	 * that lock to avoid unnecessary lock contention, in which case it
@@ -208,7 +213,6 @@ struct btrfs_root {
 	 * to access this field.
 	 */
 	int last_log_commit;
-	pid_t log_start_pid;
 
 	u64 last_trans;
 
@@ -601,6 +605,7 @@ void btrfs_release_path(struct btrfs_path *p);
 struct btrfs_path *btrfs_alloc_path(void);
 void btrfs_free_path(struct btrfs_path *p);
 DEFINE_FREE(btrfs_free_path, struct btrfs_path *, btrfs_free_path(_T))
+DEFINE_FREE(btrfs_release_path, struct btrfs_path, btrfs_release_path(&_T))
 
 int btrfs_del_items(struct btrfs_trans_handle *trans, struct btrfs_root *root,
 		   struct btrfs_path *path, int slot, int nr);

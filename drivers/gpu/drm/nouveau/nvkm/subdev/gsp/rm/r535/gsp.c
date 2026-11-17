@@ -796,7 +796,8 @@ r535_gsp_acpi_mux_id(acpi_handle handle, u32 id, MUX_METHOD_DATA_ELEMENT *mode,
 	struct acpi_object_list input = { 1, &mux_arg };
 	acpi_handle iter = NULL, handle_mux = NULL;
 	acpi_status status;
-	unsigned long long value;
+	u64 value;
+	int ret;
 
 	mode->status = 0xffff;
 	part->status = 0xffff;
@@ -806,8 +807,8 @@ r535_gsp_acpi_mux_id(acpi_handle handle, u32 id, MUX_METHOD_DATA_ELEMENT *mode,
 		if (ACPI_FAILURE(status) || !iter)
 			return;
 
-		status = acpi_evaluate_integer(iter, "_ADR", NULL, &value);
-		if (ACPI_FAILURE(status) || value != id)
+		ret = acpi_get_local_u64_address(iter, &value);
+		if (ret || value != id)
 			continue;
 
 		handle_mux = iter;
@@ -1782,6 +1783,23 @@ r535_gsp_fini(struct nvkm_gsp *gsp, enum nvkm_suspend_state suspend)
 }
 
 int
+r535_gsp_get_static_memsys_info(struct nvkm_gsp *gsp)
+{
+	NV2080_CTRL_INTERNAL_MEMSYS_GET_STATIC_CONFIG_PARAMS *ctrl;
+
+	ctrl = nvkm_gsp_rm_ctrl_rd(&gsp->internal.device.subdevice,
+				    NV2080_CTRL_CMD_INTERNAL_MEMSYS_GET_STATIC_CONFIG,
+				    sizeof(*ctrl));
+	if (IS_ERR(ctrl))
+		return PTR_ERR(ctrl);
+
+	gsp->memsys.use_raw_mode_comptagline_alloc = ctrl->bUseRawModeComptaglineAllocation;
+
+	nvkm_gsp_rm_ctrl_done(&gsp->internal.device.subdevice, ctrl);
+	return 0;
+}
+
+int
 r535_gsp_init(struct nvkm_gsp *gsp)
 {
 	int ret;
@@ -2007,7 +2025,7 @@ static void r535_gsp_retain_logging(struct nvkm_gsp *gsp)
 		goto exit;
 	}
 
-	log = kzalloc(sizeof(*log), GFP_KERNEL);
+	log = kzalloc_obj(*log);
 	if (!log)
 		goto error;
 

@@ -17,12 +17,12 @@
 #ifdef CONFIG_ACPI_DEBUG
 /*
  * ACPI debug sysfs I/F, including:
- * /sys/modules/acpi/parameters/debug_layer
- * /sys/modules/acpi/parameters/debug_level
- * /sys/modules/acpi/parameters/trace_method_name
- * /sys/modules/acpi/parameters/trace_state
- * /sys/modules/acpi/parameters/trace_debug_layer
- * /sys/modules/acpi/parameters/trace_debug_level
+ * /sys/module/acpi/parameters/debug_layer
+ * /sys/module/acpi/parameters/debug_level
+ * /sys/module/acpi/parameters/trace_method_name
+ * /sys/module/acpi/parameters/trace_state
+ * /sys/module/acpi/parameters/trace_debug_layer
+ * /sys/module/acpi/parameters/trace_debug_level
  */
 
 struct acpi_dlayer {
@@ -269,7 +269,7 @@ module_param_call(trace_state, param_set_trace_state, param_get_trace_state,
 #endif /* CONFIG_ACPI_DEBUG */
 
 
-/* /sys/modules/acpi/parameters/aml_debug_output */
+/* /sys/module/acpi/parameters/aml_debug_output */
 
 module_param_named(aml_debug_output, acpi_gbl_enable_aml_debug_object,
 		   byte, 0644);
@@ -386,7 +386,7 @@ acpi_status acpi_sysfs_table_handler(u32 event, void *table, void *context)
 
 	switch (event) {
 	case ACPI_TABLE_EVENT_INSTALL:
-		table_attr = kzalloc(sizeof(*table_attr), GFP_KERNEL);
+		table_attr = kzalloc_obj(*table_attr);
 		if (!table_attr)
 			return AE_NO_MEMORY;
 
@@ -448,7 +448,7 @@ static int acpi_bert_data_init(void *th, struct acpi_data_attr *data_attr)
 	struct acpi_table_bert *bert = th;
 
 	if (bert->header.length < sizeof(struct acpi_table_bert) ||
-	    bert->region_length < sizeof(struct acpi_hest_generic_status)) {
+	    bert->region_length < sizeof(struct acpi_bert_region)) {
 		kfree(data_attr);
 		return -EINVAL;
 	}
@@ -490,7 +490,7 @@ static int acpi_table_data_init(struct acpi_table_header *th, struct acpi_table_
 
 	for (i = 0; i < NUM_ACPI_DATA_OBJS; i++) {
 		if (ACPI_COMPARE_NAMESEG(th->signature, acpi_data_objs[i].name)) {
-			data_attr = kzalloc(sizeof(*data_attr), GFP_KERNEL);
+			data_attr = kzalloc_obj(*data_attr);
 			if (!data_attr)
 				return -ENOMEM;
 			sysfs_attr_init(&data_attr->attr.attr);
@@ -533,7 +533,7 @@ static int acpi_tables_sysfs_init(void)
 		if (ACPI_FAILURE(status))
 			continue;
 
-		table_attr = kzalloc(sizeof(*table_attr), GFP_KERNEL);
+		table_attr = kzalloc_obj(*table_attr);
 		if (!table_attr)
 			return -ENOMEM;
 
@@ -688,7 +688,7 @@ static ssize_t counter_show(struct kobject *kobj,
 	    acpi_irq_not_handled;
 	all_counters[num_gpes + ACPI_NUM_FIXED_EVENTS + COUNT_GPE].count =
 	    acpi_gpe_count;
-	size = sprintf(buf, "%8u", all_counters[index].count);
+	size = sysfs_emit(buf, "%8u", all_counters[index].count);
 
 	/* "gpe_all" or "sci" */
 	if (index >= num_gpes + ACPI_NUM_FIXED_EVENTS)
@@ -699,29 +699,29 @@ static ssize_t counter_show(struct kobject *kobj,
 		goto end;
 
 	if (status & ACPI_EVENT_FLAG_ENABLE_SET)
-		size += sprintf(buf + size, "  EN");
+		size += sysfs_emit_at(buf, size, "  EN");
 	else
-		size += sprintf(buf + size, "    ");
+		size += sysfs_emit_at(buf, size, "    ");
 	if (status & ACPI_EVENT_FLAG_STATUS_SET)
-		size += sprintf(buf + size, " STS");
+		size += sysfs_emit_at(buf, size, " STS");
 	else
-		size += sprintf(buf + size, "    ");
+		size += sysfs_emit_at(buf, size, "    ");
 
 	if (!(status & ACPI_EVENT_FLAG_HAS_HANDLER))
-		size += sprintf(buf + size, " invalid     ");
+		size += sysfs_emit_at(buf, size, " invalid     ");
 	else if (status & ACPI_EVENT_FLAG_ENABLED)
-		size += sprintf(buf + size, " enabled     ");
+		size += sysfs_emit_at(buf, size, " enabled     ");
 	else if (status & ACPI_EVENT_FLAG_WAKE_ENABLED)
-		size += sprintf(buf + size, " wake_enabled");
+		size += sysfs_emit_at(buf, size, " wake_enabled");
 	else
-		size += sprintf(buf + size, " disabled    ");
+		size += sysfs_emit_at(buf, size, " disabled    ");
 	if (status & ACPI_EVENT_FLAG_MASKED)
-		size += sprintf(buf + size, " masked  ");
+		size += sysfs_emit_at(buf, size, " masked  ");
 	else
-		size += sprintf(buf + size, " unmasked");
+		size += sysfs_emit_at(buf, size, " unmasked");
 
 end:
-	size += sprintf(buf + size, "\n");
+	size += sysfs_emit_at(buf, size, "\n");
 	return result ? result : size;
 }
 
@@ -865,11 +865,11 @@ void acpi_irq_stats_init(void)
 	num_gpes = acpi_current_gpe_count;
 	num_counters = num_gpes + ACPI_NUM_FIXED_EVENTS + NUM_COUNTERS_EXTRA;
 
-	all_attrs = kcalloc(num_counters + 1, sizeof(*all_attrs), GFP_KERNEL);
+	all_attrs = kzalloc_objs(*all_attrs, num_counters + 1);
 	if (all_attrs == NULL)
 		return;
 
-	all_counters = kcalloc(num_counters, sizeof(*all_counters), GFP_KERNEL);
+	all_counters = kzalloc_objs(*all_counters, num_counters);
 	if (all_counters == NULL)
 		goto fail;
 
@@ -877,7 +877,7 @@ void acpi_irq_stats_init(void)
 	if (ACPI_FAILURE(status))
 		goto fail;
 
-	counter_attrs = kcalloc(num_counters, sizeof(*counter_attrs), GFP_KERNEL);
+	counter_attrs = kzalloc_objs(*counter_attrs, num_counters);
 	if (counter_attrs == NULL)
 		goto fail;
 
@@ -938,7 +938,7 @@ static void __exit interrupt_stats_exit(void)
 
 static ssize_t pm_profile_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%d\n", acpi_gbl_FADT.preferred_profile);
+	return sysfs_emit(buf, "%d\n", acpi_gbl_FADT.preferred_profile);
 }
 
 static const struct kobj_attribute pm_profile_attr = __ATTR_RO(pm_profile);
@@ -947,7 +947,7 @@ static ssize_t enabled_show(struct kobject *kobj, struct kobj_attribute *attr, c
 {
 	struct acpi_hotplug_profile *hotplug = to_acpi_hotplug_profile(kobj);
 
-	return sprintf(buf, "%d\n", hotplug->enabled);
+	return sysfs_emit(buf, "%d\n", hotplug->enabled);
 }
 
 static ssize_t enabled_store(struct kobject *kobj, struct kobj_attribute *attr,
@@ -1001,7 +1001,7 @@ void acpi_sysfs_add_hotplug_profile(struct acpi_hotplug_profile *hotplug,
 static ssize_t force_remove_show(struct kobject *kobj,
 				 struct kobj_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%d\n", 0);
+	return sysfs_emit(buf, "%d\n", 0);
 }
 
 static ssize_t force_remove_store(struct kobject *kobj,

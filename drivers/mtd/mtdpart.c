@@ -18,6 +18,7 @@
 #include <linux/err.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
+#include <linux/mtd/concat.h>
 
 #include "mtdcore.h"
 
@@ -53,7 +54,7 @@ static struct mtd_info *allocate_partition(struct mtd_info *parent,
 	u64 tmp;
 
 	/* allocate the partition structure */
-	child = kzalloc(sizeof(*child), GFP_KERNEL);
+	child = kzalloc_obj(*child);
 	name = kstrdup(part->name, GFP_KERNEL);
 	if (!name || !child) {
 		printk(KERN_ERR"memory allocation error while creating partitions for \"%s\"\n",
@@ -117,6 +118,9 @@ static struct mtd_info *allocate_partition(struct mtd_info *parent,
 				part->name, parent_size - child->part.offset,
 				child->part.size);
 			/* register to preserve ordering */
+			child->part.offset = 0;
+			child->part.size = 0;
+			child->erasesize = parent->erasesize;
 			goto out_register;
 		}
 	}
@@ -264,6 +268,11 @@ int mtd_add_partition(struct mtd_info *parent, const char *name,
 	if (length <= 0)
 		return -EINVAL;
 
+	if (offset < 0 || offset >= (long long)parent_size)
+		return -EINVAL;
+
+	if ((u64)offset + (u64)length > parent_size)
+		return -EINVAL;
 	memset(&part, 0, sizeof(part));
 	part.name = name;
 	part.size = length;
@@ -408,6 +417,11 @@ int add_mtd_partitions(struct mtd_info *parent,
 		if (IS_ERR(child)) {
 			ret = PTR_ERR(child);
 			goto err_del_partitions;
+		}
+
+		if (IS_REACHABLE(CONFIG_MTD_VIRT_CONCAT)) {
+			if (mtd_virt_concat_add(child))
+				continue;
 		}
 
 		mutex_lock(&master->master.partitions_lock);

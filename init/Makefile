@@ -31,7 +31,7 @@ preempt-flag-$(CONFIG_PREEMPT_RT)	:= PREEMPT_RT
 
 build-version = $(or $(KBUILD_BUILD_VERSION), $(build-version-auto))
 
-# lingmoOS prefixes the build number and enabled kernel feature flags.
+# lingmoOS prefixes the automatic build number and enabled kernel feature flags.
 # Maximum length of UTS_VERSION is 64 chars
 filechk_uts_version = \
 	utsver=$$(echo '[lingmoOS]$(pound)$(build-version)' $(smp-flag-y) $(preempt-flag-y) | cut -b -64); \

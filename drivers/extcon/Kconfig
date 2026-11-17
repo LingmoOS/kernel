@@ -158,6 +158,7 @@ config EXTCON_PTN5150
 	tristate "NXP PTN5150 CC LOGIC USB EXTCON support"
 	depends on I2C && (GPIOLIB || COMPILE_TEST)
 	depends on USB_ROLE_SWITCH || !USB_ROLE_SWITCH
+	depends on TYPEC || !TYPEC
 	select REGMAP_I2C
 	help
 	  Say Y here to enable support for USB peripheral and USB host
@@ -226,12 +227,5 @@ config EXTCON_RTK_TYPE_C
 	  when using the Realtek RTD SoC USB Type-C port.
 	  The DHC (Digital Home Hub) RTD series SoC contains a type c module.
 	  This driver will detect the status of the type-c port.
-
-config EXTCON_STEAMDECK
-	tristate "Steam Deck extcon support"
-	depends on MFD_STEAMDECK
-	help
-	  Say Y here to enable support of USB Type C cable detection extcon
-	  support on Steam Deck devices
 
 endif

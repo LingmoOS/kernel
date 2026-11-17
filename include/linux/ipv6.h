@@ -177,7 +177,6 @@ struct inet6_skb_parm {
 #define IP6SKB_L3SLAVE         64
 #define IP6SKB_JUMBOGRAM      128
 #define IP6SKB_SEG6	      256
-#define IP6SKB_FAKEJUMBO      512
 #define IP6SKB_MULTIPATH      1024
 #define IP6SKB_MCROUTE        2048
 };
@@ -227,17 +226,14 @@ struct ipv6_mc_socklist;
 struct ipv6_ac_socklist;
 struct ipv6_fl_socklist;
 
-struct inet6_cork {
-	struct ipv6_txoptions *opt;
-	u8 hop_limit;
-	u8 tclass;
-	u8 dontfrag:1;
-};
-
 /* struct ipv6_pinfo - ipv6 private area */
 struct ipv6_pinfo {
 	/* Used in tx path (inet6_csk_route_socket(), ip6_xmit()) */
 	struct in6_addr 	saddr;
+	union {
+		struct in6_addr daddr;
+		struct in6_addr final;
+	};
 	__be32			flow_label;
 	u32			dst_cookie;
 	struct ipv6_txoptions __rcu	*opt;
@@ -289,7 +285,6 @@ struct ipv6_pinfo {
 
 	struct sk_buff		*pktoptions;
 	struct sk_buff		*rxpmtu;
-	struct inet6_cork	cork;
 
 	struct ipv6_mc_socklist	__rcu *ipv6_mc_list;
 	struct ipv6_ac_socklist	*ipv6_ac_list;
@@ -338,7 +333,12 @@ struct tcp6_timewait_sock {
 };
 
 #if IS_ENABLED(CONFIG_IPV6)
-bool ipv6_mod_enabled(void);
+extern int disable_ipv6_mod;
+
+static inline bool ipv6_mod_enabled(void)
+{
+	return disable_ipv6_mod == 0;
+}
 
 static inline struct ipv6_pinfo *inet6_sk(const struct sock *__sk)
 {

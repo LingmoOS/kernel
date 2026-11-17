@@ -132,12 +132,14 @@ struct snps_hdmirx_dev {
 	struct delayed_work delayed_work_hotplug;
 	struct delayed_work delayed_work_res_change;
 	struct hdmirx_cec *cec;
+	struct mutex phy_rw_lock; /* to protect phy r/w configuration */
 	struct mutex stream_lock; /* to lock video stream capture */
 	struct mutex work_lock; /* to lock the critical section of hotplug event */
 	struct reset_control_bulk_data resets[HDMIRX_NUM_RST];
 	struct clk_bulk_data *clks;
 	struct regmap *grf;
 	struct regmap *vo1_grf;
+	struct completion cr_read_done;
 	struct completion cr_write_done;
 	struct completion timer_base_lock;
 	struct completion avi_pkt_rcv;
@@ -154,7 +156,6 @@ struct snps_hdmirx_dev {
 	int num_clks;
 	u32 edid_blocks_written;
 	u32 cur_fmt_fourcc;
-	u32 color_depth;
 	spinlock_t rst_lock; /* to lock register access */
 	u8 edid[EDID_NUM_BLOCKS_MAX * EDID_BLOCK_SIZE];
 };
@@ -230,14 +231,14 @@ static bool tx_5v_power_present(struct snps_hdmirx_dev *hdmirx_dev)
 
 	for (i = 0; i < 10; i++) {
 		usleep_range(1000, 1100);
-		val = gpiod_get_value(hdmirx_dev->detect_5v_gpio);
+		val = gpiod_get_value_cansleep(hdmirx_dev->detect_5v_gpio);
 		if (val > 0)
 			cnt++;
 		if (cnt >= detection_threshold)
 			break;
 	}
 
-	ret = (cnt >= detection_threshold) ? true : false;
+	ret = cnt >= detection_threshold;
 	v4l2_dbg(3, debug, &hdmirx_dev->v4l2_dev, "%s: %d\n", __func__, ret);
 
 	return ret;
@@ -378,6 +379,38 @@ static void hdmirx_toggle_polarity(struct snps_hdmirx_dev *hdmirx_dev)
 			   VPROC_HSYNC_POL_OVR_EN, 0);
 }
 
+static u32 hdmirx_get_colordepth(struct snps_hdmirx_dev *hdmirx_dev)
+{
+	struct v4l2_device *v4l2_dev = &hdmirx_dev->v4l2_dev;
+	u32 val, color_depth_reg, color_depth;
+
+	val = hdmirx_readl(hdmirx_dev, DMA_STATUS11);
+	color_depth_reg = (val & HDMIRX_COLOR_DEPTH_MASK) >> 3;
+
+	switch (color_depth_reg) {
+	case 0x4:
+		color_depth = 24;
+		break;
+	case 0x5:
+		color_depth = 30;
+		break;
+	case 0x6:
+		color_depth = 36;
+		break;
+	case 0x7:
+		color_depth = 48;
+		break;
+	default:
+		color_depth = 24;
+		break;
+	}
+
+	v4l2_dbg(1, debug, v4l2_dev, "%s: color_depth: %d, reg_val:%d\n",
+		 __func__, color_depth, color_depth_reg);
+
+	return color_depth;
+}
+
 /*
  * When querying DV timings during preview, if the DMA's timing is stable,
  * we retrieve the timings directly from the DMA. However, if the current
@@ -391,7 +424,7 @@ static int hdmirx_get_detected_timings(struct snps_hdmirx_dev *hdmirx_dev,
 	struct v4l2_bt_timings *bt = &timings->bt;
 	u32 val, tmdsqpclk_freq, pix_clk;
 	unsigned int num_retries = 0;
-	u32 field_type, deframer_st;
+	u32 field_type, deframer_st, color_depth;
 	u64 tmp_data, tmds_clk;
 	bool is_dvi_mode;
 	int ret;
@@ -412,10 +445,11 @@ retry:
 	deframer_st = hdmirx_readl(hdmirx_dev, DEFRAMER_STATUS);
 	is_dvi_mode = !(deframer_st & OPMODE_STS_MASK);
 
+	color_depth = hdmirx_get_colordepth(hdmirx_dev);
 	tmdsqpclk_freq = hdmirx_readl(hdmirx_dev, CMU_TMDSQPCLK_FREQ);
 	tmds_clk = tmdsqpclk_freq * 4 * 1000;
 	tmp_data = tmds_clk * 24;
-	do_div(tmp_data, hdmirx_dev->color_depth);
+	do_div(tmp_data, color_depth);
 	pix_clk = tmp_data;
 	bt->pixelclock = pix_clk;
 
@@ -427,7 +461,7 @@ retry:
 	v4l2_dbg(2, debug, v4l2_dev, "tmds_clk:%llu, pix_clk:%d\n", tmds_clk, pix_clk);
 	v4l2_dbg(1, debug, v4l2_dev, "interlace:%d, fmt:%d, color:%d, mode:%s\n",
 		 bt->interlaced, hdmirx_dev->pix_fmt,
-		 hdmirx_dev->color_depth,
+		 color_depth,
 		 is_dvi_mode ? "dvi" : "hdmi");
 	v4l2_dbg(2, debug, v4l2_dev, "deframer_st:%#x\n", deframer_st);
 
@@ -796,10 +830,49 @@ static int wait_reg_bit_status(struct snps_hdmirx_dev *hdmirx_dev, u32 reg,
 	return 0;
 }
 
+static int hdmirx_phy_register_read(struct snps_hdmirx_dev *hdmirx_dev,
+				    u32 phy_reg, u32 *val)
+{
+	struct device *dev = hdmirx_dev->dev;
+	u32 status;
+
+	guard(mutex)(&hdmirx_dev->phy_rw_lock);
+
+	reinit_completion(&hdmirx_dev->cr_read_done);
+	/* clear irq status */
+	hdmirx_clear_interrupt(hdmirx_dev, MAINUNIT_2_INT_CLEAR, 0xffffffff);
+	/* en irq */
+	hdmirx_update_bits(hdmirx_dev, MAINUNIT_2_INT_MASK_N,
+			   PHYCREG_CR_READ_DONE, PHYCREG_CR_READ_DONE);
+	/* write phy reg addr */
+	hdmirx_writel(hdmirx_dev, PHYCREG_CONFIG1, phy_reg);
+	/* config read enable */
+	hdmirx_writel(hdmirx_dev, PHYCREG_CONTROL, PHYCREG_CR_PARA_READ_P);
+
+	if (!wait_for_completion_timeout(&hdmirx_dev->cr_read_done,
+					 msecs_to_jiffies(20))) {
+		dev_err(dev, "%s wait cr read done failed\n", __func__);
+		return -ETIMEDOUT;
+	}
+
+	/* read phy reg value */
+	status = hdmirx_readl(hdmirx_dev, PHYCREG_STATUS);
+	if (!(status & PHYCREG_CR_PARA_DATAVALID)) {
+		dev_err(dev, "%s cr read failed\n", __func__);
+		return -EINVAL;
+	}
+
+	*val = status & PHYCREG_CR_PARA_RD_DATA_MASK;
+
+	return 0;
+}
+
 static int hdmirx_phy_register_write(struct snps_hdmirx_dev *hdmirx_dev,
 				     u32 phy_reg, u32 val)
 {
 	struct device *dev = hdmirx_dev->dev;
+
+	guard(mutex)(&hdmirx_dev->phy_rw_lock);
 
 	reinit_completion(&hdmirx_dev->cr_write_done);
 	/* clear irq status */
@@ -947,36 +1020,6 @@ static void hdmirx_controller_init(struct snps_hdmirx_dev *hdmirx_dev)
 			   VS_REMAPFILTER_EN_QST | VS_FILTER_ORDER_QST(0x3));
 }
 
-static void hdmirx_get_colordepth(struct snps_hdmirx_dev *hdmirx_dev)
-{
-	struct v4l2_device *v4l2_dev = &hdmirx_dev->v4l2_dev;
-	u32 val, color_depth_reg;
-
-	val = hdmirx_readl(hdmirx_dev, DMA_STATUS11);
-	color_depth_reg = (val & HDMIRX_COLOR_DEPTH_MASK) >> 3;
-
-	switch (color_depth_reg) {
-	case 0x4:
-		hdmirx_dev->color_depth = 24;
-		break;
-	case 0x5:
-		hdmirx_dev->color_depth = 30;
-		break;
-	case 0x6:
-		hdmirx_dev->color_depth = 36;
-		break;
-	case 0x7:
-		hdmirx_dev->color_depth = 48;
-		break;
-	default:
-		hdmirx_dev->color_depth = 24;
-		break;
-	}
-
-	v4l2_dbg(1, debug, v4l2_dev, "%s: color_depth: %d, reg_val:%d\n",
-		 __func__, hdmirx_dev->color_depth, color_depth_reg);
-}
-
 static void hdmirx_get_pix_fmt(struct snps_hdmirx_dev *hdmirx_dev)
 {
 	struct v4l2_device *v4l2_dev = &hdmirx_dev->v4l2_dev;
@@ -1087,7 +1130,6 @@ static void hdmirx_format_change(struct snps_hdmirx_dev *hdmirx_dev)
 	};
 
 	hdmirx_get_pix_fmt(hdmirx_dev);
-	hdmirx_get_colordepth(hdmirx_dev);
 	hdmirx_get_avi_infoframe(hdmirx_dev);
 
 	v4l2_dbg(1, debug, v4l2_dev, "%s: queue res_chg_event\n", __func__);
@@ -1735,7 +1777,7 @@ static void process_signal_change(struct snps_hdmirx_dev *hdmirx_dev)
 			   FIFO_UNDERFLOW_INT_EN |
 			   HDMIRX_AXI_ERROR_INT_EN, 0);
 	hdmirx_reset_dma(hdmirx_dev);
-	queue_delayed_work(system_unbound_wq,
+	queue_delayed_work(system_dfl_wq,
 			   &hdmirx_dev->delayed_work_res_change,
 			   msecs_to_jiffies(50));
 }
@@ -1811,6 +1853,13 @@ static void mainunit_2_int_handler(struct snps_hdmirx_dev *hdmirx_dev,
 		hdmirx_update_bits(hdmirx_dev, MAINUNIT_2_INT_MASK_N,
 				   PHYCREG_CR_WRITE_DONE, 0);
 		complete(&hdmirx_dev->cr_write_done);
+		*handled = true;
+	}
+
+	if (status & PHYCREG_CR_READ_DONE) {
+		hdmirx_update_bits(hdmirx_dev, MAINUNIT_2_INT_MASK_N,
+				   PHYCREG_CR_READ_DONE, 0);
+		complete(&hdmirx_dev->cr_read_done);
 		*handled = true;
 	}
 
@@ -2190,7 +2239,7 @@ static void hdmirx_delayed_work_res_change(struct work_struct *work)
 
 		if (hdmirx_wait_signal_lock(hdmirx_dev)) {
 			hdmirx_plugout(hdmirx_dev);
-			queue_delayed_work(system_unbound_wq,
+			queue_delayed_work(system_dfl_wq,
 					   &hdmirx_dev->delayed_work_hotplug,
 					   msecs_to_jiffies(200));
 		} else {
@@ -2204,12 +2253,8 @@ static void hdmirx_delayed_work_res_change(struct work_struct *work)
 static irqreturn_t hdmirx_5v_det_irq_handler(int irq, void *dev_id)
 {
 	struct snps_hdmirx_dev *hdmirx_dev = dev_id;
-	u32 val;
 
-	val = gpiod_get_value(hdmirx_dev->detect_5v_gpio);
-	v4l2_dbg(3, debug, &hdmirx_dev->v4l2_dev, "%s: 5v:%d\n", __func__, val);
-
-	queue_delayed_work(system_unbound_wq,
+	queue_delayed_work(system_dfl_wq,
 			   &hdmirx_dev->delayed_work_hotplug,
 			   msecs_to_jiffies(10));
 
@@ -2313,18 +2358,51 @@ static void hdmirx_disable_all_interrupts(struct snps_hdmirx_dev *hdmirx_dev)
 	hdmirx_clear_interrupt(hdmirx_dev, CEC_INT_CLEAR, 0xffffffff);
 }
 
-static void hdmirx_init(struct snps_hdmirx_dev *hdmirx_dev)
+static int hdmirx_detect_broken_interrupt(struct snps_hdmirx_dev *hdmirx_dev)
 {
+	int ret;
+	u32 val;
+
+	enable_irq(hdmirx_dev->hdmi_irq);
+
+	hdmirx_writel(hdmirx_dev, PHYCREG_CONFIG0, 0x3);
+
+	ret = hdmirx_phy_register_read(hdmirx_dev,
+				       HDMIPCS_DIG_CTRL_PATH_MAIN_FSM_FSM_CONFIG,
+				       &val);
+
+	disable_irq(hdmirx_dev->hdmi_irq);
+
+	return ret;
+}
+
+static int hdmirx_init(struct snps_hdmirx_dev *hdmirx_dev)
+{
+	int ret;
+
 	hdmirx_update_bits(hdmirx_dev, PHY_CONFIG, PHY_RESET | PHY_PDDQ, 0);
 
 	regmap_write(hdmirx_dev->vo1_grf, VO1_GRF_VO1_CON2,
 		     (HDMIRX_SDAIN_MSK | HDMIRX_SCLIN_MSK) |
 		     ((HDMIRX_SDAIN_MSK | HDMIRX_SCLIN_MSK) << 16));
+
+	/*
+	 * RK3588 downstream version of TF-A remaps HDMIRX interrupt and
+	 * requires use of a vendor-specific FW API that we don't support
+	 * in this driver.
+	 */
+	ret = hdmirx_detect_broken_interrupt(hdmirx_dev);
+	if (ret)
+		dev_err_probe(hdmirx_dev->dev, ret,
+			      "interrupt not functioning, open-source TF-A is required by this driver\n");
+
 	/*
 	 * Some interrupts are enabled by default, so we disable
 	 * all interrupts and clear interrupts status first.
 	 */
 	hdmirx_disable_all_interrupts(hdmirx_dev);
+
+	return ret;
 }
 
 /* hdmi-4k-300mhz EDID produced by v4l2-ctl tool */
@@ -2441,7 +2519,7 @@ static void hdmirx_enable_irq(struct device *dev)
 	enable_irq(hdmirx_dev->dma_irq);
 	enable_irq(hdmirx_dev->det_irq);
 
-	queue_delayed_work(system_unbound_wq,
+	queue_delayed_work(system_dfl_wq,
 			   &hdmirx_dev->delayed_work_hotplug,
 			   msecs_to_jiffies(110));
 }
@@ -2532,10 +2610,11 @@ static int hdmirx_setup_irq(struct snps_hdmirx_dev *hdmirx_dev,
 	irq_set_status_flags(irq, IRQ_NOAUTOEN);
 
 	hdmirx_dev->det_irq = irq;
-	ret = devm_request_irq(dev, irq, hdmirx_5v_det_irq_handler,
-			       IRQF_TRIGGER_FALLING | IRQF_TRIGGER_RISING,
-			       "rk_hdmirx-5v", hdmirx_dev);
-	if (ret) {
+	ret = devm_request_any_context_irq(dev, irq, hdmirx_5v_det_irq_handler,
+					   IRQF_TRIGGER_FALLING |
+					   IRQF_TRIGGER_RISING,
+					   "rk_hdmirx-5v", hdmirx_dev);
+	if (ret < 0) {
 		dev_err_probe(dev, ret, "failed to request hdmirx-5v irq\n");
 		return ret;
 	}
@@ -2606,10 +2685,12 @@ static int hdmirx_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, PTR_ERR(hdmirx_dev->regs),
 				     "failed to remap regs resource\n");
 
+	mutex_init(&hdmirx_dev->phy_rw_lock);
 	mutex_init(&hdmirx_dev->stream_lock);
 	mutex_init(&hdmirx_dev->work_lock);
 	spin_lock_init(&hdmirx_dev->rst_lock);
 
+	init_completion(&hdmirx_dev->cr_read_done);
 	init_completion(&hdmirx_dev->cr_write_done);
 	init_completion(&hdmirx_dev->timer_base_lock);
 	init_completion(&hdmirx_dev->avi_pkt_rcv);
@@ -2623,7 +2704,10 @@ static int hdmirx_probe(struct platform_device *pdev)
 	hdmirx_dev->timings = cea640x480;
 
 	hdmirx_enable(dev);
-	hdmirx_init(hdmirx_dev);
+
+	ret = hdmirx_init(hdmirx_dev);
+	if (ret)
+		goto err_pm;
 
 	v4l2_dev = &hdmirx_dev->v4l2_dev;
 	strscpy(v4l2_dev->name, dev_name(dev), sizeof(v4l2_dev->name));

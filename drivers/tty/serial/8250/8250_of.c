@@ -5,6 +5,7 @@
  *    Copyright (C) 2006 Arnd Bergmann <arnd@arndb.de>, IBM Corp.
  */
 
+#include <linux/align.h>
 #include <linux/bits.h>
 #include <linux/console.h>
 #include <linux/math.h>
@@ -129,7 +130,7 @@ static int of_platform_serial_setup(struct platform_device *ofdev,
 	u32 spd;
 	int ret;
 
-	memset(port, 0, sizeof *port);
+	memset(port, 0, sizeof(*port));
 
 	pm_runtime_enable(&ofdev->dev);
 	pm_runtime_get_sync(&ofdev->dev);
@@ -155,6 +156,17 @@ static int of_platform_serial_setup(struct platform_device *ofdev,
 	ret = uart_read_and_validate_port_properties(port);
 	if (ret)
 		goto err_pmruntime;
+
+	if (IS_ENABLED(CONFIG_CPU_XSCALE) && type == PORT_XSCALE) {
+		/*
+		 * Adjust for BE32 register accesses: drop any hardcoded
+		 * address for the big endian byte target, add it explicitly
+		 * if running on BE32.
+		 */
+		port->mapbase = PTR_ALIGN_DOWN(port->mapbase, 4);
+		if (IS_ENABLED(CONFIG_CPU_ENDIAN_BE32))
+			port->mapbase += 3;
+	}
 
 	/* Get clk rate through clk driver if present */
 	if (!port->uartclk) {
@@ -254,7 +266,7 @@ static int of_platform_serial_probe(struct platform_device *ofdev)
 	if (of_property_read_bool(ofdev->dev.of_node, "used-by-rtas"))
 		return -EBUSY;
 
-	info = kzalloc(sizeof(*info), GFP_KERNEL);
+	info = kzalloc_obj(*info);
 	if (info == NULL)
 		return -ENOMEM;
 

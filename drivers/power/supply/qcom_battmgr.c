@@ -258,7 +258,6 @@ struct qcom_battmgr_info {
 	unsigned int capacity_warning;
 	unsigned int cycle_count;
 	unsigned int charge_count;
-	bool charge_ctrl_enable;
 	unsigned int charge_ctrl_start;
 	unsigned int charge_ctrl_end;
 	char model_number[BATTMGR_STRING_LEN];
@@ -661,13 +660,13 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 }
 
 static int qcom_battmgr_set_charge_control(struct qcom_battmgr *battmgr,
-					   bool enable, u32 target_soc, u32 delta_soc)
+					   u32 target_soc, u32 delta_soc)
 {
 	struct qcom_battmgr_charge_ctrl_request request = {
 		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_BATTMGR),
 		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
 		.hdr.opcode = cpu_to_le32(BATTMGR_CHG_CTRL_LIMIT_EN),
-		.enable = cpu_to_le32(enable),
+		.enable = cpu_to_le32(1),
 		.target_soc = cpu_to_le32(target_soc),
 		.delta_soc = cpu_to_le32(delta_soc),
 	};
@@ -679,7 +678,6 @@ static int qcom_battmgr_set_charge_start_threshold(struct qcom_battmgr *battmgr,
 {
 	u32 target_soc, delta_soc;
 	int ret;
-	bool enable = start_soc != 0;
 
 	start_soc = clamp(start_soc, CHARGE_CTRL_START_THR_MIN, CHARGE_CTRL_START_THR_MAX);
 
@@ -699,10 +697,9 @@ static int qcom_battmgr_set_charge_start_threshold(struct qcom_battmgr *battmgr,
 	}
 
 	mutex_lock(&battmgr->lock);
-	ret = qcom_battmgr_set_charge_control(battmgr, enable, target_soc, delta_soc);
+	ret = qcom_battmgr_set_charge_control(battmgr, target_soc, delta_soc);
 	mutex_unlock(&battmgr->lock);
 	if (!ret) {
-		battmgr->info.charge_ctrl_enable = enable;
 		battmgr->info.charge_ctrl_start = start_soc;
 		battmgr->info.charge_ctrl_end = target_soc;
 	}
@@ -714,7 +711,6 @@ static int qcom_battmgr_set_charge_end_threshold(struct qcom_battmgr *battmgr, i
 {
 	u32 delta_soc = CHARGE_CTRL_DELTA_SOC;
 	int ret;
-	bool enable = battmgr->info.charge_ctrl_enable;
 
 	end_soc = clamp(end_soc, CHARGE_CTRL_END_THR_MIN, CHARGE_CTRL_END_THR_MAX);
 
@@ -722,7 +718,7 @@ static int qcom_battmgr_set_charge_end_threshold(struct qcom_battmgr *battmgr, i
 		delta_soc = end_soc - battmgr->info.charge_ctrl_start;
 
 	mutex_lock(&battmgr->lock);
-	ret = qcom_battmgr_set_charge_control(battmgr, enable, end_soc, delta_soc);
+	ret = qcom_battmgr_set_charge_control(battmgr, end_soc, delta_soc);
 	mutex_unlock(&battmgr->lock);
 	if (!ret) {
 		battmgr->info.charge_ctrl_start = end_soc - delta_soc;
@@ -1242,11 +1238,11 @@ static void qcom_battmgr_sc8280xp_strcpy(char *dest, const char *src)
 
 static unsigned int qcom_battmgr_sc8280xp_parse_technology(const char *chemistry)
 {
-	if ((!strncmp(chemistry, "LIO", BATTMGR_CHEMISTRY_LEN)) ||
-	    (!strncmp(chemistry, "OOI", BATTMGR_CHEMISTRY_LEN)))
+	if ((!strncmp(chemistry, "LIO", 3)) ||
+	    (!strncmp(chemistry, "OOI", 3)))
 		return POWER_SUPPLY_TECHNOLOGY_LION;
-	if (!strncmp(chemistry, "LIP", BATTMGR_CHEMISTRY_LEN) ||
-	    !strncmp(chemistry, "LiP", BATTMGR_CHEMISTRY_LEN))
+	if (!strncmp(chemistry, "LIP", 3) ||
+	    !strncmp(chemistry, "LiP", 3))
 		return POWER_SUPPLY_TECHNOLOGY_LIPO;
 
 	pr_err("Unknown battery technology '%s'\n", chemistry);
@@ -1256,6 +1252,23 @@ static unsigned int qcom_battmgr_sc8280xp_parse_technology(const char *chemistry
 static unsigned int qcom_battmgr_sc8280xp_convert_temp(unsigned int temperature)
 {
 	return DIV_ROUND_CLOSEST(temperature, 10);
+}
+
+/*
+ * The charger supplies' online state comes from the battery status response,
+ * and the firmware sends no notification of its own when it changes, so
+ * announce the change here. A supply that is not registered yet announces its
+ * state when it is.
+ */
+static void qcom_battmgr_sc8280xp_set_online(struct power_supply *psy,
+					     bool *online, bool value)
+{
+	if (*online == value)
+		return;
+
+	*online = value;
+	if (psy)
+		power_supply_changed(psy);
 }
 
 static void qcom_battmgr_sc8280xp_callback(struct qcom_battmgr *battmgr,
@@ -1327,9 +1340,12 @@ static void qcom_battmgr_sc8280xp_callback(struct qcom_battmgr *battmgr,
 		battmgr->status.temperature = qcom_battmgr_sc8280xp_convert_temp(le32_to_cpu(resp->status.temperature));
 
 		source = le32_to_cpu(resp->status.charging_source);
-		battmgr->ac.online = source == BATTMGR_CHARGING_SOURCE_AC;
-		battmgr->usb.online = source == BATTMGR_CHARGING_SOURCE_USB;
-		battmgr->wireless.online = source == BATTMGR_CHARGING_SOURCE_WIRELESS;
+		qcom_battmgr_sc8280xp_set_online(battmgr->ac_psy, &battmgr->ac.online,
+						 source == BATTMGR_CHARGING_SOURCE_AC);
+		qcom_battmgr_sc8280xp_set_online(battmgr->usb_psy, &battmgr->usb.online,
+						 source == BATTMGR_CHARGING_SOURCE_USB);
+		qcom_battmgr_sc8280xp_set_online(battmgr->wls_psy, &battmgr->wireless.online,
+						 source == BATTMGR_CHARGING_SOURCE_WIRELESS);
 		if (battmgr->info.last_full_capacity != 0) {
 			/*
 			 * 100 * battmgr->status.capacity can overflow a 32bit
@@ -1616,6 +1632,8 @@ static void qcom_battmgr_pdr_notify(void *priv, int state)
 }
 
 static const struct of_device_id qcom_battmgr_of_variants[] = {
+	{ .compatible = "qcom,glymur-pmic-glink", .data = (void *)QCOM_BATTMGR_X1E80100 },
+	{ .compatible = "qcom,kaanapali-pmic-glink", .data = (void *)QCOM_BATTMGR_SM8550 },
 	{ .compatible = "qcom,sc8180x-pmic-glink", .data = (void *)QCOM_BATTMGR_SC8280XP },
 	{ .compatible = "qcom,sc8280xp-pmic-glink", .data = (void *)QCOM_BATTMGR_SC8280XP },
 	{ .compatible = "qcom,sm8550-pmic-glink", .data = (void *)QCOM_BATTMGR_SM8550 },

@@ -9,11 +9,9 @@
 #include <linux/errno.h>
 #include <linux/hid.h>
 #include <linux/hwmon.h>
-#include <linux/hwmon-sysfs.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
-#include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/types.h>
 
@@ -124,7 +122,6 @@ struct corsairpsu_data {
 	struct device *hwmon_dev;
 	struct dentry *debugfs;
 	struct completion wait_completion;
-	struct mutex lock; /* for locking access to cmd_buffer */
 	u8 *cmd_buffer;
 	char vendor[REPLY_SIZE];
 	char product[REPLY_SIZE];
@@ -225,7 +222,6 @@ static int corsairpsu_request(struct corsairpsu_data *priv, u8 cmd, u8 rail, voi
 {
 	int ret;
 
-	mutex_lock(&priv->lock);
 	switch (cmd) {
 	case PSU_CMD_RAIL_VOLTS_HCRIT:
 	case PSU_CMD_RAIL_VOLTS_LCRIT:
@@ -235,17 +231,13 @@ static int corsairpsu_request(struct corsairpsu_data *priv, u8 cmd, u8 rail, voi
 	case PSU_CMD_RAIL_WATTS:
 		ret = corsairpsu_usb_cmd(priv, 2, PSU_CMD_SELECT_RAIL, rail, NULL);
 		if (ret < 0)
-			goto cmd_fail;
+			return ret;
 		break;
 	default:
 		break;
 	}
 
-	ret = corsairpsu_usb_cmd(priv, 3, cmd, 0, data);
-
-cmd_fail:
-	mutex_unlock(&priv->lock);
-	return ret;
+	return corsairpsu_usb_cmd(priv, 3, cmd, 0, data);
 }
 
 static int corsairpsu_get_value(struct corsairpsu_data *priv, u8 cmd, u8 rail, long *val)
@@ -677,6 +669,8 @@ static void print_uptime(struct seq_file *seqf, u8 cmd)
 	long val;
 	int ret;
 
+	guard(hwmon_lock)(priv->hwmon_dev);
+
 	ret = corsairpsu_get_value(priv, cmd, 0, &val);
 	if (ret < 0) {
 		seq_puts(seqf, "N/A\n");
@@ -735,6 +729,8 @@ static int ocpmode_show(struct seq_file *seqf, void *unused)
 	struct corsairpsu_data *priv = seqf->private;
 	long val;
 	int ret;
+
+	guard(hwmon_lock)(priv->hwmon_dev);
 
 	/*
 	 * The rail mode is switchable on the fly. The RAW interface can be used for this. But it
@@ -802,7 +798,6 @@ static int corsairpsu_probe(struct hid_device *hdev, const struct hid_device_id 
 
 	priv->hdev = hdev;
 	hid_set_drvdata(hdev, priv);
-	mutex_init(&priv->lock);
 	init_completion(&priv->wait_completion);
 
 	hid_device_io_start(hdev);
@@ -889,7 +884,7 @@ static const struct hid_device_id corsairpsu_idtable[] = {
 	{ HID_USB_DEVICE(0x1b1c, 0x1c0c) }, /* Corsair RM850i */
 	{ HID_USB_DEVICE(0x1b1c, 0x1c0d) }, /* Corsair RM1000i */
 	{ HID_USB_DEVICE(0x1b1c, 0x1c1e) }, /* Corsair HX1000i Series 2023 */
-	{ HID_USB_DEVICE(0x1b1c, 0x1c1f) }, /* Corsair HX1500i Legacy and Series 2023 */
+	{ HID_USB_DEVICE(0x1b1c, 0x1c1f) }, /* Corsair HX1500i Legacy, Series 2023 and 2025 */
 	{ HID_USB_DEVICE(0x1b1c, 0x1c23) }, /* Corsair HX1200i Series 2023 */
 	{ HID_USB_DEVICE(0x1b1c, 0x1c27) }, /* Corsair HX1200i Series 2025 */
 	{ },

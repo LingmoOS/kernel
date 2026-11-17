@@ -18,9 +18,6 @@
 #include <linux/uaccess.h>
 #include "pegasus.h"
 
-/*
- * Version Information
- */
 #define DRIVER_AUTHOR "Petko Manolov <petkan@nucleusys.com>"
 #define DRIVER_DESC "Pegasus/Pegasus II USB Ethernet driver"
 
@@ -146,7 +143,7 @@ static int update_eth_regs_async(pegasus_t *pegasus)
 	struct urb *async_urb;
 	struct usb_ctrlrequest *req;
 
-	req = kmalloc(sizeof(struct usb_ctrlrequest), GFP_ATOMIC);
+	req = kmalloc_obj(struct usb_ctrlrequest, GFP_ATOMIC);
 	if (req == NULL)
 		return ret;
 
@@ -523,11 +520,17 @@ static void read_bulk_callback(struct urb *urb)
 	}
 
 	/*
-	 * If the packet is unreasonably long, quietly drop it rather than
-	 * kernel panicing by calling skb_put.
+	 * Drop frames shorter than an Ethernet header, because
+	 * eth_type_trans() reads the header whatever the length, and frames
+	 * longer than what was actually received. Passing either up would
+	 * expose stale buffer contents, and skb_put() could panic on the
+	 * latter. count is at most PEGASUS_MTU.
 	 */
-	if (pkt_len > PEGASUS_MTU - rx_offset)
+	if (pkt_len < ETH_HLEN || pkt_len + rx_offset > count) {
+		net->stats.rx_errors++;
+		net->stats.rx_length_errors++;
 		goto goon;
+	}
 
 	/*
 	 * at this point we are sure pegasus->rx_skb != NULL
@@ -1325,14 +1328,18 @@ static void __init parse_id(char *id)
 	char *token, *name = NULL;
 	int dyn_id_index = ARRAY_SIZE(pegasus_ids) - 2;
 
-	if ((token = strsep(&id, ":")) != NULL)
+	token = strsep(&id, ":");
+	if (token)
 		name = token;
 	/* name now points to a null terminated string*/
-	if ((token = strsep(&id, ":")) != NULL)
-		vendor_id = simple_strtoul(token, NULL, 16);
-	if ((token = strsep(&id, ":")) != NULL)
-		device_id = simple_strtoul(token, NULL, 16);
-	flags = simple_strtoul(id, NULL, 16);
+	token = strsep(&id, ":");
+	if (token && kstrtouint(token, 16, &vendor_id))
+		return;
+	token = strsep(&id, ":");
+	if (token && kstrtouint(token, 16, &device_id))
+		return;
+	if (id && *id && kstrtouint(id, 16, &flags))
+		return;
 	pr_info("%s: new device %s, vendor ID 0x%04x, device ID 0x%04x, flags: 0x%x\n",
 		driver_name, name, vendor_id, device_id, flags);
 

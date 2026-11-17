@@ -9,6 +9,7 @@
 
 #include "../transport_ipc.h"
 #include "../connection.h"
+#include "../stats.h"
 
 #include "tree_connect.h"
 #include "user_config.h"
@@ -31,8 +32,7 @@ ksmbd_tree_conn_connect(struct ksmbd_work *work, const char *share_name)
 	if (!sc)
 		return status;
 
-	tree_conn = kzalloc(sizeof(struct ksmbd_tree_connect),
-			    KSMBD_DEFAULT_GFP);
+	tree_conn = kzalloc_obj(struct ksmbd_tree_connect, KSMBD_DEFAULT_GFP);
 	if (!tree_conn) {
 		status.ret = -ENOMEM;
 		goto out_error;
@@ -82,11 +82,15 @@ ksmbd_tree_conn_connect(struct ksmbd_work *work, const char *share_name)
 	down_write(&sess->tree_conns_lock);
 	ret = xa_err(xa_store(&sess->tree_conns, tree_conn->id, tree_conn,
 			      KSMBD_DEFAULT_GFP));
+	if (!ret)
+		atomic_inc(&tree_conn->refcount);
 	up_write(&sess->tree_conns_lock);
 	if (ret) {
 		status.ret = -ENOMEM;
 		goto out_error;
 	}
+	ksmbd_counter_inc(KSMBD_COUNTER_TREE_CONNS);
+	ksmbd_share_tree_conn_inc(sc);
 	kvfree(resp);
 	return status;
 
@@ -101,8 +105,10 @@ out_error:
 
 void ksmbd_tree_connect_put(struct ksmbd_tree_connect *tcon)
 {
-	if (atomic_dec_and_test(&tcon->refcount))
+	if (atomic_dec_and_test(&tcon->refcount)) {
+		ksmbd_share_config_put(tcon->share_conf);
 		kfree(tcon);
+	}
 }
 
 static int __ksmbd_tree_conn_disconnect(struct ksmbd_session *sess,
@@ -112,9 +118,12 @@ static int __ksmbd_tree_conn_disconnect(struct ksmbd_session *sess,
 
 	ret = ksmbd_ipc_tree_disconnect_request(sess->id, tree_conn->id);
 	ksmbd_release_tree_conn_id(sess, tree_conn->id);
-	ksmbd_share_config_put(tree_conn->share_conf);
-	if (atomic_dec_and_test(&tree_conn->refcount))
+	ksmbd_counter_dec(KSMBD_COUNTER_TREE_CONNS);
+	ksmbd_share_tree_conn_dec(tree_conn->share_conf);
+	if (atomic_dec_and_test(&tree_conn->refcount)) {
+		ksmbd_share_config_put(tree_conn->share_conf);
 		kfree(tree_conn);
+	}
 	return ret;
 }
 
@@ -122,6 +131,12 @@ int ksmbd_tree_conn_disconnect(struct ksmbd_session *sess,
 			       struct ksmbd_tree_connect *tree_conn)
 {
 	down_write(&sess->tree_conns_lock);
+	if (tree_conn->t_state == TREE_DISCONNECTED ||
+	    xa_load(&sess->tree_conns, tree_conn->id) != tree_conn) {
+		up_write(&sess->tree_conns_lock);
+		return -ENOENT;
+	}
+	tree_conn->t_state = TREE_DISCONNECTED;
 	xa_erase(&sess->tree_conns, tree_conn->id);
 	up_write(&sess->tree_conns_lock);
 

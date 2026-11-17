@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: BSD-3-Clause-Clear */
 /* Copyright (C) 2020 MediaTek Inc. */
 
 #ifndef __MT7915_MCU_H
@@ -51,6 +51,15 @@ struct mt7915_mcu_bcc_notify {
 	u8 band_idx;
 	u8 omac_idx;
 	u8 cca_count;
+	u8 rsv;
+} __packed;
+
+struct mt7915_mcu_ps_notify {
+	struct mt76_connac2_mcu_rxd_hdr rxd;
+
+	u8 wtbl_lower;
+	u8 ps_bit;
+	u8 wtbl_higher;
 	u8 rsv;
 } __packed;
 
@@ -440,10 +449,16 @@ enum {
 
 enum {
 	TX_POWER_LIMIT_ENABLE,
+	TX_POWER_LIMIT_PATH_ENABLE = 0x3,
 	TX_POWER_LIMIT_TABLE = 0x4,
 	TX_POWER_LIMIT_INFO = 0x7,
 	TX_POWER_LIMIT_FRAME = 0x11,
 	TX_POWER_LIMIT_FRAME_MIN = 0x12,
+};
+
+enum {
+	TX_POWER_INFO_PATH = 1,
+	TX_POWER_INFO_RATE,
 };
 
 enum {

@@ -584,7 +584,7 @@ int xhci_dbc_tty_probe(struct device *dev, void __iomem *base, struct xhci_hcd *
 	if (!dbc_tty_driver)
 		return -ENODEV;
 
-	port = kzalloc(sizeof(*port), GFP_KERNEL);
+	port = kzalloc_obj(*port);
 	if (!port)
 		return -ENOMEM;
 
@@ -665,11 +665,11 @@ fail:
 
 void dbc_tty_exit(void)
 {
-	if (dbc_tty_driver) {
-		tty_unregister_driver(dbc_tty_driver);
-		tty_driver_kref_put(dbc_tty_driver);
-		dbc_tty_driver = NULL;
-	}
+	if (IS_ERR_OR_NULL(dbc_tty_driver))
+		return;
 
+	tty_unregister_driver(dbc_tty_driver);
+	tty_driver_kref_put(dbc_tty_driver);
 	idr_destroy(&dbc_tty_minors);
+	dbc_tty_driver = NULL;
 }
