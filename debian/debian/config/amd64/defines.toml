@@ -25,18 +25,6 @@ hardware = '64-bit PCs'
 hardware_long = 'PCs with AMD64, Intel 64 or VIA Nano processors'
 parts = ['rt']
 
-[[flavour]]
-name = 'test'
-[flavour.build]
-config = ['config.test', 'amd64/config.test']
-[flavour.defs]
-is_test = true
-[flavour.description]
-hardware = "CI only"
-hardware_long = "CI only"
-[flavour.packages]
-installer = true
-
 [[featureset]]
 name = 'none'
 

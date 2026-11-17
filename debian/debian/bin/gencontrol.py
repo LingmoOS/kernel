@@ -410,9 +410,6 @@ class Gencontrol(Base):
         for p in packages_headers:
             p.depends.merge([relation_c_compiler_host])
 
-        packages_own.extend(
-            self.bundle.add('image-dbg', ruleid, makeflags, vars, arch=arch)
-        )
 
         if do_meta:
             packages_own.extend(bundle_signed.add('base.meta', ruleid, makeflags, vars, arch=arch))
@@ -421,8 +418,6 @@ class Gencontrol(Base):
                 bundle_signed.add('modules.meta', ruleid, makeflags, vars, arch=arch))
             packages_own.extend(
                 bundle_signed.add('headers.meta', ruleid, makeflags, vars, arch=arch))
-            packages_own.extend(
-                bundle_signed.add('image-dbg.meta', ruleid, makeflags, vars, arch=arch))
 
         if (
             config.defs_flavour.is_default
