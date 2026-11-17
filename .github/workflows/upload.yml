@@ -26,7 +26,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             ca-certificates git build-essential devscripts dpkg-dev \
-            debhelper quilt rsync python3 python3-dacite xz-utils fakeroot
+            debhelper quilt rsync python3 python3-dacite python3-jinja2 xz-utils fakeroot
 
       - name: Checkout source
         uses: actions/checkout@v4
